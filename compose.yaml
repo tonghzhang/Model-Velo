@@ -1,0 +1,62 @@
+name: model-velo
+
+services:
+  postgres:
+    image: postgres:17.10-alpine3.23
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${MODEL_VELO_POSTGRES_DB:-model_velo}
+      POSTGRES_USER: ${MODEL_VELO_POSTGRES_USER:-model_velo}
+      POSTGRES_PASSWORD: ${MODEL_VELO_POSTGRES_PASSWORD:?set MODEL_VELO_POSTGRES_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:${MODEL_VELO_POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    stop_grace_period: 15s
+    networks:
+      - infrastructure
+
+  redis:
+    image: redis:8.8.0-alpine3.23
+    restart: unless-stopped
+    environment:
+      MODEL_VELO_REDIS_PASSWORD: ${MODEL_VELO_REDIS_PASSWORD:?set MODEL_VELO_REDIS_PASSWORD in .env}
+    command:
+      - /bin/sh
+      - -c
+      - |
+        exec redis-server \
+          --appendonly yes \
+          --appendfsync everysec \
+          --requirepass "$$MODEL_VELO_REDIS_PASSWORD"
+    ports:
+      - "127.0.0.1:${MODEL_VELO_REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - redis-cli --no-auth-warning -a "$${MODEL_VELO_REDIS_PASSWORD}" ping | grep -q PONG
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    stop_grace_period: 10s
+    networks:
+      - infrastructure
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  infrastructure:
+    driver: bridge

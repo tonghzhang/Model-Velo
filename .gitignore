@@ -1,0 +1,21 @@
+# Local credentials and environment overrides
+.env
+.env.*
+!.env.example
+
+# Go build and test output
+*.exe
+*.test
+*.out
+coverage/
+dist/
+
+# Local runtime data and logs
+*.log
+tmp/
+
+# IDE and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

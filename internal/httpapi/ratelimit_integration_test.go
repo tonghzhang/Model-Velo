@@ -21,7 +21,6 @@ import (
 	"model-velo/internal/apikey"
 	"model-velo/internal/config"
 	"model-velo/internal/httpapi"
-	"model-velo/internal/provider"
 	"model-velo/internal/ratelimit"
 	"model-velo/internal/responsecache"
 )
@@ -42,15 +41,12 @@ func TestRedisRateLimitHTTPFlow(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upstreamCalls.Add(1)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"choices":[]}`)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
 	}))
 	t.Cleanup(upstream.Close)
 
-	providerClient, err := provider.NewClient(upstream.URL, "provider-test-key", time.Second)
-	if err != nil {
-		t.Fatalf("provider.NewClient() error = %v", err)
-	}
-	router := httpapi.NewRouter(providerClient, testAccessController{}, limiter, testResponseCache{})
+	providerClient := newTestCompatibleAdapter(t, upstream.URL)
+	router := newSingleProviderTestRouter(t, providerClient, testAccessController{}, limiter, testResponseCache{}, nil, nil, nil)
 
 	first := performChatRequest(router)
 	assertRateLimitResponse(t, first, http.StatusOK, "2", "1")
@@ -184,20 +180,21 @@ func TestRedisResponseCacheHTTPFlow(t *testing.T) {
 			_, _ = io.WriteString(w, `{"error":{"message":"temporary"}}`)
 			return
 		}
-		_, _ = fmt.Fprintf(w, `{"id":"upstream-%d","choices":[]}`, call)
+		_, _ = fmt.Fprintf(w, `{"id":"upstream-%d","choices":[{"message":{"role":"assistant","content":"ok"}}]}`, call)
 	}))
 	t.Cleanup(upstream.Close)
 
-	providerClient, err := provider.NewClient(upstream.URL, "provider-test-key", time.Second)
-	if err != nil {
-		t.Fatalf("provider.NewClient() error = %v", err)
-	}
+	providerClient := newTestCompatibleAdapter(t, upstream.URL)
 	newRouter := func(tenantID string, responseCache httpapi.ResponseCache) http.Handler {
-		return httpapi.NewRouter(
+		return newSingleProviderTestRouter(
+			t,
 			providerClient,
 			testAccessController{identity: apikey.Identity{TenantID: tenantID, APIKeyID: "cache-test-key"}},
 			testRateLimiter{decision: ratelimit.Decision{Allowed: true}},
 			responseCache,
+			nil,
+			nil,
+			nil,
 		)
 	}
 	router := newRouter("tenant-cache-a", cache)

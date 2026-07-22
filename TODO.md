@@ -29,11 +29,11 @@
 | S0 项目治理与基线 | 10/15 | 进行中 | README、架构现状和密钥基线已同步，Git 与治理模板仍待补齐 |
 | S1 最小非流式网关 | 48/50 | 进行中 | 功能检查通过且用户已授权进入 S2；race 仍被本机缺少 GCC 阻止，可解释提交尚未形成 |
 | S2 PostgreSQL、鉴权、Redis 限流与缓存 | 58/60 | 进行中 | 生产功能与真实依赖门禁已完成；用户已允许带着 race 环境缺口进入 S3，缺口仍保留 |
-| S3 路由与可靠性 | 36/90 | 进行中 | 已接入 Route Plan、稳定错误策略、Provider Circuit Breaker 和有界 Queue；Key、Retry、Fallback 尚未实现 |
+| S3 路由与可靠性 | 54/90 | 进行中 | Provider 能力规划、按 Provider 运行参数、Attempt Trail 与有序 Fallback 已接入；完整故障矩阵和 race 仍待门禁 |
 | S4 SSE | 0/35 | 未开始 | 必须在非流式可靠性链路稳定后开始 |
 | S5 Usage 数据链路 | 0/45 | 未开始 | Redis Stream、Worker、PostgreSQL 幂等落库尚未实现 |
 | S6 工程化与求职展示 | 0/75 | 未开始 | 可观测性、CI、benchmark、故障报告和展示材料尚未实现 |
-| **合计** | **152/370** | **41.1%** | 百分比只表示任务数量，不表示风险或工期完成度 |
+| **合计** | **167/370** | **45.1%** | 百分比只表示任务数量，不表示风险或工期完成度 |
 
 ## 3. S0：项目治理、仓库基线与独立性约束
 
@@ -204,34 +204,34 @@
 ### 6.1 阶段契约、领域错误与配置
 
 - [x] `S3-001` **确认阶段 3 目标与非目标** — 实施：实现非流式多候选可靠性，不提前输出 SSE 或启动 Usage Worker；完成证据：用户已明确允许进入 S3，本切片只接 Router 和当前 primary，不进入 SSE/Usage。
-- [x] `S3-002` **定义 Provider 身份模型** — 实施：`routing.Provider` 表达稳定 ID、类型、可用模型和配置版本；完成证据：路由校验和 Plan 只使用稳定 ID，不依赖显示名称。
-- [x] `S3-003` **定义 Route Candidate** — 实施：Candidate 表达 Provider ID/类型、上游模型和稳定优先级；完成证据：配置与 Plan 均不承载 Provider Key，合并用例验证顺序。
-- [ ] `S3-004` **定义有序 Route Plan** — 实施：包含请求模型、候选序列、总 deadline/策略版本；完成证据：顺序确定且可记录但不泄密。
-- [ ] `S3-005` **设计多 Provider 配置格式** — 实施：表达 Provider、模型映射、多个 Key 和 fallback 顺序；完成证据：格式使用 Model-Velo 自己命名，不复制参考项目配置。
-- [x] `S3-006` **校验 Provider 配置唯一性** — 实施：拒绝重复 ID、空候选、未知 Provider/类型、重复模型规则和不支持的模型映射；完成证据：错误包含 Provider 或 Route 位置，坏配置在基础设施连接前阻止启动。
+- [x] `S3-002` **定义 Provider 身份模型** — 实施：启动配置表达稳定 ID、显式协议、API Base 和可用模型；Router 只保留规划需要的 ID/模型集合；完成证据：运行时 Registry 和 Route Plan 使用稳定 ID，同一厂商可拥有多个实例。
+- [x] `S3-003` **定义 Route Candidate** — 实施：Candidate 只表达 Provider ID、上游模型和稳定优先级；完成证据：协议归 Adapter Registry 所有，Candidate 不重复携带类型或 Provider Key。
+- [x] `S3-004` **定义有序 Route Plan** — 实施：Plan 只包含请求模型和候选序列；租户身份留在鉴权/限流/缓存层，总 deadline 由 Orchestrator 持有；完成证据：顺序确定且不携带无效租户、协议或缓存版本字段。
+- [x] `S3-005` **设计多 Provider 配置格式** — 实施：路由 JSON 表达任意数量的 Provider、厂商预设/API Base、多个模型、别名映射和有序候选，Key JSON 独立表达每 Provider 多 Key；完成证据：启动装配不再读取 `Providers[0]`，没有隐式单 Provider 回退，即使只配置一个 Provider 也必须显式声明路由。
+- [x] `S3-006` **校验 Provider 配置唯一性** — 实施：拒绝缺失路由配置、重复 ID、空候选、未知 Provider/类型、重复模型规则和不支持的模型映射；完成证据：错误包含 Provider 或 Route 位置，坏配置在基础设施连接前阻止启动。
 - [ ] `S3-007` **校验时间与容量参数** — 实施：限制总超时、attempt 超时、重试数、队列容量和等待上限；完成证据：零值、负值和不可能组合有测试。
-- [x] `S3-008` **定义稳定内部错误类别** — 实施：`reliability.Category` 区分本地、授权/Key、租户/上游限流、上游 4xx/5xx/协议、网络、超时、队列、Breaker 和取消；完成证据：HTTP 层只把稳定 Failure 映射成公共文案。
+- [x] `S3-008` **定义稳定内部错误类别** — 实施：`reliability.Category` 只保留生产链实际产生的本地、输入能力、无法表达的上游输出、401 Key、403 Key、上游限流、普通 4xx、模型不可用、5xx/协议、网络、超时、队列、Breaker 和取消；完成证据：HTTP 层只映射稳定 Failure，输入能力错误为 400，上游输出能力错误为 502。
 - [x] `S3-009` **为内部错误附加安全元数据** — 实施：Failure 携带 Provider ID、候选、attempt、HTTP 状态、超时范围、Retry-After 和可 unwrap cause；完成证据：Error 文案不输出 cause、Key、URL 或请求内容，合并用例断言路由元数据。
 - [x] `S3-010` **定义 Retry/Fallback/Breaker 判定结果** — 实施：`Signals` 独立表达 Retry、SwitchKey、Fallback、CountBreaker；完成证据：合并表覆盖普通 4xx、Key、429、指定 5xx、协议、网络、超时与取消。
 - [x] `S3-011` **分类本地校验与授权错误** — 实施：本地/授权/租户限流类别不产生任何恢复信号，既有调用顺序在 Provider 前截断；完成证据：400/模型未授权不会取得 Breaker Permit。
-- [ ] `S3-012` **分类 401/403 Key 错误** — 当前：已产生 SwitchKey/Fallback 信号且不计 Breaker；待 Key Selector 实现后验证有/无备用 Key 的真实选择路径。
-- [ ] `S3-013` **分类 429** — 当前：已产生 SwitchKey/Retry/Fallback 信号且不计 Breaker；Key cooldown 与 Retry-After 解析留在 S3-058～060。
+- [x] `S3-012` **分类 401/403 Key 错误** — 实施：401/403 使用不同类别且都产生 SwitchKey/Fallback、不计 Breaker；401 永久停用 Key，403 只在当前请求排除 Key；完成证据：合并分类表和 Key 状态用例固定二者差异。
+- [x] `S3-013` **分类 429** — 实施：产生 SwitchKey/Retry/Fallback 信号且不计 Breaker，实际 Key 按解析后的 `Retry-After` 冷却；完成证据：分类表和 Key 冷却恢复用例覆盖该链路。
 - [x] `S3-014` **分类指定 5xx 与网络错误** — 实施：只有 500/502/503/504 和网络错误产生 Retry/Fallback/CountBreaker；完成证据：合并表证明 501 等其他 5xx 不被笼统计数。
 - [ ] `S3-015` **分类超时与客户端取消** — 当前：已区分上游超时、请求预算超时和 cancel，只有上游超时计 Breaker；Attempt/总预算的最终来源标记待预算切片接入。
 - [ ] `S3-016` **建立错误分类表驱动测试** — 实施：覆盖架构错误矩阵及包装后的 `errors.Is/As`；完成证据：每个类别的三个策略信号固定。
 
 ### 6.2 Router 与 Provider Adapter 边界
 
-- [x] `S3-017` **实现模型到候选的路由输入** — 实施：授权后以 tenant、请求模型和启动配置生成候选集合；完成证据：Router 是纯内存规划，不执行网络调用。
+- [x] `S3-017` **实现模型到候选的路由输入** — 实施：授权后以请求模型和启动配置生成候选集合；租户只属于授权、限流与缓存作用域；完成证据：Router 是纯内存规划，不执行网络调用。
 - [x] `S3-018` **实现 primary 候选选择** — 实施：按 JSON 数组顺序确定第一候选并接入当前 Provider；完成证据：合并用例断言 primary 模型和真实上游请求。
 - [x] `S3-019` **实现有序 fallback 候选生成** — 实施：按配置顺序生成并按 Provider+模型去重；完成证据：候选数组不依赖 map 遍历，合并用例固定 primary/secondary 顺序。
 - [x] `S3-020` **处理无可用路由** — 实施：Router 返回稳定错误，HTTP 输出结构化 `503 route_unavailable`；完成证据：合并用例断言未知模型不增加上游调用。
-- [x] `S3-021` **记录路由配置版本** — 实施：同一个 `MODEL_VELO_CACHE_ROUTE_VERSION` 同时进入 Route Plan 和 Cache Key；完成证据：版本变化产生不同缓存 route digest。
-- [ ] `S3-022` **建立 Router 单元测试** — 实施：覆盖单候选、多候选、重复候选、未知模型、租户差异和顺序稳定；完成证据：测试不依赖真实 Provider。
-- [ ] `S3-023` **在出现第二种实现时提取 Adapter 接口** — 实施：接口只表达一次非流式调用所需能力；完成证据：不是为了未来假设创建大而全接口。
-- [ ] `S3-024` **实现 Adapter Registry** — 实施：按 Provider 类型/ID解析具体 Adapter；完成证据：未知 ID 有明确错误且 registry 不承担 fallback。
-- [ ] `S3-025` **保持 Adapter 错误标准化** — 实施：各 Adapter 把协议差异转换为内部错误类别；完成证据：Orchestrator 不解析供应商 JSON。
-- [ ] `S3-026` **建立 Adapter 契约测试** — 实施：对每个实现复用成功、4xx、5xx、超时、取消和 Body 上限场景；完成证据：行为满足统一最小契约。
+- [x] `S3-021` **隔离缓存路由版本** — 实施：`MODEL_VELO_CACHE_ROUTE_VERSION` 只由 Exact Cache 持有，不再重复进入 Route Plan/Provider；完成证据：版本变化产生不同缓存 route digest，运行时路由结构没有重复版本字段。
+- [ ] `S3-022` **建立 Router 单元测试** — 实施：覆盖单候选、多候选、重复候选、未知模型和顺序稳定；完成证据：测试不依赖租户或真实 Provider。
+- [x] `S3-023` **在出现第二种实现时提取 Adapter 接口** — 实施：接口只表达鉴权方式和一次非流式 Chat 调用；完成证据：Attempt Executor 与唯一的多 Provider HTTP 装配入口都只依赖 Adapter Registry，不存在并行的 Provider Client 抽象或旧单 Provider 构造路径。
+- [x] `S3-024` **实现 Adapter Registry** — 实施：按 Provider ID 和显式 `vendor`/`type` 构造 16 个厂商 Adapter；OpenAI、Mistral、DeepSeek、xAI、Zhipu、Groq、NVIDIA、Together 保留独立厂商类型，仅复用 OpenAI Chat wire codec 与 HTTP 边界；`custom/openai-compatible` 使用通用兼容 Adapter。Registry 不承担 fallback，也不保留旧 Client 别名、协议推断或 Adapter 内置默认 Key。
+- [x] `S3-025` **保持 Adapter 错误标准化** — 实施：共享 HTTP 边界统一状态码、`Retry-After`、响应上限和 Chat 响应结构校验，原生响应归一化为 OpenAI Chat Completion；缺失 Usage 时省略而非伪造，无法表示的原生输出独立分类并 Fallback；完成证据：Orchestrator 不解析供应商 JSON，畸形 2xx 会反馈 Breaker。
+- [ ] `S3-026` **建立 Adapter 契约测试** — 当前：一个合并文件已验证 16 个内置厂商及 custom-compatible 的具体 Adapter 身份、路径、鉴权、请求转换/透传和成功响应；端到端用例证明视觉能力不匹配会跳过当前 Provider、全部候选不支持时返回明确 400；共享 4xx/5xx、超时、取消与 Body 上限矩阵由 OpenAI Adapter 用例覆盖，阶段门禁再补遗漏协议边界。
 
 ### 6.3 Circuit Breaker 状态闭环
 
@@ -245,8 +245,8 @@
 - [x] `S3-034` **限制 HalfOpen 探测并发** — 实施：显式记录 in-flight 探测并按配置拒绝超额请求；完成证据：首 Permit 未反馈时第二个探测被快速拒绝。
 - [x] `S3-035` **实现成功反馈关闭 Breaker** — 实施：达到 HalfOpen 成功探测数后清零并回到 Closed；完成证据：HTTP 恢复请求成功且 Snapshot 为 Closed。
 - [x] `S3-036` **实现失败反馈重新 Open** — 实施：HalfOpen 的可计数失败立即重新 Open 并重置冷却期；完成证据：fake clock 用例验证失败与下一轮恢复。
-- [ ] `S3-037` **忽略 Key 级 401/403** — 当前：Failure/Breaker 已保证不计 Provider 故障；Key 健康更新等待 Key Selector 切片。
-- [ ] `S3-038` **忽略默认 Key 级 429** — 当前：Failure/Breaker 已保证不计 Provider 故障；实际 Key cooldown 等待 Key Selector 切片。
+- [x] `S3-037` **忽略 Key 级 401/403** — 实施：Failure/Breaker 不计 Provider 故障；401 永久禁用实际 Key，403 不修改全局状态；完成证据：合并 Breaker 与 Key 状态用例固定策略。
+- [x] `S3-038` **忽略 Key 级 429** — 实施：Failure/Breaker 不计 Provider 故障，实际选中的 Key 优先按上游 `Retry-After` 冷却，缺失时使用 30s；完成证据：分类表和 Key 状态用例证明不会污染 Provider Breaker。
 - [x] `S3-039` **忽略客户端取消** — 实施：取消 Complete/Abandon 只释放探测许可，不修改失败计数；完成证据：合并用例断言取消后仍为 Closed。
 - [x] `S3-040` **统计网络/指定 5xx 失败** — 实施：Breaker 只读取 `CountBreaker` 信号；完成证据：网络及 500/502/503/504 计数，401/429/501/cancel 不计数。
 - [x] `S3-041` **保证每个准入结果只回写一次** — 实施：Permit 使用原子一次性标记，调用路径 defer Abandon；完成证据：重复 Complete 和 Abandon 后 Complete 均被拒绝。
@@ -268,46 +268,46 @@
 
 ### 6.5 Provider Key 选择与健康状态
 
-- [ ] `S3-054` **定义 Key 内部身份与密文边界** — 实施：配置中的 Secret 与日志/状态 ID 分离；完成证据：任何快照只显示 Key ID/掩码。
-- [ ] `S3-055` **加载每 Provider 多 Key 配置** — 实施：拒绝重复 ID、空 Secret 和无 Key Provider；完成证据：启动校验有测试。
-- [ ] `S3-056` **实现并发安全的轮换策略** — 实施：在可用 Key 中公平选择；完成证据：并发调用不会长期固定首 Key。
-- [ ] `S3-057` **跳过禁用或认证失败 Key** — 实施：401/403 后从选择集合移出或按明确策略恢复；完成证据：原 Key 不被立即重试。
-- [ ] `S3-058` **实现 429 Key cooldown** — 实施：根据 Retry-After 或默认冷却时间暂时跳过；完成证据：fake clock 到期前后选择结果正确。
-- [ ] `S3-059` **解析 Retry-After 秒数格式** — 实施：处理非负整数和边界；完成证据：非法值不导致无限等待。
-- [ ] `S3-060` **解析 Retry-After HTTP-date 格式** — 实施：以注入 Clock 计算剩余时间；完成证据：过去时间和超预算值有测试。
-- [ ] `S3-061` **记录 Key 成功反馈** — 实施：清理可恢复的临时状态但不掩盖永久禁用；完成证据：状态机规则明确。
-- [ ] `S3-062` **处理所有 Key 不可用** — 实施：返回 key-exhausted 类别供 Attempt/Fallback 决策；完成证据：不退回使用冷却或无效 Key。
+- [ ] `S3-054` **定义 Key 内部身份与密文边界** — 当前：生产类型已分离 Key ID/Secret，快照、Failure 和安全 String 只暴露 ID；按用户要求未新增专项证据，暂不勾选。
+- [ ] `S3-055` **加载每 Provider 多 Key 配置** — 当前：统一由 `MODEL_VELO_PROVIDER_KEYS_JSON` 加载，配置层不再依赖路由 Provider 数量；Registry 在启动阶段拒绝重复 ID、空 Secret、未知或缺 Key Provider，尚未增加配置专项测试。
+- [ ] `S3-056` **实现并发安全的轮换策略** — 当前：已用原子游标轮换选择起点，以读写锁保护健康状态；并发/race 完成证据留在阶段门禁。
+- [x] `S3-057` **跳过不可再次使用的 Key** — 实施：后续请求跳过 401 禁用 Key；当前请求额外排除已返回 401/403 的 Key，403 不影响后续请求；完成证据：选择器状态用例证明 401/403 的全局状态不同。
+- [x] `S3-058` **实现 429 Key cooldown** — 实施：实际 429 优先采用上游 `Retry-After` 冷却选中 Key，缺失/非法时回退 30 秒，并把任何值限制在 24 小时内；完成证据：短冷却恢复以及并发反馈不缩短较长冷却的合并用例通过。
+- [x] `S3-059` **解析 Retry-After 秒数格式** — 实施：只接受非负十进制秒数，超大值限制为 24 小时并向客户端回传规范秒数；完成证据：既有上游 HTTP 错误链路验证 `Retry-After: 17` 贯穿 Adapter、Failure 和响应。
+- [ ] `S3-060` **解析 Retry-After HTTP-date 格式** — 当前：生产代码已通过 `http.ParseTime` 计算剩余时间，过去时间按立即可用处理，未来超大值限制为 24 小时；确定性时钟证据尚未补。
+- [x] `S3-061` **记录 Key 成功反馈** — 实施：成功只清理选择时观察到的同一版本状态；完成证据：较旧的并发成功不能清除或缩短较新的 429 冷却，也不能恢复 401 禁用 Key。
+- [ ] `S3-062` **处理所有 Key 不可用** — 当前：生产链返回 `key_exhausted` Failure 和结构化 `503 provider_keys_exhausted`，不会退回使用冷却或禁用 Key；Fallback 接入及专项证据未完成。
 - [ ] `S3-063` **建立 Key Selector 单元测试** — 实施：覆盖轮换、禁用、401、403、429、冷却恢复和全耗尽；完成证据：测试不输出 Secret。
 - [ ] `S3-064` **建立 Key Selector race 测试** — 实施：并发选择与反馈；完成证据：无数据竞争、重复状态损坏或越界。
 
 ### 6.6 有限 Retry 与时间预算
 
-- [ ] `S3-065` **定义 Retry Policy** — 实施：配置最大尝试、初始退避、倍数、上限、抖动和允许类别；完成证据：参数有安全边界。
-- [ ] `S3-066` **明确 400 不 Retry** — 实施：本地和上游普通 400 直接结束当前候选；完成证据：Adapter 调用次数为一。
-- [ ] `S3-067` **实现 401/403 换 Key 路径** — 实施：不使用原 Key，只有其他可用 Key 时继续；完成证据：请求次数与 Key 选择可断言。
-- [ ] `S3-068` **实现 429 优先换 Key** — 实施：冷却当前 Key，再选择未冷却 Key；完成证据：只有无 Key 时才考虑等待/fallback。
-- [ ] `S3-069` **实现指定 5xx 有限 Retry** — 实施：仅对策略表状态重试；完成证据：尝试次数不超过配置。
-- [ ] `S3-070` **实现网络错误有限 Retry** — 实施：区分临时连接错误和不可重试的构造/协议错误；完成证据：分类测试固定。
-- [ ] `S3-071` **实现指数退避与上限** — 实施：按 attempt 计算且防溢出；完成证据：确定性序列测试通过。
-- [ ] `S3-072` **注入抖动随机源** — 实施：生产减少惊群，测试可固定；完成证据：退避仍受上下限约束。
-- [ ] `S3-073` **实现 Context-aware 退避等待** — 实施：用 Timer/select 响应取消，不直接 `time.Sleep`；完成证据：取消立即返回且 Timer 正确释放。
-- [ ] `S3-074` **建立请求总时间预算** — 实施：入口生成总 deadline，Retry 与 Fallback 共享；完成证据：候选增加不会线性突破上限。
-- [ ] `S3-075` **建立单次 Attempt 超时** — 实施：每次调用取配置和剩余预算较小值；完成证据：最后一次不会越过总 deadline。
-- [ ] `S3-076` **限制 Retry-After 等待** — 实施：超过剩余预算时不等待并交给 fallback/最终错误；完成证据：极大 Header 值不会挂住请求。
-- [ ] `S3-077` **记录安全的尝试元数据** — 实施：记录 attempt 序号、Provider/Key ID、类别和耗时；完成证据：不记录请求密钥或完整提示词。
+- [ ] `S3-065` **定义 Retry Policy** — 当前：生产配置已限制最大尝试、初始/最大退避、倍数、抖动、总预算和单次超时；配置边界专项证据尚未补。
+- [x] `S3-066` **明确 400 不 Retry** — 实施：Retry Policy 只读取恢复信号，本地和上游普通 400 没有 Retry/SwitchKey 信号，因此立即结束；完成证据：合并 HTTP 用例断言上游 400 时调用次数严格为一。
+- [ ] `S3-067` **实现 401/403 换 Key 路径** — 当前：两者均以零退避重新进入 Breaker→Queue→Key 并排除本请求已拒绝的 Key；只有 401 写入全局禁用状态；完整调用序列证据尚未补。
+- [ ] `S3-068` **实现 429 优先换 Key** — 当前：实际 Key 按 `Retry-After` 冷却，再以零退避选择其他可用 Key；全 Key 不可用时返回 Key 耗尽供后续 Fallback，调用序列证据尚未补。
+- [ ] `S3-069` **实现指定 5xx 有限 Retry** — 当前：500/502/503/504 在最大次数和总预算内退避重试，每次重新准入并优先保持原 Key；尝试次数证据尚未补。
+- [ ] `S3-070` **实现网络错误有限 Retry** — 当前：网络调用错误允许有限 Retry，本地构造和上游协议错误不 Retry；更细的临时网络错误矩阵尚未补。
+- [ ] `S3-071` **实现指数退避与上限** — 当前：生产按已完成 attempt 计算指数序列并在浮点放大前后限制最大退避；确定性序列证据尚未补。
+- [ ] `S3-072` **注入抖动随机源** — 当前：生产使用并发安全随机源施加可配置比例抖动并再次限制上限；可固定随机源的证据构造尚未补。
+- [ ] `S3-073` **实现 Context-aware 退避等待** — 当前：生产使用 Timer/select，在退避期间响应总预算和客户端取消并安全停止 Timer；取消专项证据尚未补。
+- [ ] `S3-074` **建立请求总时间预算** — 当前：Cache miss 后由 Orchestrator 建立统一 deadline，所有 Retry 与 Fallback 已共享；多候选预算耗尽/取消证据仍待门禁。
+- [ ] `S3-075` **建立单次 Attempt 超时** — 当前：每次上游 HTTP 调用创建子 deadline，父级总预算更早时自动优先生效；最后一次预算边界证据尚未补。
+- [x] `S3-076` **限制 Retry-After 等待** — 实施：只有 Key 存在明确冷却恢复时间、仍有 Retry 次数且等待小于剩余总预算时才释放资源后等待并重选；否则立即交给 Fallback 或最终错误；完成证据：现有合并用例证明短冷却后 Key 恢复，超出剩余预算的等待不会启动或耗尽 Context。
+- [x] `S3-077` **记录安全的尝试元数据** — 实施：Trail 只记录真正上游调用的 attempt 序号、Provider/模型/Key ID、类别、状态码和耗时，并随成功结果或最终 Failure 汇总；完成证据：Key 冷却等待不占 attempt，合并用例断言一次真实调用只产生一条记录且结构不含 Secret/提示词。
 - [ ] `S3-078` **建立 Retry 策略测试矩阵** — 实施：覆盖所有错误类别、尝试上限、退避、Retry-After、取消与总预算；完成证据：使用 fake clock/随机源，避免慢测试。
 
 ### 6.7 Attempt Executor 与 Fallback Orchestrator
 
-- [ ] `S3-079` **实现单候选 Attempt Executor 骨架** — 实施：输入 candidate/context/budget，输出标准结果；完成证据：不遍历 fallback 候选。
+- [x] `S3-079` **实现单候选 Attempt Executor 骨架** — 实施：输入 candidate/context/request，输出标准结果；完成证据：组件只执行一个 Candidate，候选遍历留在 Orchestrator。
 - [ ] `S3-080` **固定 Attempt 内部执行顺序** — 实施：Breaker 准入→Queue→Key→Retry→Adapter→反馈；完成证据：调用顺序测试可观察。
 - [ ] `S3-081` **在 Attempt 中配对资源释放** — 实施：Breaker 反馈、Queue release、Body close 和 Timer 停止覆盖所有路径；完成证据：故障注入后无泄漏。
-- [ ] `S3-082` **实现 Attempt 成功结果** — 实施：返回响应、实际 Provider/模型/Key ID 和尝试统计；完成证据：供 Cache/Usage 使用但不含 Secret。
-- [ ] `S3-083` **实现 Attempt 最终错误** — 实施：Retry 耗尽后保留最有用的安全类别和 cause；完成证据：HTTP 层不读取内部实现细节。
+- [x] `S3-082` **实现 Attempt 成功结果** — 实施：返回响应、实际 Provider/模型/Key ID 和尝试统计；完成证据：`AttemptResult`/`ExecutionResult` 可供 Cache/Usage 使用且不含 Secret。
+- [x] `S3-083` **实现 Attempt 最终错误** — 实施：Retry 耗尽后保留最后一次安全 Failure，并附累计 attempt/fallback；完成证据：HTTP 层只接收最终 Failure，不读取执行组件内部状态。
 - [ ] `S3-084` **建立 Attempt 组件交互测试** — 实施：用 fake Breaker/Queue/Selector/Adapter 覆盖准入拒绝、满队列、换 Key、Retry 和成功；完成证据：每个依赖调用次数固定。
-- [ ] `S3-085` **实现 Fallback Orchestrator 外层循环** — 实施：依序执行候选，每个候选重新进入完整 Attempt；完成证据：不会在候选之间复用 Queue/Breaker/Key 状态句柄。
-- [ ] `S3-086` **按错误策略决定是否 Fallback** — 实施：400/取消停止，允许类别进入下一候选；完成证据：候选调用序列符合矩阵。
-- [ ] `S3-087` **成功后立即停止候选循环** — 实施：返回首个成功结果；完成证据：后续 Provider 调用次数为零。
+- [x] `S3-085` **实现 Fallback Orchestrator 外层循环** — 实施：依序执行候选，每个候选重新进入完整 Attempt；完成证据：503 场景 primary 完成后由 secondary 的独立 Registry 资源取得成功。
+- [x] `S3-086` **按错误策略决定是否 Fallback** — 实施：普通 4xx/取消停止，明确模型不可用 400/404/422、能力不匹配和可恢复失败进入下一候选；Fallback 成功响应不写 Exact Cache；完成证据：合并 HTTP 用例同时断言调用次数与 Cache Store 次数。
+- [x] `S3-087` **成功后立即停止候选循环** — 实施：返回首个成功结果；完成证据：primary 200 时 secondary 调用次数严格为零。
 - [ ] `S3-088` **保留统一总预算和取消传播** — 实施：每个候选读取剩余 deadline；完成证据：fallback 期间客户端取消会停止全部后续工作。
 - [ ] `S3-089` **建立端到端可靠性故障矩阵** — 实施：假 Provider 覆盖 primary 成功、Retry 后成功、fallback 成功、全失败、Breaker Open、Queue 满、Key 耗尽和预算耗尽；完成证据：测试同时断言调用顺序和最终错误。
 - [ ] `S3-090` **完成阶段 3 门禁并等待用户确认** — 实施：运行单元/集成/race/故障测试，更新架构与错误矩阵，完成字面/近似/人工独立性检查；完成证据：指标严格小于 10% 且用户允许进入 S4。

@@ -14,61 +14,19 @@ type healthResponse struct {
 	Status string `json:"status"`
 }
 
-func NewRouter(client *provider.Client, access AccessController, limiter RateLimiter, cache ResponseCache) *gin.Engine {
-	routes, err := routing.New(routing.SingleProviderDefinition("upstream", "single-provider-v1"))
-	if err != nil {
-		panic("httpapi: create default routing: " + err.Error())
-	}
-	breaker, err := reliability.NewBreaker("upstream", reliability.DefaultBreakerConfig())
-	if err != nil {
-		panic("httpapi: create default circuit breaker: " + err.Error())
-	}
-	return NewRouterWithBreaker(client, access, limiter, cache, routes, breaker)
-}
-
-func NewRouterWithRouting(
-	client *provider.Client,
+func NewRouter(
+	adapters *provider.AdapterRegistry,
 	access AccessController,
 	limiter RateLimiter,
 	cache ResponseCache,
 	routes *routing.Router,
-) *gin.Engine {
-	breaker, err := reliability.NewBreaker("upstream", reliability.DefaultBreakerConfig())
-	if err != nil {
-		panic("httpapi: create default circuit breaker: " + err.Error())
-	}
-	return NewRouterWithBreaker(client, access, limiter, cache, routes, breaker)
-}
-
-func NewRouterWithBreaker(
-	client *provider.Client,
-	access AccessController,
-	limiter RateLimiter,
-	cache ResponseCache,
-	routes *routing.Router,
-	breaker *reliability.Breaker,
-) *gin.Engine {
-	if breaker == nil {
-		panic("httpapi: circuit breaker is nil")
-	}
-	queues, err := reliability.NewQueueRegistry([]string{breaker.Snapshot().ProviderID}, reliability.DefaultQueueConfig())
-	if err != nil {
-		panic("httpapi: create default provider queue: " + err.Error())
-	}
-	return NewRouterWithReliability(client, access, limiter, cache, routes, breaker, queues)
-}
-
-func NewRouterWithReliability(
-	client *provider.Client,
-	access AccessController,
-	limiter RateLimiter,
-	cache ResponseCache,
-	routes *routing.Router,
-	breaker *reliability.Breaker,
+	breakers *reliability.BreakerRegistry,
 	queues *reliability.QueueRegistry,
+	providerKeys *reliability.ProviderKeyRegistry,
+	retry reliability.RetryPolicies,
 ) *gin.Engine {
-	if client == nil {
-		panic("httpapi: provider client is nil")
+	if adapters == nil {
+		panic("httpapi: provider adapter registry is nil")
 	}
 	if access == nil {
 		panic("httpapi: access controller is nil")
@@ -82,11 +40,22 @@ func NewRouterWithReliability(
 	if routes == nil {
 		panic("httpapi: routing is nil")
 	}
-	if breaker == nil {
-		panic("httpapi: circuit breaker is nil")
+	if breakers == nil {
+		panic("httpapi: circuit breaker registry is nil")
 	}
 	if queues == nil {
 		panic("httpapi: provider queue registry is nil")
+	}
+	if retry == nil {
+		panic("httpapi: retry policy is nil")
+	}
+	attempts, err := reliability.NewAttemptExecutor(adapters, breakers, queues, providerKeys, retry)
+	if err != nil {
+		panic("httpapi: create attempt executor: " + err.Error())
+	}
+	orchestrator, err := reliability.NewOrchestrator(attempts, retry)
+	if err != nil {
+		panic("httpapi: create fallback orchestrator: " + err.Error())
 	}
 
 	router := gin.New()
@@ -97,13 +66,11 @@ func NewRouterWithReliability(
 	protected := router.Group("/v1")
 	protected.Use(authenticationMiddleware(access))
 	protected.POST("/chat/completions", chatHandler{
-		client:  client,
-		access:  access,
-		limiter: limiter,
-		cache:   cache,
-		routes:  routes,
-		breaker: breaker,
-		queues:  queues,
+		access:       access,
+		limiter:      limiter,
+		cache:        cache,
+		routes:       routes,
+		orchestrator: orchestrator,
 	}.complete)
 
 	return router

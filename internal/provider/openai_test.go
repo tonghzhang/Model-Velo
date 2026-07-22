@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-func TestChatCompletionsEndpoint(t *testing.T) {
+func TestCompatibleChatCompletionsEndpoint(t *testing.T) {
 	tests := []struct {
 		name string
 		base string
@@ -22,54 +22,47 @@ func TestChatCompletionsEndpoint(t *testing.T) {
 		{name: "trailing slash", base: "https://example.com/", want: "https://example.com/v1/chat/completions"},
 		{name: "version path", base: "https://example.com/v1", want: "https://example.com/v1/chat/completions"},
 		{name: "full endpoint", base: "https://example.com/v1/chat/completions/", want: "https://example.com/v1/chat/completions"},
-		{name: "provider prefix", base: "https://example.com/openai", want: "https://example.com/openai/v1/chat/completions"},
+		{name: "provider prefix", base: "https://example.com/openai", want: "https://example.com/openai/chat/completions"},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got, err := chatCompletionsEndpoint(test.base)
+			got, err := compatibleChatCompletionsEndpoint(test.base)
 			if err != nil {
-				t.Fatalf("chatCompletionsEndpoint() error = %v", err)
+				t.Fatalf("compatibleChatCompletionsEndpoint() error = %v", err)
 			}
 			if got != test.want {
-				t.Fatalf("chatCompletionsEndpoint() = %q, want %q", got, test.want)
+				t.Fatalf("compatibleChatCompletionsEndpoint() = %q, want %q", got, test.want)
 			}
 		})
 	}
 }
 
-func TestNewClientValidatesConfig(t *testing.T) {
+func TestOpenAIAdapterValidatesConfig(t *testing.T) {
 	tests := []struct {
 		name    string
 		baseURL string
-		apiKey  string
-		timeout time.Duration
 	}{
-		{name: "missing URL", baseURL: "", apiKey: "test-key", timeout: time.Second},
-		{name: "unsupported scheme", baseURL: "ftp://example.com", apiKey: "test-key", timeout: time.Second},
-		{name: "missing host", baseURL: "http:///v1", apiKey: "test-key", timeout: time.Second},
-		{name: "embedded credentials", baseURL: "https://user:pass@example.com", apiKey: "test-key", timeout: time.Second},
-		{name: "query", baseURL: "https://example.com?secret=value", apiKey: "test-key", timeout: time.Second},
-		{name: "missing key", baseURL: "https://example.com", apiKey: "", timeout: time.Second},
-		{name: "invalid timeout", baseURL: "https://example.com", apiKey: "test-key", timeout: 0},
+		{name: "missing URL", baseURL: ""},
+		{name: "unsupported scheme", baseURL: "ftp://example.com"},
+		{name: "missing host", baseURL: "http:///v1"},
+		{name: "embedded credentials", baseURL: "https://user:pass@example.com"},
+		{name: "query", baseURL: "https://example.com?secret=value"},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			client, err := NewClient(test.baseURL, test.apiKey, test.timeout)
+			adapter, err := newOpenAIAdapter(test.baseURL, DefaultHTTPConfig())
 			if err == nil {
-				t.Fatalf("NewClient() = %#v, nil; want error", client)
-			}
-			if strings.Contains(err.Error(), test.apiKey) && test.apiKey != "" {
-				t.Fatalf("error contains API key: %q", err)
+				t.Fatalf("newOpenAIAdapter() = %#v, nil; want error", adapter)
 			}
 		})
 	}
 }
 
-func TestClientChat(t *testing.T) {
+func TestOpenAIAdapterComplete(t *testing.T) {
 	wantRequestBody := `{"model":"demo-model","messages":[{"role":"user","content":"hello"}],"temperature":0.2}`
-	wantResponseBody := `{"id":"chatcmpl-test","object":"chat.completion","choices":[]}`
+	wantResponseBody := `{"id":"chatcmpl-test","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"ok"}}]}`
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -101,29 +94,32 @@ func TestClientChat(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	client, err := NewClient(upstream.URL+"/", "provider-test-key", time.Second)
+	adapter, err := newOpenAIAdapter(upstream.URL+"/v1", DefaultHTTPConfig())
 	if err != nil {
-		t.Fatalf("NewClient() error = %v", err)
+		t.Fatalf("newOpenAIAdapter() error = %v", err)
 	}
 
-	responseBody, err := client.Chat(context.Background(), "request-test-id", []byte(wantRequestBody))
+	responseBody, err := adapter.Complete(context.Background(), ChatInput{
+		RequestID: "request-test-id",
+		Request:   mustParseChatRequest(t, wantRequestBody),
+	}, "provider-test-key")
 	if err != nil {
-		t.Fatalf("Chat() error = %v", err)
+		t.Fatalf("Complete() error = %v", err)
 	}
 	if string(responseBody) != wantResponseBody {
 		t.Fatalf("response body = %s, want %s", responseBody, wantResponseBody)
 	}
 }
 
-func TestClientChatPropagatesCancellation(t *testing.T) {
+func TestOpenAIAdapterPropagatesCancellation(t *testing.T) {
 	requestStarted := make(chan struct{})
 	upstreamCancelled := make(chan struct{})
 
-	client, err := NewClient("https://example.com", "provider-test-key", 5*time.Second)
+	adapter, err := newOpenAIAdapter("https://example.com/v1", DefaultHTTPConfig())
 	if err != nil {
-		t.Fatalf("NewClient() error = %v", err)
+		t.Fatalf("newOpenAIAdapter() error = %v", err)
 	}
-	client.httpClient.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
+	adapter.transport.client.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		close(requestStarted)
 		<-request.Context().Done()
 		close(upstreamCancelled)
@@ -131,9 +127,13 @@ func TestClientChatPropagatesCancellation(t *testing.T) {
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
+	request := mustParseChatRequest(t, `{"model":"demo-model"}`)
 	result := make(chan error, 1)
 	go func() {
-		_, callErr := client.Chat(ctx, "request-test-id", []byte(`{"model":"demo-model"}`))
+		_, callErr := adapter.Complete(ctx, ChatInput{
+			RequestID: "request-test-id",
+			Request:   request,
+		}, "provider-test-key")
 		result <- callErr
 	}()
 
@@ -147,10 +147,10 @@ func TestClientChatPropagatesCancellation(t *testing.T) {
 	select {
 	case callErr := <-result:
 		if !errors.Is(callErr, context.Canceled) {
-			t.Fatalf("Chat() error = %v, want context.Canceled", callErr)
+			t.Fatalf("Complete() error = %v, want context.Canceled", callErr)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("Chat() did not return after cancellation")
+		t.Fatal("Complete() did not return after cancellation")
 	}
 
 	select {
@@ -160,7 +160,7 @@ func TestClientChatPropagatesCancellation(t *testing.T) {
 	}
 }
 
-func TestClientChatRejectsInvalidResponse(t *testing.T) {
+func TestOpenAIAdapterRejectsInvalidResponse(t *testing.T) {
 	tests := []struct {
 		name        string
 		contentType string
@@ -178,45 +178,51 @@ func TestClientChatRejectsInvalidResponse(t *testing.T) {
 			}))
 			defer upstream.Close()
 
-			client, err := NewClient(upstream.URL, "provider-test-key", time.Second)
+			adapter, err := newOpenAIAdapter(upstream.URL+"/v1", DefaultHTTPConfig())
 			if err != nil {
-				t.Fatalf("NewClient() error = %v", err)
+				t.Fatalf("newOpenAIAdapter() error = %v", err)
 			}
 
-			_, err = client.Chat(context.Background(), "request-test-id", []byte(`{"model":"demo-model"}`))
+			_, err = adapter.Complete(context.Background(), ChatInput{
+				RequestID: "request-test-id",
+				Request:   mustParseChatRequest(t, `{"model":"demo-model"}`),
+			}, "provider-test-key")
 			if !errors.Is(err, ErrInvalidResponse) {
-				t.Fatalf("Chat() error = %v, want ErrInvalidResponse", err)
+				t.Fatalf("Complete() error = %v, want ErrInvalidResponse", err)
 			}
 		})
 	}
 }
 
-func TestClientChatLimitsResponseBody(t *testing.T) {
+func TestOpenAIAdapterLimitsResponseBody(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"content":"response larger than test limit"}`)
 	}))
 	defer upstream.Close()
 
-	client, err := NewClient(upstream.URL, "provider-test-key", time.Second)
+	adapter, err := newOpenAIAdapter(upstream.URL+"/v1", DefaultHTTPConfig())
 	if err != nil {
-		t.Fatalf("NewClient() error = %v", err)
+		t.Fatalf("newOpenAIAdapter() error = %v", err)
 	}
-	client.maxResponseBytes = 16
+	adapter.transport.maxResponseBytes = 16
 
-	_, err = client.Chat(context.Background(), "request-test-id", []byte(`{"model":"demo-model"}`))
+	_, err = adapter.Complete(context.Background(), ChatInput{
+		RequestID: "request-test-id",
+		Request:   mustParseChatRequest(t, `{"model":"demo-model"}`),
+	}, "provider-test-key")
 	if !errors.Is(err, ErrResponseTooLarge) {
-		t.Fatalf("Chat() error = %v, want ErrResponseTooLarge", err)
+		t.Fatalf("Complete() error = %v, want ErrResponseTooLarge", err)
 	}
 }
 
-func TestClientChatClosesBodyAfterReadError(t *testing.T) {
+func TestOpenAIAdapterClosesBodyAfterReadError(t *testing.T) {
 	body := &failingReadCloser{}
-	client, err := NewClient("https://example.com", "provider-test-key", time.Second)
+	adapter, err := newOpenAIAdapter("https://example.com/v1", DefaultHTTPConfig())
 	if err != nil {
-		t.Fatalf("NewClient() error = %v", err)
+		t.Fatalf("newOpenAIAdapter() error = %v", err)
 	}
-	client.httpClient.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
+	adapter.transport.client.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     http.Header{"Content-Type": []string{"application/json"}},
@@ -225,7 +231,10 @@ func TestClientChatClosesBodyAfterReadError(t *testing.T) {
 		}, nil
 	})
 
-	_, err = client.Chat(context.Background(), "request-test-id", []byte(`{"model":"demo-model"}`))
+	_, err = adapter.Complete(context.Background(), ChatInput{
+		RequestID: "request-test-id",
+		Request:   mustParseChatRequest(t, `{"model":"demo-model"}`),
+	}, "provider-test-key")
 	if err == nil || !strings.Contains(err.Error(), "read upstream response") {
 		t.Fatalf("Chat() error = %v, want response read error", err)
 	}

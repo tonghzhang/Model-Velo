@@ -27,13 +27,10 @@ import (
 
 const (
 	httpAddressEnv         = "MODEL_VELO_HTTP_ADDR"
-	upstreamBaseURLEnv     = "MODEL_VELO_UPSTREAM_BASE_URL"
-	upstreamAPIKeyEnv      = "MODEL_VELO_UPSTREAM_API_KEY"
-	upstreamTimeoutEnv     = "MODEL_VELO_UPSTREAM_TIMEOUT"
 	shutdownTimeoutEnv     = "MODEL_VELO_SHUTDOWN_TIMEOUT"
 	defaultHTTPAddress     = ":8080"
-	defaultUpstreamTimeout = 30 * time.Second
 	defaultShutdownTimeout = 10 * time.Second
+	responseWriteGrace     = 15 * time.Second
 )
 
 func main() {
@@ -88,7 +85,7 @@ func run() error {
 		return fmt.Errorf("configure response cache: %w", err)
 	}
 
-	server, err := newHTTPServerWithRouting(access, limiter, cache, startup.routing, startup.breaker, startup.queues)
+	server, err := newHTTPServer(access, limiter, cache, startup.routing, startup.adapters, startup.breakers, startup.queues, startup.providerKeys, startup.retry)
 	if err != nil {
 		return fmt.Errorf("configure HTTP server: %w", err)
 	}
@@ -106,8 +103,11 @@ type startupConfig struct {
 	rateLimit       config.RateLimit
 	responseCache   config.ResponseCache
 	routing         *routing.Router
-	breaker         *reliability.Breaker
+	adapters        *provider.AdapterRegistry
+	breakers        *reliability.BreakerRegistry
 	queues          *reliability.QueueRegistry
+	providerKeys    *reliability.ProviderKeyRegistry
+	retry           *reliability.RetryRegistry
 	shutdownTimeout time.Duration
 }
 
@@ -129,33 +129,76 @@ func loadStartupConfig() (startupConfig, error) {
 	if err != nil {
 		return startupConfig{}, err
 	}
-	routingDefinition, err := config.LoadRouting(responseCache.RouteVersion)
-	if err != nil {
-		return startupConfig{}, err
-	}
-	routes, err := routing.New(routingDefinition)
-	if err != nil {
-		return startupConfig{}, fmt.Errorf("configure routing: %w", err)
-	}
 	breakerConfig, err := config.LoadCircuitBreaker()
 	if err != nil {
 		return startupConfig{}, err
-	}
-	breaker, err := reliability.NewBreaker(routingDefinition.Providers[0].ID, breakerConfig)
-	if err != nil {
-		return startupConfig{}, fmt.Errorf("configure circuit breaker: %w", err)
 	}
 	queueConfig, err := config.LoadProviderQueue()
 	if err != nil {
 		return startupConfig{}, err
 	}
-	providerIDs := make([]string, 0, len(routingDefinition.Providers))
-	for _, configuredProvider := range routingDefinition.Providers {
-		providerIDs = append(providerIDs, configuredProvider.ID)
+	retryConfig, err := config.LoadRetry()
+	if err != nil {
+		return startupConfig{}, err
 	}
-	queues, err := reliability.NewQueueRegistry(providerIDs, queueConfig)
+	routingConfig, err := config.LoadRouting(config.ProviderDefaults{
+		Breaker: breakerConfig,
+		Queue:   queueConfig,
+		Retry:   retryConfig,
+		HTTP:    provider.DefaultHTTPConfig(),
+	})
+	if err != nil {
+		return startupConfig{}, err
+	}
+	routes, err := routing.New(routingConfig.Definition)
+	if err != nil {
+		return startupConfig{}, fmt.Errorf("configure routing: %w", err)
+	}
+	providerIDs := make([]string, 0, len(routingConfig.Definition.Providers))
+	adapterConfigs := make([]provider.AdapterConfig, 0, len(routingConfig.Definition.Providers))
+	breakerConfigs := make(map[string]reliability.BreakerConfig, len(routingConfig.Providers))
+	queueConfigs := make(map[string]reliability.QueueConfig, len(routingConfig.Providers))
+	retryConfigs := make(map[string]reliability.RetryConfig, len(routingConfig.Providers))
+	for _, configuredProvider := range routingConfig.Definition.Providers {
+		runtime := routingConfig.Providers[configuredProvider.ID]
+		providerIDs = append(providerIDs, configuredProvider.ID)
+		adapterConfigs = append(adapterConfigs, provider.AdapterConfig{
+			ProviderID: configuredProvider.ID,
+			Protocol:   configuredProvider.Type,
+			BaseURL:    configuredProvider.BaseURL,
+			HTTP:       runtime.HTTP,
+		})
+		breakerConfigs[configuredProvider.ID] = runtime.Breaker
+		queueConfigs[configuredProvider.ID] = runtime.Queue
+		retryConfigs[configuredProvider.ID] = runtime.Retry
+	}
+	adapters, err := provider.NewAdapterRegistry(adapterConfigs)
+	if err != nil {
+		return startupConfig{}, err
+	}
+	breakers, err := reliability.NewBreakerRegistryWithConfigs(providerIDs, breakerConfigs)
+	if err != nil {
+		return startupConfig{}, fmt.Errorf("configure circuit breakers: %w", err)
+	}
+	queues, err := reliability.NewQueueRegistryWithConfigs(providerIDs, queueConfigs)
 	if err != nil {
 		return startupConfig{}, fmt.Errorf("configure provider queue: %w", err)
+	}
+	var providerKeys *reliability.ProviderKeyRegistry
+	keyedProviderIDs := adapters.KeyedProviderIDs()
+	if len(keyedProviderIDs) > 0 {
+		keySets, err := config.LoadProviderKeys()
+		if err != nil {
+			return startupConfig{}, err
+		}
+		providerKeys, err = reliability.NewProviderKeyRegistry(keyedProviderIDs, keySets)
+		if err != nil {
+			return startupConfig{}, fmt.Errorf("configure provider keys: %w", err)
+		}
+	}
+	retry, err := reliability.NewRetryRegistry(providerIDs, retryConfigs)
+	if err != nil {
+		return startupConfig{}, fmt.Errorf("configure retry policy: %w", err)
 	}
 
 	shutdownTimeout, err := loadShutdownTimeout()
@@ -169,8 +212,11 @@ func loadStartupConfig() (startupConfig, error) {
 		rateLimit:       rateLimit,
 		responseCache:   responseCache,
 		routing:         routes,
-		breaker:         breaker,
+		adapters:        adapters,
+		breakers:        breakers,
 		queues:          queues,
+		providerKeys:    providerKeys,
+		retry:           retry,
 		shutdownTimeout: shutdownTimeout,
 	}, nil
 }
@@ -179,61 +225,29 @@ func newHTTPServer(
 	access httpapi.AccessController,
 	limiter httpapi.RateLimiter,
 	cache httpapi.ResponseCache,
-) (*http.Server, error) {
-	routes, err := routing.New(routing.SingleProviderDefinition("upstream", "single-provider-v1"))
-	if err != nil {
-		return nil, fmt.Errorf("configure default routing: %w", err)
-	}
-	breaker, err := reliability.NewBreaker("upstream", reliability.DefaultBreakerConfig())
-	if err != nil {
-		return nil, fmt.Errorf("configure default circuit breaker: %w", err)
-	}
-	queues, err := reliability.NewQueueRegistry([]string{"upstream"}, reliability.DefaultQueueConfig())
-	if err != nil {
-		return nil, fmt.Errorf("configure default provider queue: %w", err)
-	}
-	return newHTTPServerWithRouting(access, limiter, cache, routes, breaker, queues)
-}
-
-func newHTTPServerWithRouting(
-	access httpapi.AccessController,
-	limiter httpapi.RateLimiter,
-	cache httpapi.ResponseCache,
 	routes *routing.Router,
-	breaker *reliability.Breaker,
+	adapters *provider.AdapterRegistry,
+	breakers *reliability.BreakerRegistry,
 	queues *reliability.QueueRegistry,
+	providerKeys *reliability.ProviderKeyRegistry,
+	retry reliability.RetryPolicies,
 ) (*http.Server, error) {
+	if retry == nil {
+		return nil, errors.New("retry policy is required")
+	}
 	address := strings.TrimSpace(os.Getenv(httpAddressEnv))
 	if address == "" {
 		address = defaultHTTPAddress
 	}
 
-	upstreamTimeout, err := loadUpstreamTimeout()
-	if err != nil {
-		return nil, err
-	}
-
-	upstreamClient, err := provider.NewClient(
-		os.Getenv(upstreamBaseURLEnv),
-		os.Getenv(upstreamAPIKeyEnv),
-		upstreamTimeout,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("configure upstream provider: %w", err)
-	}
-
 	return &http.Server{
 		Addr:              address,
-		Handler:           httpapi.NewRouterWithReliability(upstreamClient, access, limiter, cache, routes, breaker, queues),
+		Handler:           httpapi.NewRouter(adapters, access, limiter, cache, routes, breakers, queues, providerKeys, retry),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      60 * time.Second,
+		WriteTimeout:      retry.RequestTimeout() + responseWriteGrace,
 		IdleTimeout:       60 * time.Second,
 	}, nil
-}
-
-func loadUpstreamTimeout() (time.Duration, error) {
-	return loadPositiveDuration(upstreamTimeoutEnv, defaultUpstreamTimeout)
 }
 
 func loadShutdownTimeout() (time.Duration, error) {

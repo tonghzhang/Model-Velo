@@ -25,16 +25,16 @@
 ```text
 main
   -> 加载监听地址、上游地址、上游 Key、调用超时、关闭超时
-  -> 创建 provider.Client
+  -> 创建 provider.Adapter（OpenAI 实现）
   -> 创建 Gin Router 和 http.Server
   -> request ID middleware
   -> chatHandler.complete
-  -> provider.Client.Chat
+  -> provider.Adapter.Complete
   -> 假上游或配置的 OpenAI-compatible 上游
   -> 原样成功 JSON / writeAPIError
 ```
 
-HTTP Handler 只处理传输协议和错误写出；Provider Client 只构造和执行单次上游请求。阶段 1 没有提前创建 Retry、Fallback 或通用 Provider 接口。
+HTTP Handler 只处理传输协议和错误写出；当时的单 OpenAI Adapter 只构造和执行单次上游请求。阶段 1 没有提前创建 Retry、Fallback 或通用 Provider 接口。
 
 ## 3. 自动化检查结果
 
@@ -83,7 +83,7 @@ go run <clone-check-script> -model <repository-root> -gomodel D:\agent开源项�
 
 归一化检测是启发式工具结果，不把 `0.00%` 宣称为通用代码相似度的绝对精确值；结合逐文件人工复核，保守结论区间为 `0% <= 重复度 < 10%`，满足本项目门禁阈值。
 
-人工复核覆盖 `cmd/model-velo/main.go`、`internal/httpapi` 的四个生产文件和 `internal/provider/client.go`。没有发现相同的特色控制流、独特命名、注释或错误字符串；对 `requestIDMiddleware`、`normalizeServeError`、`chatCompletionsEndpoint`、`upstream_response_too_large`、`request_id_generation_failed`、`MODEL_VELO_UPSTREAM_BASE_URL`、`model-velo.request_id`、`stream_not_supported` 的参考仓库搜索也无命中。本次没有打开参考项目的具体实现函数进行改写。
+人工复核覆盖 `cmd/model-velo/main.go`、`internal/httpapi` 的四个生产文件和当前的 `internal/provider/openai.go`（阶段 1 时文件名为 `client.go`）。没有发现相同的特色控制流、独特命名、注释或错误字符串；对 `requestIDMiddleware`、`normalizeServeError`、`chatCompletionsEndpoint`、`upstream_response_too_large`、`request_id_generation_failed`、`MODEL_VELO_UPSTREAM_BASE_URL`、`model-velo.request_id`、`stream_not_supported` 的参考仓库搜索也无命中。本次没有打开参考项目的具体实现函数进行改写。
 
 ## 5. 未覆盖边界和门禁决定
 

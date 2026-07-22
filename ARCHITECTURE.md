@@ -1,10 +1,10 @@
 # Model-Velo 架构设计
 
-> 状态：用户已明确授权开始阶段 3。阶段 2 的 PostgreSQL/Redis 生产链与真实依赖门禁已经完成，race 环境缺口仍保留。阶段 3 已接入有序 Route Plan、稳定错误分类、Provider Circuit Breaker 和 Provider 有界 Queue；Key、Retry、Fallback 仍按后续切片推进。
+> 状态：用户已明确授权开始阶段 3。阶段 2 的 PostgreSQL/Redis 生产链与真实依赖门禁已经完成，race 环境缺口仍保留。阶段 3 已接入有序 Route Plan、稳定错误分类、多 Provider Adapter/Breaker/Queue/Key Registry、单候选 Attempt Executor，以及共享总预算的有限 Retry 与有序 Fallback。
 
 ## 0. 当前实现边界
 
-截至 2026-07-18，仓库中已经运行的是一条单 Provider、非流式请求链：
+截至 2026-07-22，仓库中已经运行的是一条可在多个 Provider 之间有序 Fallback 的非流式请求链：
 
 ```text
 HTTP Client
@@ -14,19 +14,23 @@ HTTP Client
   -> Redis Lua 租户+模型限流
   -> Router 按精确规则或默认规则生成有序 Route Plan
   -> Redis Exact Cache 查询
-  -> 命中直接返回；未命中进入 Provider Circuit Breaker
-  -> Closed 放行 / Open 快速拒绝 / HalfOpen 有界探测
-  -> 按 Provider 获取进程内 Queue 槽位，满载时有界等待
-  -> 执行 primary 候选并映射上游模型
-  -> 释放 Queue 槽位，再按分类结果反馈 Breaker
+  -> 命中直接返回；未命中由 Fallback Orchestrator 建立统一执行预算
+  -> 按 Route Plan 顺序把当前候选交给 Attempt Executor
+  -> Attempt 每次重新执行 Breaker 准入和 Provider Queue 有界等待
+  -> Key Selector 选择可用 Key；5xx/网络重试优先保持原 Key
+  -> 执行候选并映射上游模型，单次 HTTP 调用有独立期限
+  -> 按结果反馈 Key/Breaker 并释放 Queue；允许时 Context-aware 退避后重试
+  -> 候选最终失败且策略允许时进入下一候选；首个成功立即停止
   -> 完整成功 JSON 回填 Redis Cache
-  -> 单个可配置上游
-  -> 成功 JSON 原样返回或结构化错误转换
+  -> Provider Adapter 按厂商协议转换请求并调用官方端点
+  -> 兼容响应原样返回；原生响应归一化为 OpenAI Chat Completion
 ```
 
-`cmd/model-velo` 负责环境变量、依赖装配、HTTP Server 和优雅关闭，`internal/httpapi` 负责传输协议和调用顺序，`internal/apikey` 负责认证授权，`internal/ratelimit` 负责 Redis 原子限流，`internal/routing` 负责纯内存有序路由计划，`internal/responsecache` 负责 Exact Cache Key 与读写，`internal/reliability` 负责安全 Failure、策略信号、Breaker 状态闭环和 Provider Queue，`internal/provider` 负责单上游协议转换和 HTTP 调用。当前还没有完整 Orchestrator、Key Selector、Retry、Fallback、SSE 或 Usage Worker。
+`cmd/model-velo` 负责环境变量、依赖装配、HTTP Server 和优雅关闭，`internal/httpapi` 负责传输协议，`internal/apikey` 负责认证授权，`internal/ratelimit` 负责 Redis 原子限流，`internal/routing` 负责纯内存有序路由计划，`internal/responsecache` 负责 Exact Cache Key 与读写，`internal/reliability` 负责 Orchestrator、Attempt Executor、安全 Failure、Retry Policy、时间预算以及按 Provider 隔离的 Breaker、Queue 和 Key 状态，`internal/provider` 负责 16 个厂商配置、Adapter Registry、协议转换和统一 HTTP 错误边界。当前还没有 SSE 或 Usage Worker。
 
-阶段 1 的全量测试、静态检查、异常矩阵和独立性检查已经通过；race detector 因本机缺少 GCC 尚未执行成功。用户已允许在保留该缺口的前提下继续。阶段 3 当前只执行 Route Plan 的 primary，并在 Cache miss 后执行 Breaker 准入、Provider Queue、上游调用和反馈；Plan 中后续候选已稳定排序，但尚未执行 Key、Retry/Fallback。实际阶段 1 门禁证据见 `STAGE1_GATE.md`。
+启动配置没有隐式 Provider：`MODEL_VELO_ROUTING_JSON` 必须显式声明 Provider 与 Route，一个 Provider 也按相同格式配置；缺失或空白会在连接外部基础设施和监听 HTTP 前失败。生产 HTTP 装配只接受完整的 Adapter、Breaker、Queue、Key 与 Route Registry，不再保留单 Provider 快捷构造路径。
+
+阶段 1 的全量测试、静态检查、异常矩阵和独立性检查已经通过；race detector 因本机缺少 GCC 尚未执行成功。用户已允许在保留该缺口的前提下继续。阶段 3 会先按请求所需的 `text`、`image`、`tools` 能力过滤 Route Plan，再在统一预算内按顺序执行候选：每个候选内部按 Provider ID 有限 Retry，401 永久停用无效 Key，403 只在当前请求内换 Key，429 优先换未冷却 Key；全部 Key 冷却时，只有最早恢复时间能放入剩余预算才在释放准入资源后等待；指定 5xx、网络和上游超时有界退避，每次调用重新进入 Breaker、Queue 和 Key 选择。候选耗尽后，普通 400 与取消停止，明确的模型不可用 4xx 等策略失败进入下一候选。VLM `text`/`image_url` 内容在兼容协议中原样透传，在 Anthropic、Gemini、Ollama 和 Bedrock 中显式转换；Adapter 明确不支持某种输入时只触发 Fallback，不 Retry、不计 Breaker，全部候选都不支持时返回明确 400。上游模型自身的实际模态能力仍由厂商响应决定。总预算取消和 race 仍留在阶段门禁。实际阶段 1 门禁证据见 `STAGE1_GATE.md`。
 
 ## 1. 项目定位
 
@@ -36,7 +40,7 @@ Model-Velo 是一个面向学习、实习求职展示和实际运行的轻量 LL
 - Redis：分布式限流、响应缓存、Usage Stream；
 - PostgreSQL：API Key、Usage 和必要的持久化数据；
 - OpenAI-compatible API：对客户端提供统一协议；
-- 外部 Provider：第一阶段只接一个 OpenAI-compatible 上游，之后再扩展。
+- 外部 Provider：通过统一 Adapter 契约接入厂商原生协议、厂商 OpenAI Chat 协议和自定义兼容端点。
 
 项目采用“先完成最小纵向请求，再逐步增强”的方式，不在第一阶段搭建完整平台。
 
@@ -53,13 +57,17 @@ Model-Velo 是一个面向学习、实习求职展示和实际运行的轻量 LL
 - 从 Bifrost 借鉴 Provider Queue、Attempt Executor、Key 选择/轮换、有序 Fallback 和 SSE 首 Chunk 检查的思路。
 - Model-Velo 自己确定 Gin 接入、Redis 分布式限流、Redis Stream Usage 管道、PostgreSQL 幂等落库以及具体包边界。
 
+2026-07-22 只读核对 GoModel 的 `cmd/gomodel/main.go`、`internal/providers/init.go` 和 ADR-0001：它通过显式工厂注册选择可用 Provider，初始化后没有任何 Provider 会返回错误，而不是虚构一个兼容上游。Model-Velo 没有复制其注册结构，独立采用“显式路由 JSON + 启动失败”的配置边界。
+
 这些是架构概念，不复制两个项目的代码、命名和目录。具体重合度约束见 `AGENTS.md`。
 
 2026-07-18 使用 `modelmux-clone-check 1.0`，按连续至少 12 条非空逻辑行或 80 个 token 的阈值扫描 19 个生产 Go 文件、1763 条逻辑行，并排除测试、vendor、generated、UI 和示例。对 GoModel、Bifrost 及二者合并集的字面重复度和标识符归一化近似重复度均为 0.00%；人工复核也未发现相同独特命名、注释、错误文案或控制流。该结果只证明当前快照，不替代后续里程碑复查。
 
+2026-07-21 在原生 Provider Adapter 切片后以同一工具和阈值复查 47 个生产 Go 文件、4892 条逻辑行：对 GoModel 的字面/近似重复度均为 0.00%；对 Bifrost 的字面重复度为 0.00%、近似重复度为 0.31%（15 行）；合并参考集为 0.00%/0.31%。人工复核本轮协议结构、错误文案和转换控制流未发现参考项目特有实现被复制。该结果仍只证明当前快照，阶段 3 总门禁保持未完成。
+
 ## 3. 运行时部署架构
 
-下面是完整项目的目标部署图。阶段 1 只启用了 `Client -> API -> 单个 Provider`，图中的 PostgreSQL、Redis、Worker 和 Prometheus 都属于后续阶段。
+下面是完整项目的目标部署图。当前已经启用 `Client -> API -> 多 Provider 有序 Fallback`、PostgreSQL 和 Redis；Worker 与 Prometheus 仍属于后续阶段。
 
 ```mermaid
 flowchart LR
@@ -67,7 +75,7 @@ flowchart LR
 
     API -->|"鉴权数据 / 路由元数据"| PG[("PostgreSQL")]
     API -->|"限流 / Cache / XADD Usage"| Redis[("Redis")]
-    API -->|"HTTPS"| Providers["外部模型 Provider<br/>第一阶段：单个 OpenAI-compatible 上游"]
+    API -->|"HTTPS"| Providers["外部模型 Provider<br/>16 个厂商配置 + custom"]
 
     Worker["model-velo-usage-worker<br/>后续阶段启用"] -->|"XREADGROUP"| Redis
     Worker -->|"幂等 INSERT/UPSERT"| PG
@@ -78,7 +86,7 @@ flowchart LR
 
 运行时约束：
 
-- 第一阶段只有 `model-velo-api` 和一个测试用假上游，Redis/PostgreSQL 从第二阶段开始接入业务链路。
+- 当前 `model-velo-api` 同时装配 PostgreSQL、Redis 和所有路由中声明的 Provider；每个 Provider 的 Adapter 与可靠性状态相互隔离。
 - API 与 Worker 使用同一仓库、共享稳定的数据契约，但作为不同进程运行，避免 Usage 落库拖慢在线请求。
 - Redis、PostgreSQL 都是外部组件，通过 Docker Compose 提供本地开发环境；生产部署细节不在早期阶段展开。
 
@@ -238,11 +246,17 @@ sequenceDiagram
 | 情况 | Retry | 换 Key | Fallback | Breaker |
 |---|---|---|---|---|
 | 本地解析/校验 400 | 否 | 否 | 否 | 不记录 Provider 失败 |
-| 上游 400 | 否 | 否 | 默认否；只有明确的模型不兼容规则才允许 | 不触发 |
-| 401/403 | 不使用原 Key 重试 | 有其他 Key 时可以 | Key 耗尽后按策略决定 | 标记 Key，不熔断整个 Provider |
+| Provider 能力不匹配 | 否 | 否 | 允许 | 不触发 |
+| Provider 返回网关暂不能表达的输出 | 否 | 否 | 允许 | 不触发；最终映射为 502 |
+| Provider 返回网关暂不能表达的输出 | 否 | 否 | 允许 | 不触发；最终映射为 502 |
+| 上游普通 4xx | 否 | 否 | 否 | 不触发 |
+| 模型不可用 400/404/422 | 否 | 否 | 允许 | 不触发 |
+| 401 | 不使用原 Key 重试 | 有其他 Key 时可以 | Key 耗尽后按策略决定 | 永久停用 Key，不熔断 Provider |
+| 403 | 当前请求不再使用原 Key | 有其他 Key 时可以 | Key 耗尽后按策略决定 | 不修改全局 Key 状态，不熔断 Provider |
 | 429 | 尊重 `Retry-After`，受总预算限制 | 优先尝试未冷却 Key | Key 耗尽后允许 | 默认做 Key 冷却，不直接算 Provider 故障 |
 | 500/502/503/504 | 有限次数 | 通常保持当前 Key | Retry 耗尽后允许 | 计入 Provider 失败 |
 | 网络连接/超时 | 有限次数 | 通常保持当前 Key | Retry 耗尽后允许 | 计入 Provider 失败 |
+| 畸形 2xx 协议响应 | 否 | 否 | 允许 | 计入 Provider 失败；网关主动大小限制除外 |
 | 客户端取消 | 否 | 否 | 否 | 不把取消算作 Provider 故障 |
 | SSE 首 Chunk 前错误 | 按上述类别 | 按上述类别 | 允许 | 按上述类别更新 |
 | SSE 已输出 Chunk 后错误 | 否 | 否 | 否 | 根据真实上游错误更新 |
@@ -290,7 +304,7 @@ Retry 次数不是唯一约束：所有 Retry 和 Fallback 必须共享请求总
 
 只缓存通过认证、授权和限流的非流式请求及其完整成功响应；`Cache-Control: no-store` 显式 bypass。缓存位于限流之后，因此命中也消耗配额。流中断、客户端取消、上游错误和非法响应不写缓存。缓存不可用时固定 fail-open，记录安全错误并继续上游；Context 取消仍直接传播。`HIT/MISS/BYPASS` 同时存在于内部结果和 HTTP Header，供后续 Usage 接入复用。
 
-当前调用链为认证→授权→限流→Route Plan→缓存→Breaker 准入→Provider Queue→primary Provider→Queue 释放→分类反馈→成功回填。Breaker 只统计网络、上游超时与 500/502/503/504；Open 快速拒绝不会调用 Provider，HalfOpen 探测名额由一次性 Permit 配对释放。Queue 使用 channel 强制 active 上限，以原子计数限制 waiting，并让 Context、等待 Timer 和槽位竞争在同一 select 中完成；一次性 Lease 防止重复释放。Queue 是进程内容量保护，多实例总容量由每实例配置相加，不提供分布式全局并发上限。合并用例覆盖 Breaker 状态闭环以及 Queue 获取、满载、等待、超时、取消、Provider 隔离与 HTTP 拒绝；尚未执行 race 门禁。
+当前调用链为认证→授权→限流→按请求能力过滤 Route Plan→缓存→Fallback Orchestrator 建立 Provider 执行总预算→按序调用单候选 Attempt Executor。每次真正的上游调用都按 Provider ID 重新进入 Adapter/Breaker→Queue→Key Selector→厂商协议端点→Key/Breaker 反馈→Queue 释放；Queue、Breaker 或 Key 冷却等调用前准入等待不占用 `MaxAttempts`，只有策略允许时才在资源释放后用 Timer/select 退避。Chat 请求在 HTTP 边界只解析一次；兼容协议保留原始 JSON 和未知字段，原生协议在转换前明确拒绝无法表达的字段。Adapter Registry 根据路由显式声明的 `vendor`/`type` 构造实现：OpenAI、Mistral、DeepSeek、xAI、Zhipu、Groq、NVIDIA、Together 各自拥有厂商 Adapter，并复用它们共同采用的 OpenAI Chat wire codec 与 HTTP 安全边界；custom-compatible 使用独立的通用兼容 Adapter。Anthropic、Gemini、DashScope、Cohere、Ollama、Bedrock 和 Cloudflare 执行显式请求/响应转换，Azure 使用自己的 Endpoint 与 `api-key` 鉴权。Adapter 不保存默认 API Key，每次调用只接收 Key Selector 为本 attempt 选出的 Secret。Adapter 能力不匹配会跳过当前候选，不消耗 Retry、不污染 Breaker；401 永久停用无效 Key，403 仅在当前请求排除该 Key，429 按 `Retry-After` 冷却并优先选择其他 Key。网络、上游超时与 500/502/503/504 退避重试并优先保持原 Key；普通 4xx 停止，带安全错误码的模型不可用 400/404/422 允许 Fallback。兼容 2xx 必须满足 Chat 响应结构，原生输出无法表示时明确 Fallback；真正的畸形协议响应会计入 Provider Breaker。Fallback 成功结果不写 Exact Cache。全部 Retry 与 Fallback 共享一个请求总预算，Provider 可独立覆盖单次超时、重试、Breaker、Queue 和 HTTP 连接池；连接池默认跟随 Queue 并发上限。Attempt Trail 记录实际 Provider 调用的 Provider/模型/Key ID、序号、类别、状态码和耗时，不记录 Secret 或提示词，并在成功结果与最终 Failure 中保留，供后续 Usage 使用。Queue、Breaker 和 Key 状态都按 Provider ID 隔离；Queue 是进程内容量保护，多实例总容量由每实例配置相加，不提供分布式全局并发上限。总预算取消和 race 证据留在阶段门禁。
 
 ### Usage Stream
 

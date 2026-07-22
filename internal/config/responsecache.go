@@ -11,7 +11,7 @@ import (
 const (
 	responseCacheTTLEnv          = "MODEL_VELO_CACHE_TTL"
 	responseCacheRouteVersionEnv = "MODEL_VELO_CACHE_ROUTE_VERSION"
-	defaultCacheRouteVersion     = "single-provider-v1"
+	defaultCacheRouteVersion     = "routes-v1"
 )
 
 const (

@@ -90,21 +90,16 @@ func TestChatCompletionUsesOrderedRoutePlan(t *testing.T) {
 			t.Errorf("upstream model = %q, want provider-model-primary", request.Model)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"choices":[]}`)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
 	}))
 	defer upstream.Close()
 
-	client, err := provider.NewClient(upstream.URL, "provider-test-key", time.Second)
-	if err != nil {
-		t.Fatalf("provider.NewClient() error = %v", err)
-	}
+	client := newTestCompatibleAdapter(t, upstream.URL)
 	routes, err := routing.New(routing.Definition{
-		Version: "routing-test-v1",
 		Providers: []routing.Provider{{
-			ID:            "upstream",
-			Type:          routing.ProviderTypeOpenAICompatible,
-			Models:        []string{"provider-model-primary", "provider-model-secondary"},
-			ConfigVersion: "routing-test-v1",
+			ID:     "upstream",
+			Type:   provider.ProtocolOpenAICompatible,
+			Models: []string{"provider-model-primary", "provider-model-secondary"},
 		}},
 		Rules: []routing.Rule{{
 			Model: "demo-model",
@@ -118,7 +113,7 @@ func TestChatCompletionUsesOrderedRoutePlan(t *testing.T) {
 	if err != nil {
 		t.Fatalf("routing.New() error = %v", err)
 	}
-	plan, err := routes.Plan("tenant-test-id", "demo-model")
+	plan, err := routes.Plan("demo-model", nil)
 	if err != nil {
 		t.Fatalf("routes.Plan() error = %v", err)
 	}
@@ -126,9 +121,9 @@ func TestChatCompletionUsesOrderedRoutePlan(t *testing.T) {
 		t.Fatalf("route candidates = %#v, want ordered de-duplicated models", plan.Candidates)
 	}
 
-	router := httpapi.NewRouterWithRouting(client, testAccessController{}, testRateLimiter{
+	router := newSingleProviderTestRouter(t, client, testAccessController{}, testRateLimiter{
 		decision: ratelimit.Decision{Allowed: true, Limit: 60, Remaining: 59, ResetAtUnix: 1_800_000_000},
-	}, testResponseCache{}, routes)
+	}, testResponseCache{}, routes, nil, nil)
 	response := httptest.NewRecorder()
 	router.ServeHTTP(response, validChatRequest())
 	if response.Code != http.StatusOK {
@@ -161,15 +156,19 @@ func TestChatCompletionCircuitBreakerPolicy(t *testing.T) {
 			wantSignals  reliability.Signals
 		}{
 			{name: "local request", err: provider.ErrInvalidRequest, wantCategory: reliability.CategoryLocalValidation},
+			{name: "unsupported capability", err: provider.ErrUnsupportedCapability, wantCategory: reliability.CategoryUnsupportedCapability, wantSignals: reliability.Signals{Fallback: true}},
+			{name: "unsupported response", err: provider.ErrUnsupportedResponse, wantCategory: reliability.CategoryUnsupportedResponse, wantSignals: reliability.Signals{Fallback: true}},
 			{name: "upstream 400", err: &provider.HTTPError{StatusCode: http.StatusBadRequest}, wantCategory: reliability.CategoryUpstream4xx},
-			{name: "key rejected", err: &provider.HTTPError{StatusCode: http.StatusUnauthorized}, wantCategory: reliability.CategoryKeyRejected, wantSignals: reliability.Signals{SwitchKey: true, Fallback: true}},
+			{name: "key unauthorized", err: &provider.HTTPError{StatusCode: http.StatusUnauthorized}, wantCategory: reliability.CategoryKeyUnauthorized, wantSignals: reliability.Signals{SwitchKey: true, Fallback: true}},
+			{name: "key forbidden", err: &provider.HTTPError{StatusCode: http.StatusForbidden}, wantCategory: reliability.CategoryKeyForbidden, wantSignals: reliability.Signals{SwitchKey: true, Fallback: true}},
+			{name: "model unavailable", err: &provider.HTTPError{StatusCode: http.StatusNotFound, Code: "model_not_found"}, wantCategory: reliability.CategoryModelUnavailable, wantSignals: reliability.Signals{Fallback: true}},
 			{name: "upstream rate limit", err: &provider.HTTPError{StatusCode: http.StatusTooManyRequests}, wantCategory: reliability.CategoryUpstreamRateLimit, wantSignals: reliability.Signals{Retry: true, SwitchKey: true, Fallback: true}},
 			{name: "counted 500", err: &provider.HTTPError{StatusCode: http.StatusInternalServerError}, wantCategory: reliability.CategoryUpstream5xx, wantSignals: reliability.Signals{Retry: true, Fallback: true, CountBreaker: true}},
 			{name: "counted 502", err: &provider.HTTPError{StatusCode: http.StatusBadGateway}, wantCategory: reliability.CategoryUpstream5xx, wantSignals: reliability.Signals{Retry: true, Fallback: true, CountBreaker: true}},
 			{name: "counted 503", err: &provider.HTTPError{StatusCode: http.StatusServiceUnavailable}, wantCategory: reliability.CategoryUpstream5xx, wantSignals: reliability.Signals{Retry: true, Fallback: true, CountBreaker: true}},
 			{name: "counted 504", err: &provider.HTTPError{StatusCode: http.StatusGatewayTimeout}, wantCategory: reliability.CategoryUpstream5xx, wantSignals: reliability.Signals{Retry: true, Fallback: true, CountBreaker: true}},
 			{name: "uncounted 501", err: &provider.HTTPError{StatusCode: http.StatusNotImplemented}, wantCategory: reliability.CategoryUpstream5xx},
-			{name: "protocol", err: provider.ErrInvalidResponse, wantCategory: reliability.CategoryUpstreamProtocol, wantSignals: reliability.Signals{Fallback: true}},
+			{name: "protocol", err: provider.ErrInvalidResponse, wantCategory: reliability.CategoryUpstreamProtocol, wantSignals: reliability.Signals{Fallback: true, CountBreaker: true}},
 			{name: "network", err: errors.New("test network failure"), wantCategory: reliability.CategoryNetwork, wantSignals: reliability.Signals{Retry: true, Fallback: true, CountBreaker: true}},
 			{name: "timeout", err: context.DeadlineExceeded, wantCategory: reliability.CategoryTimeout, wantSignals: reliability.Signals{Retry: true, Fallback: true, CountBreaker: true}},
 			{name: "client cancel", err: context.Canceled, wantCategory: reliability.CategoryCanceled},
@@ -209,7 +208,7 @@ func TestChatCompletionCircuitBreakerPolicy(t *testing.T) {
 	}
 
 	ignoredFailures := []*reliability.Failure{
-		{Category: reliability.CategoryKeyRejected, ProviderID: "upstream", StatusCode: http.StatusUnauthorized},
+		{Category: reliability.CategoryKeyUnauthorized, ProviderID: "upstream", StatusCode: http.StatusUnauthorized},
 		{Category: reliability.CategoryUpstreamRateLimit, ProviderID: "upstream", StatusCode: http.StatusTooManyRequests},
 		{Category: reliability.CategoryCanceled, ProviderID: "upstream", Cause: context.Canceled},
 	}
@@ -275,20 +274,17 @@ func TestChatCompletionCircuitBreakerPolicy(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		upstreamCalls.Add(1)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"choices":[]}`)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
 	}))
 	defer upstream.Close()
-	client, err := provider.NewClient(upstream.URL, "provider-test-key", time.Second)
-	if err != nil {
-		t.Fatalf("provider.NewClient() error = %v", err)
-	}
-	routes, err := routing.New(routing.SingleProviderDefinition("upstream", "breaker-test-v1"))
+	client := newTestCompatibleAdapter(t, upstream.URL)
+	routes, err := routing.New(singleProviderTestDefinition("upstream"))
 	if err != nil {
 		t.Fatalf("routing.New() error = %v", err)
 	}
-	router := httpapi.NewRouterWithBreaker(client, testAccessController{}, testRateLimiter{
+	router := newSingleProviderTestRouter(t, client, testAccessController{}, testRateLimiter{
 		decision: ratelimit.Decision{Allowed: true, Limit: 60, Remaining: 59, ResetAtUnix: 1_800_000_000},
-	}, testResponseCache{}, routes, breaker)
+	}, testResponseCache{}, routes, breaker, nil)
 
 	openResponse := httptest.NewRecorder()
 	router.ServeHTTP(openResponse, validChatRequest())
@@ -467,15 +463,12 @@ func TestChatCompletionProviderQueue(t *testing.T) {
 		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			upstreamCalls.Add(1)
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(w, `{"choices":[]}`)
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
 		}))
 		defer upstream.Close()
 
-		client, err := provider.NewClient(upstream.URL, "provider-test-key", time.Second)
-		if err != nil {
-			t.Fatalf("provider.NewClient() error = %v", err)
-		}
-		routes, err := routing.New(routing.SingleProviderDefinition("upstream", "queue-test-v1"))
+		client := newTestCompatibleAdapter(t, upstream.URL)
+		routes, err := routing.New(singleProviderTestDefinition("upstream"))
 		if err != nil {
 			t.Fatalf("routing.New() error = %v", err)
 		}
@@ -494,7 +487,7 @@ func TestChatCompletionProviderQueue(t *testing.T) {
 			t.Fatalf("acquire holder: %v", failure)
 		}
 
-		router := httpapi.NewRouterWithReliability(client, testAccessController{}, testRateLimiter{
+		router := newSingleProviderTestRouter(t, client, testAccessController{}, testRateLimiter{
 			decision: ratelimit.Decision{Allowed: true, Limit: 60, Remaining: 59, ResetAtUnix: 1_800_000_000},
 		}, testResponseCache{}, routes, breaker, queues)
 		fullResponse := httptest.NewRecorder()
@@ -528,11 +521,8 @@ func TestChatCompletionReturnsTenantRateLimit(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	client, err := provider.NewClient(upstream.URL, "provider-test-key", time.Second)
-	if err != nil {
-		t.Fatalf("provider.NewClient() error = %v", err)
-	}
-	router := httpapi.NewRouter(client, testAccessController{}, testRateLimiter{
+	client := newTestCompatibleAdapter(t, upstream.URL)
+	router := newSingleProviderTestRouter(t, client, testAccessController{}, testRateLimiter{
 		decision: ratelimit.Decision{
 			Allowed:           false,
 			Limit:             60,
@@ -540,7 +530,7 @@ func TestChatCompletionReturnsTenantRateLimit(t *testing.T) {
 			ResetAtUnix:       1_800_000_000,
 			RetryAfterSeconds: 17,
 		},
-	}, testResponseCache{})
+	}, testResponseCache{}, nil, nil, nil)
 	response := httptest.NewRecorder()
 	router.ServeHTTP(response, validChatRequest())
 
@@ -599,15 +589,12 @@ func TestChatCompletionAppliesRateLimitFailurePolicy(t *testing.T) {
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				upstreamCalls.Add(1)
 				w.Header().Set("Content-Type", "application/json")
-				_, _ = io.WriteString(w, `{"choices":[]}`)
+				_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
 			}))
 			defer upstream.Close()
 
-			client, err := provider.NewClient(upstream.URL, "provider-test-key", time.Second)
-			if err != nil {
-				t.Fatalf("provider.NewClient() error = %v", err)
-			}
-			router := httpapi.NewRouter(client, testAccessController{}, test.limiter, testResponseCache{})
+			client := newTestCompatibleAdapter(t, upstream.URL)
+			router := newSingleProviderTestRouter(t, client, testAccessController{}, test.limiter, testResponseCache{}, nil, nil, nil)
 			response := httptest.NewRecorder()
 			router.ServeHTTP(response, validChatRequest())
 
@@ -631,8 +618,8 @@ func TestChatCompletionAppliesRateLimitFailurePolicy(t *testing.T) {
 
 func TestChatCompletionCacheFlow(t *testing.T) {
 	const (
-		upstreamBody = `{"id":"upstream","choices":[]}`
-		cachedBody   = `{"id":"cached","choices":[]}`
+		upstreamBody = `{"id":"upstream","choices":[{"message":{"role":"assistant","content":"upstream"}}]}`
+		cachedBody   = `{"id":"cached","choices":[{"message":{"role":"assistant","content":"cached"}}]}`
 	)
 
 	tests := []struct {
@@ -713,10 +700,7 @@ func TestChatCompletionCacheFlow(t *testing.T) {
 			}))
 			defer upstream.Close()
 
-			client, err := provider.NewClient(upstream.URL, "provider-test-key", time.Second)
-			if err != nil {
-				t.Fatalf("provider.NewClient() error = %v", err)
-			}
+			client := newTestCompatibleAdapter(t, upstream.URL)
 			cache := test.cache
 			cache.onLookup = func(tenantID, model string, requestBody []byte) {
 				lookupCalls.Add(1)
@@ -730,9 +714,9 @@ func TestChatCompletionCacheFlow(t *testing.T) {
 					t.Errorf("stored response = %s, want %s", responseBody, upstreamBody)
 				}
 			}
-			router := httpapi.NewRouter(client, testAccessController{}, testRateLimiter{
+			router := newSingleProviderTestRouter(t, client, testAccessController{}, testRateLimiter{
 				decision: ratelimit.Decision{Allowed: true},
-			}, cache)
+			}, cache, nil, nil, nil)
 			response := httptest.NewRecorder()
 			request := validChatRequest()
 			request.Header.Set("Cache-Control", test.cacheControl)
@@ -793,7 +777,7 @@ func TestChatRequestDependencyOrder(t *testing.T) {
 			limitDecision: ratelimit.Decision{Allowed: true},
 			cacheResult: responsecache.Result{
 				Status: responsecache.StatusHit,
-				Body:   []byte(`{"choices":[]}`),
+				Body:   []byte(`{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`),
 			},
 			wantStatus: http.StatusOK,
 			wantEvents: "authenticate,authorize,limit,cache_lookup",
@@ -827,14 +811,11 @@ func TestChatRequestDependencyOrder(t *testing.T) {
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				record("provider")
 				w.Header().Set("Content-Type", "application/json")
-				_, _ = io.WriteString(w, `{"choices":[]}`)
+				_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
 			}))
 			defer upstream.Close()
 
-			client, err := provider.NewClient(upstream.URL, "provider-test-key", time.Second)
-			if err != nil {
-				t.Fatalf("provider.NewClient() error = %v", err)
-			}
+			client := newTestCompatibleAdapter(t, upstream.URL)
 			access := testAccessController{
 				identity:        apikey.Identity{TenantID: tenantID, APIKeyID: "key-order-test"},
 				authenticateErr: test.authenticateErr,
@@ -865,7 +846,7 @@ func TestChatRequestDependencyOrder(t *testing.T) {
 					assertScope(gotTenantID, model)
 				},
 			}
-			router := httpapi.NewRouter(client, access, limiter, cache)
+			router := newSingleProviderTestRouter(t, client, access, limiter, cache, nil, nil, nil)
 			response := httptest.NewRecorder()
 			router.ServeHTTP(response, validChatRequest())
 
@@ -887,7 +868,7 @@ func TestChatCompletionRejectsInvalidRequests(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upstreamCalls.Add(1)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"choices":[]}`)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
 	}))
 	defer upstream.Close()
 
@@ -908,9 +889,9 @@ func TestChatCompletionRejectsInvalidRequests(t *testing.T) {
 		{name: "blank model", contentType: "application/json", body: `{"model":"  ","messages":[{"role":"user","content":"hello"}]}`, wantStatus: http.StatusBadRequest, wantCode: "missing_model"},
 		{name: "missing messages", contentType: "application/json", body: `{"model":"demo-model"}`, wantStatus: http.StatusBadRequest, wantCode: "missing_messages"},
 		{name: "empty messages", contentType: "application/json", body: `{"model":"demo-model","messages":[]}`, wantStatus: http.StatusBadRequest, wantCode: "missing_messages"},
-		{name: "unsupported role", contentType: "application/json", body: `{"model":"demo-model","messages":[{"role":"tool","content":"hello"}]}`, wantStatus: http.StatusBadRequest, wantCode: "invalid_message_role"},
+		{name: "unsupported role", contentType: "application/json", body: `{"model":"demo-model","messages":[{"role":"critic","content":"hello"}]}`, wantStatus: http.StatusBadRequest, wantCode: "invalid_message_role"},
 		{name: "missing content", contentType: "application/json", body: `{"model":"demo-model","messages":[{"role":"user","content":""}]}`, wantStatus: http.StatusBadRequest, wantCode: "missing_message_content"},
-		{name: "unsupported content shape", contentType: "application/json", body: `{"model":"demo-model","messages":[{"role":"user","content":[]}]}`, wantStatus: http.StatusBadRequest, wantCode: "invalid_json"},
+		{name: "empty content parts", contentType: "application/json", body: `{"model":"demo-model","messages":[{"role":"user","content":[]}]}`, wantStatus: http.StatusBadRequest, wantCode: "missing_message_content"},
 		{name: "streaming", contentType: "application/json", body: `{"model":"demo-model","messages":[{"role":"user","content":"hello"}],"stream":true}`, wantStatus: http.StatusBadRequest, wantCode: "stream_not_supported"},
 	}
 
@@ -973,15 +954,17 @@ func TestChatCompletionRejectsLargeBody(t *testing.T) {
 
 func TestChatCompletionMapsUpstreamHTTPError(t *testing.T) {
 	tests := []struct {
-		name       string
-		upstream   int
-		wantStatus int
-		wantCode   string
+		name           string
+		upstream       int
+		retryAfter     string
+		wantStatus     int
+		wantCode       string
+		wantRetryAfter string
 	}{
 		{name: "bad request", upstream: http.StatusBadRequest, wantStatus: http.StatusBadRequest, wantCode: "upstream_rejected_request"},
 		{name: "unauthorized", upstream: http.StatusUnauthorized, wantStatus: http.StatusBadGateway, wantCode: "upstream_http_error"},
 		{name: "forbidden", upstream: http.StatusForbidden, wantStatus: http.StatusBadGateway, wantCode: "upstream_http_error"},
-		{name: "rate limited", upstream: http.StatusTooManyRequests, wantStatus: http.StatusTooManyRequests, wantCode: "upstream_rate_limited"},
+		{name: "rate limited", upstream: http.StatusTooManyRequests, retryAfter: "17", wantStatus: http.StatusTooManyRequests, wantCode: "upstream_rate_limited", wantRetryAfter: "17"},
 		{name: "internal server error", upstream: http.StatusInternalServerError, wantStatus: http.StatusBadGateway, wantCode: "upstream_http_error"},
 		{name: "bad gateway", upstream: http.StatusBadGateway, wantStatus: http.StatusBadGateway, wantCode: "upstream_http_error"},
 		{name: "service unavailable", upstream: http.StatusServiceUnavailable, wantStatus: http.StatusBadGateway, wantCode: "upstream_http_error"},
@@ -992,6 +975,9 @@ func TestChatCompletionMapsUpstreamHTTPError(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "text/html")
+				if test.retryAfter != "" {
+					w.Header().Set("Retry-After", test.retryAfter)
+				}
 				w.WriteHeader(test.upstream)
 				_, _ = io.WriteString(w, `<p>internal upstream detail</p>`)
 			}))
@@ -1008,6 +994,9 @@ func TestChatCompletionMapsUpstreamHTTPError(t *testing.T) {
 			if got := responseErrorCode(t, response); got != test.wantCode {
 				t.Errorf("error code = %q, want %q", got, test.wantCode)
 			}
+			if got := response.Header().Get("Retry-After"); got != test.wantRetryAfter {
+				t.Errorf("Retry-After = %q, want %q", got, test.wantRetryAfter)
+			}
 			if strings.Contains(response.Body.String(), "internal upstream detail") {
 				t.Fatal("response leaked upstream error body")
 			}
@@ -1016,6 +1005,494 @@ func TestChatCompletionMapsUpstreamHTTPError(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestChatCompletionRetriesOnlyRecoverableFailures(t *testing.T) {
+	tests := []struct {
+		name       string
+		statuses   []int
+		wantStatus int
+		wantCalls  int32
+	}{
+		{name: "retry service unavailable", statuses: []int{http.StatusServiceUnavailable, http.StatusOK}, wantStatus: http.StatusOK, wantCalls: 2},
+		{name: "do not retry bad request", statuses: []int{http.StatusBadRequest}, wantStatus: http.StatusBadRequest, wantCalls: 1},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var calls atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				call := int(calls.Add(1))
+				status := test.statuses[len(test.statuses)-1]
+				if call <= len(test.statuses) {
+					status = test.statuses[call-1]
+				}
+				if status != http.StatusOK {
+					w.WriteHeader(status)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
+			}))
+			defer upstream.Close()
+
+			router := newRetryTestRouter(t, upstream.URL)
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, validChatRequest())
+
+			if response.Code != test.wantStatus {
+				t.Fatalf("status code = %d, want %d; body = %s", response.Code, test.wantStatus, response.Body.String())
+			}
+			if got := calls.Load(); got != test.wantCalls {
+				t.Fatalf("upstream calls = %d, want %d", got, test.wantCalls)
+			}
+		})
+	}
+
+	t.Run("wait for a cooling key only when the budget permits", func(t *testing.T) {
+		keys, err := reliability.NewProviderKeyRegistry(
+			[]string{"upstream"},
+			[]reliability.ProviderKeySet{{
+				ProviderID: "upstream",
+				Keys:       []reliability.ProviderKey{{ID: "primary", Secret: "provider-test-key"}},
+			}},
+		)
+		if err != nil {
+			t.Fatalf("reliability.NewProviderKeyRegistry() error = %v", err)
+		}
+		selection, failure := keys.Select("upstream")
+		if failure != nil {
+			t.Fatalf("keys.Select() failure = %v", failure)
+		}
+		selection.Complete(&reliability.Failure{
+			Category:      reliability.CategoryUpstreamRateLimit,
+			RetryAfter:    20 * time.Millisecond,
+			RetryAfterSet: true,
+		})
+
+		_, failure = keys.Select("upstream")
+		if failure == nil || failure.Category != reliability.CategoryKeyExhausted {
+			t.Fatalf("cooling key failure = %#v", failure)
+		}
+		policy, err := reliability.NewRetryPolicy(reliability.DefaultRetryConfig())
+		if err != nil {
+			t.Fatalf("reliability.NewRetryPolicy() error = %v", err)
+		}
+		if !policy.ShouldRetry(failure, 1) {
+			t.Fatal("cooling key exhaustion should be retryable")
+		}
+		if !policy.Wait(context.Background(), policy.Backoff(failure, 1)) {
+			t.Fatal("cooldown wait ended before the key became available")
+		}
+		if _, failure = keys.Select("upstream"); failure != nil {
+			t.Fatalf("key after cooldown failure = %v", failure)
+		}
+
+		shortContext, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancel()
+		if policy.Wait(shortContext, time.Second) {
+			t.Fatal("wait longer than the remaining budget was accepted")
+		}
+		if err := shortContext.Err(); err != nil {
+			t.Fatalf("budget was consumed instead of rejected immediately: %v", err)
+		}
+	})
+
+	t.Run("older success cannot erase a newer key cooldown", func(t *testing.T) {
+		keys, err := reliability.NewProviderKeyRegistry(
+			[]string{"upstream"},
+			[]reliability.ProviderKeySet{{
+				ProviderID: "upstream",
+				Keys:       []reliability.ProviderKey{{ID: "primary", Secret: "provider-test-key"}},
+			}},
+		)
+		if err != nil {
+			t.Fatalf("reliability.NewProviderKeyRegistry() error = %v", err)
+		}
+		older, _ := keys.Select("upstream")
+		newer, _ := keys.Select("upstream")
+		shorter, _ := keys.Select("upstream")
+		newer.Complete(&reliability.Failure{
+			Category:      reliability.CategoryUpstreamRateLimit,
+			RetryAfter:    time.Minute,
+			RetryAfterSet: true,
+		})
+		shorter.Complete(&reliability.Failure{
+			Category:      reliability.CategoryUpstreamRateLimit,
+			RetryAfter:    time.Second,
+			RetryAfterSet: true,
+		})
+		older.Complete(nil)
+
+		snapshot := keys.Snapshots()[0]
+		if snapshot.State != reliability.ProviderKeyCooling || time.Until(snapshot.CooldownUntil) < 50*time.Second {
+			t.Fatalf("key cooldown was cleared or shortened: %#v", snapshot)
+		}
+	})
+
+	t.Run("admission waits do not consume an upstream attempt", func(t *testing.T) {
+		var upstreamCalls atomic.Int32
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			upstreamCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
+		}))
+		defer upstream.Close()
+
+		adapters, err := provider.NewAdapterRegistry([]provider.AdapterConfig{{
+			ProviderID: "upstream",
+			Protocol:   provider.ProtocolOpenAICompatible,
+			BaseURL:    upstream.URL,
+		}})
+		if err != nil {
+			t.Fatalf("provider.NewAdapterRegistry() error = %v", err)
+		}
+		breakers, err := reliability.NewBreakerRegistry([]string{"upstream"}, reliability.DefaultBreakerConfig())
+		if err != nil {
+			t.Fatalf("reliability.NewBreakerRegistry() error = %v", err)
+		}
+		queues, err := reliability.NewQueueRegistry([]string{"upstream"}, reliability.DefaultQueueConfig())
+		if err != nil {
+			t.Fatalf("reliability.NewQueueRegistry() error = %v", err)
+		}
+		keys, err := reliability.NewProviderKeyRegistry(
+			[]string{"upstream"},
+			[]reliability.ProviderKeySet{{
+				ProviderID: "upstream",
+				Keys:       []reliability.ProviderKey{{ID: "primary", Secret: "provider-test-key"}},
+			}},
+		)
+		if err != nil {
+			t.Fatalf("reliability.NewProviderKeyRegistry() error = %v", err)
+		}
+		cooling, _ := keys.Select("upstream")
+		cooling.Complete(&reliability.Failure{
+			Category:      reliability.CategoryUpstreamRateLimit,
+			RetryAfter:    20 * time.Millisecond,
+			RetryAfterSet: true,
+		})
+		retryConfig := reliability.DefaultRetryConfig()
+		retryConfig.MaxAttempts = 1
+		retryConfig.InitialBackoff = 10 * time.Millisecond
+		retryConfig.MaxBackoff = 20 * time.Millisecond
+		retryConfig.JitterRatio = 0
+		retryConfig.RequestTimeout = time.Second
+		retryConfig.AttemptTimeout = time.Second
+		retry, err := reliability.NewRetryPolicy(retryConfig)
+		if err != nil {
+			t.Fatalf("reliability.NewRetryPolicy() error = %v", err)
+		}
+		executor, err := reliability.NewAttemptExecutor(adapters, breakers, queues, keys, retry)
+		if err != nil {
+			t.Fatalf("reliability.NewAttemptExecutor() error = %v", err)
+		}
+		request, err := provider.ParseChatRequest([]byte(`{"model":"demo-model","messages":[{"role":"user","content":"hello"}]}`))
+		if err != nil {
+			t.Fatalf("provider.ParseChatRequest() error = %v", err)
+		}
+		result, failure := executor.Execute(context.Background(), reliability.AttemptInput{
+			RequestID:      "attempt-count-test",
+			RequestedModel: "demo-model",
+			Request:        request,
+			Candidate: routing.Candidate{
+				ProviderID:    "upstream",
+				UpstreamModel: "demo-model",
+			},
+		})
+		if failure != nil {
+			t.Fatalf("executor.Execute() failure = %v", failure)
+		}
+		if result.Attempts != 1 || len(result.Trail) != 1 || upstreamCalls.Load() != 1 {
+			t.Fatalf("result = %#v, upstream calls = %d", result, upstreamCalls.Load())
+		}
+	})
+
+	t.Run("403 remains request-local while 401 disables the key", func(t *testing.T) {
+		keys, err := reliability.NewProviderKeyRegistry(
+			[]string{"upstream"},
+			[]reliability.ProviderKeySet{{
+				ProviderID: "upstream",
+				Keys: []reliability.ProviderKey{
+					{ID: "forbidden", Secret: "forbidden-secret"},
+					{ID: "unauthorized", Secret: "unauthorized-secret"},
+				},
+			}},
+		)
+		if err != nil {
+			t.Fatalf("reliability.NewProviderKeyRegistry() error = %v", err)
+		}
+		forbidden, failure := keys.Select("upstream")
+		if failure != nil {
+			t.Fatalf("select forbidden key failure = %v", failure)
+		}
+		forbidden.Complete(&reliability.Failure{Category: reliability.CategoryKeyForbidden})
+
+		unauthorized, failure := keys.Select("upstream")
+		if failure != nil {
+			t.Fatalf("select unauthorized key failure = %v", failure)
+		}
+		unauthorized.Complete(&reliability.Failure{Category: reliability.CategoryKeyUnauthorized})
+
+		states := make(map[string]reliability.ProviderKeyState)
+		for _, snapshot := range keys.Snapshots() {
+			states[snapshot.KeyID] = snapshot.State
+		}
+		if states[forbidden.KeyID()] != reliability.ProviderKeyAvailable {
+			t.Errorf("403 key state = %q, want available", states[forbidden.KeyID()])
+		}
+		if states[unauthorized.KeyID()] != reliability.ProviderKeyDisabled {
+			t.Errorf("401 key state = %q, want disabled", states[unauthorized.KeyID()])
+		}
+	})
+}
+
+func newRetryTestRouter(t *testing.T, baseURL string) http.Handler {
+	t.Helper()
+
+	adapters, err := provider.NewAdapterRegistry([]provider.AdapterConfig{{
+		ProviderID: "upstream",
+		Protocol:   provider.ProtocolOpenAICompatible,
+		BaseURL:    baseURL,
+	}})
+	if err != nil {
+		t.Fatalf("provider.NewAdapterRegistry() error = %v", err)
+	}
+	routes, err := routing.New(singleProviderTestDefinition("upstream"))
+	if err != nil {
+		t.Fatalf("routing.New() error = %v", err)
+	}
+	breakers, err := reliability.NewBreakerRegistry([]string{"upstream"}, reliability.BreakerConfig{
+		FailureThreshold:  5,
+		OpenDuration:      time.Second,
+		HalfOpenMaxProbes: 1,
+	})
+	if err != nil {
+		t.Fatalf("reliability.NewBreakerRegistry() error = %v", err)
+	}
+	queues, err := reliability.NewQueueRegistry([]string{"upstream"}, reliability.DefaultQueueConfig())
+	if err != nil {
+		t.Fatalf("reliability.NewQueueRegistry() error = %v", err)
+	}
+	keys, err := reliability.NewProviderKeyRegistry([]string{"upstream"}, []reliability.ProviderKeySet{{
+		ProviderID: "upstream",
+		Keys:       []reliability.ProviderKey{{ID: "primary", Secret: "provider-test-key"}},
+	}})
+	if err != nil {
+		t.Fatalf("reliability.NewProviderKeyRegistry() error = %v", err)
+	}
+	retry, err := reliability.NewRetryPolicy(reliability.RetryConfig{
+		MaxAttempts:       3,
+		InitialBackoff:    10 * time.Millisecond,
+		MaxBackoff:        10 * time.Millisecond,
+		BackoffMultiplier: 2,
+		JitterRatio:       0,
+		RequestTimeout:    2 * time.Second,
+		AttemptTimeout:    time.Second,
+	})
+	if err != nil {
+		t.Fatalf("reliability.NewRetryPolicy() error = %v", err)
+	}
+
+	return httpapi.NewRouter(
+		adapters,
+		testAccessController{},
+		testRateLimiter{decision: ratelimit.Decision{Allowed: true}},
+		testResponseCache{},
+		routes,
+		breakers,
+		queues,
+		keys,
+		retry,
+	)
+}
+
+func TestChatCompletionFallbackPolicy(t *testing.T) {
+	tests := []struct {
+		name               string
+		primaryStatus      int
+		primaryErrorBody   string
+		primaryProtocol    string
+		secondaryProtocol  string
+		requestBody        string
+		wantStatus         int
+		wantPrimaryCalls   int32
+		wantSecondaryCalls int32
+		wantCacheStores    int32
+	}{
+		{name: "stop after primary success", primaryStatus: http.StatusOK, wantStatus: http.StatusOK, wantPrimaryCalls: 1, wantCacheStores: 1},
+		{name: "fallback after service unavailable", primaryStatus: http.StatusServiceUnavailable, wantStatus: http.StatusOK, wantPrimaryCalls: 1, wantSecondaryCalls: 1},
+		{name: "fallback when model is unavailable", primaryStatus: http.StatusNotFound, primaryErrorBody: `{"error":{"code":"model_not_found"}}`, wantStatus: http.StatusOK, wantPrimaryCalls: 1, wantSecondaryCalls: 1},
+		{name: "do not fallback after bad request", primaryStatus: http.StatusBadRequest, wantStatus: http.StatusBadRequest, wantPrimaryCalls: 1},
+		{
+			name:               "skip primary when it lacks vision",
+			primaryProtocol:    provider.ProtocolDeepSeek,
+			requestBody:        `{"model":"demo-model","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/image.png"}}]}]}`,
+			wantStatus:         http.StatusOK,
+			wantSecondaryCalls: 1,
+			wantCacheStores:    1,
+		},
+		{
+			name:              "reject when every candidate lacks vision",
+			primaryProtocol:   provider.ProtocolDeepSeek,
+			secondaryProtocol: provider.ProtocolDeepSeek,
+			requestBody:       `{"model":"demo-model","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/image.png"}}]}]}`,
+			wantStatus:        http.StatusBadRequest,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var cacheStores atomic.Int32
+			var primaryCalls atomic.Int32
+			primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				primaryCalls.Add(1)
+				if test.primaryStatus == http.StatusOK {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
+					return
+				}
+				w.WriteHeader(test.primaryStatus)
+				_, _ = io.WriteString(w, test.primaryErrorBody)
+			}))
+			defer primary.Close()
+
+			var secondaryCalls atomic.Int32
+			secondary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				secondaryCalls.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
+			}))
+			defer secondary.Close()
+
+			router := newFallbackTestRouter(
+				t,
+				primary.URL,
+				secondary.URL,
+				test.primaryProtocol,
+				test.secondaryProtocol,
+				testResponseCache{onStore: func(string, string, []byte, []byte) {
+					cacheStores.Add(1)
+				}},
+			)
+			response := httptest.NewRecorder()
+			request := validChatRequest()
+			if test.requestBody != "" {
+				request = chatRequest(test.requestBody)
+			}
+			router.ServeHTTP(response, request)
+
+			if response.Code != test.wantStatus {
+				t.Fatalf("status code = %d, want %d; body = %s", response.Code, test.wantStatus, response.Body.String())
+			}
+			if got := primaryCalls.Load(); got != test.wantPrimaryCalls {
+				t.Errorf("primary calls = %d, want %d", got, test.wantPrimaryCalls)
+			}
+			if got := secondaryCalls.Load(); got != test.wantSecondaryCalls {
+				t.Errorf("secondary calls = %d, want %d", got, test.wantSecondaryCalls)
+			}
+			if got := cacheStores.Load(); got != test.wantCacheStores {
+				t.Errorf("cache stores = %d, want %d", got, test.wantCacheStores)
+			}
+		})
+	}
+}
+
+func newFallbackTestRouter(
+	t *testing.T,
+	primaryURL string,
+	secondaryURL string,
+	primaryProtocol string,
+	secondaryProtocol string,
+	cache testResponseCache,
+) http.Handler {
+	t.Helper()
+	if primaryProtocol == "" {
+		primaryProtocol = provider.ProtocolOpenAICompatible
+	}
+	if secondaryProtocol == "" {
+		secondaryProtocol = provider.ProtocolOpenAICompatible
+	}
+
+	providerIDs := []string{"primary", "secondary"}
+	adapters, err := provider.NewAdapterRegistry([]provider.AdapterConfig{
+		{ProviderID: "primary", Protocol: primaryProtocol, BaseURL: primaryURL},
+		{ProviderID: "secondary", Protocol: secondaryProtocol, BaseURL: secondaryURL},
+	})
+	if err != nil {
+		t.Fatalf("provider.NewAdapterRegistry() error = %v", err)
+	}
+	routes, err := routing.New(routing.Definition{
+		Providers: []routing.Provider{
+			{
+				ID:                "primary",
+				Type:              primaryProtocol,
+				Models:            []string{"demo-model"},
+				ModelCapabilities: testModelCapabilities(primaryProtocol),
+			},
+			{
+				ID:                "secondary",
+				Type:              secondaryProtocol,
+				Models:            []string{"demo-model"},
+				ModelCapabilities: testModelCapabilities(secondaryProtocol),
+			},
+		},
+		Rules: []routing.Rule{{
+			Model: "demo-model",
+			Candidates: []routing.Target{
+				{ProviderID: "primary"},
+				{ProviderID: "secondary"},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("routing.New() error = %v", err)
+	}
+	breakers, err := reliability.NewBreakerRegistry(providerIDs, reliability.DefaultBreakerConfig())
+	if err != nil {
+		t.Fatalf("reliability.NewBreakerRegistry() error = %v", err)
+	}
+	queues, err := reliability.NewQueueRegistry(providerIDs, reliability.DefaultQueueConfig())
+	if err != nil {
+		t.Fatalf("reliability.NewQueueRegistry() error = %v", err)
+	}
+	keys, err := reliability.NewProviderKeyRegistry(providerIDs, []reliability.ProviderKeySet{
+		{ProviderID: "primary", Keys: []reliability.ProviderKey{{ID: "primary-key", Secret: "primary-secret"}}},
+		{ProviderID: "secondary", Keys: []reliability.ProviderKey{{ID: "secondary-key", Secret: "secondary-secret"}}},
+	})
+	if err != nil {
+		t.Fatalf("reliability.NewProviderKeyRegistry() error = %v", err)
+	}
+	retry, err := reliability.NewRetryPolicy(reliability.RetryConfig{
+		MaxAttempts:       1,
+		InitialBackoff:    10 * time.Millisecond,
+		MaxBackoff:        10 * time.Millisecond,
+		BackoffMultiplier: 2,
+		RequestTimeout:    2 * time.Second,
+		AttemptTimeout:    time.Second,
+	})
+	if err != nil {
+		t.Fatalf("reliability.NewRetryPolicy() error = %v", err)
+	}
+
+	return httpapi.NewRouter(
+		adapters,
+		testAccessController{},
+		testRateLimiter{decision: ratelimit.Decision{Allowed: true}},
+		cache,
+		routes,
+		breakers,
+		queues,
+		keys,
+		retry,
+	)
+}
+
+func testModelCapabilities(protocol string) map[string][]provider.Capability {
+	capabilities := []provider.Capability{provider.CapabilityText, provider.CapabilityImage}
+	if protocol == provider.ProtocolDeepSeek {
+		capabilities = capabilities[:1]
+	}
+	return map[string][]provider.Capability{"demo-model": capabilities}
 }
 
 func TestChatCompletionMapsInvalidUpstreamResponse(t *testing.T) {
@@ -1090,13 +1567,13 @@ func TestChatCompletionMapsInterruptedUpstreamResponse(t *testing.T) {
 
 func TestChatCompletionMapsUpstreamTimeout(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(300 * time.Millisecond)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"choices":[]}`)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
 	}))
 	defer upstream.Close()
 
-	router := newTestRouter(t, upstream.URL, 10*time.Millisecond)
+	router := newTestRouter(t, upstream.URL, 100*time.Millisecond)
 	response := httptest.NewRecorder()
 	router.ServeHTTP(response, validChatRequest())
 
@@ -1165,10 +1642,14 @@ func waitForQueueSnapshot(
 }
 
 func validChatRequest() *http.Request {
+	return chatRequest(`{"model":"demo-model","messages":[{"role":"user","content":"hello"}]}`)
+}
+
+func chatRequest(body string) *http.Request {
 	request := httptest.NewRequest(
 		http.MethodPost,
 		"/v1/chat/completions",
-		strings.NewReader(`{"model":"demo-model","messages":[{"role":"user","content":"hello"}]}`),
+		strings.NewReader(body),
 	)
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("X-Request-ID", "request-test-id")

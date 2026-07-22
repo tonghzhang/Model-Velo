@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -26,29 +27,16 @@ import (
 const maxChatRequestBodyBytes int64 = 1 << 20
 
 type chatHandler struct {
-	client  *provider.Client
-	access  AccessController
-	limiter RateLimiter
-	cache   ResponseCache
-	routes  *routing.Router
-	breaker *reliability.Breaker
-	queues  *reliability.QueueRegistry
+	access       AccessController
+	limiter      RateLimiter
+	cache        ResponseCache
+	routes       *routing.Router
+	orchestrator *reliability.Orchestrator
 }
 
 type ResponseCache interface {
 	Lookup(ctx context.Context, tenantID, model string, requestBody []byte) (responsecache.Result, error)
 	Store(ctx context.Context, tenantID, model string, requestBody, responseBody []byte) error
-}
-
-type chatRequest struct {
-	Model    string        `json:"model"`
-	Messages []chatMessage `json:"messages"`
-	Stream   bool          `json:"stream"`
-}
-
-type chatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
 }
 
 func (h chatHandler) complete(c *gin.Context) {
@@ -91,8 +79,8 @@ func (h chatHandler) complete(c *gin.Context) {
 		return
 	}
 
-	var request *chatRequest
-	if err := json.Unmarshal(requestBody, &request); err != nil || request == nil {
+	request, err := provider.ParseChatRequest(requestBody)
+	if err != nil {
 		writeAPIError(
 			c,
 			http.StatusBadRequest,
@@ -123,6 +111,18 @@ func (h chatHandler) complete(c *gin.Context) {
 	}
 
 	model := strings.TrimSpace(request.Model)
+	requiredCapabilities, err := request.RequiredCapabilities()
+	if err != nil {
+		writeAPIError(
+			c,
+			http.StatusBadRequest,
+			"request uses a capability that is not supported by this gateway",
+			"invalid_request_error",
+			nil,
+			"unsupported_request_capability",
+		)
+		return
+	}
 	if err := h.access.AuthorizeModel(
 		c.Request.Context(),
 		identity.TenantID,
@@ -194,8 +194,19 @@ func (h chatHandler) complete(c *gin.Context) {
 		return
 	}
 
-	routePlan, err := h.routes.Plan(identity.TenantID, model)
+	routePlan, err := h.routes.Plan(model, requiredCapabilities)
 	if err != nil {
+		if errors.Is(err, routing.ErrCapabilityUnavailable) {
+			writeAPIError(
+				c,
+				http.StatusBadRequest,
+				"no configured provider model supports the requested capabilities",
+				"invalid_request_error",
+				stringPointer("model"),
+				"unsupported_provider_capability",
+			)
+			return
+		}
 		if errors.Is(err, routing.ErrNoRoute) {
 			writeAPIError(
 				c,
@@ -217,19 +228,6 @@ func (h chatHandler) complete(c *gin.Context) {
 		)
 		return
 	}
-	primary, ok := routePlan.Primary()
-	if !ok {
-		writeAPIError(
-			c,
-			http.StatusServiceUnavailable,
-			"no provider route is available for the requested model",
-			"server_error",
-			stringPointer("model"),
-			"route_unavailable",
-		)
-		return
-	}
-
 	cacheResult := responsecache.Result{Status: responsecache.StatusBypass}
 	if !requestBypassesResponseCache(c.Request) {
 		cacheResult, err = h.cache.Lookup(c.Request.Context(), identity.TenantID, model, requestBody)
@@ -247,18 +245,17 @@ func (h chatHandler) complete(c *gin.Context) {
 		return
 	}
 
-	responseBody, failure := h.callPrimary(
-		c.Request.Context(),
-		requestIDFromContext(c.Request.Context()),
-		model,
-		requestBody,
-		primary,
-	)
+	execution, failure := h.orchestrator.Execute(c.Request.Context(), reliability.ExecutionInput{
+		RequestID: requestIDFromContext(c.Request.Context()),
+		Request:   request,
+		Plan:      routePlan,
+	})
 	if failure != nil {
 		writeReliabilityError(c, failure)
 		return
 	}
-	if cacheResult.Status == responsecache.StatusMiss {
+	responseBody := execution.Body
+	if cacheResult.Status == responsecache.StatusMiss && execution.Fallbacks == 0 {
 		if err := h.cache.Store(
 			c.Request.Context(),
 			identity.TenantID,
@@ -276,45 +273,6 @@ func (h chatHandler) complete(c *gin.Context) {
 
 	writeCacheStatusHeader(c, cacheResult.Status)
 	c.Data(http.StatusOK, "application/json; charset=utf-8", responseBody)
-}
-
-func (h chatHandler) callPrimary(
-	ctx context.Context,
-	requestID string,
-	requestedModel string,
-	requestBody []byte,
-	candidate routing.Candidate,
-) ([]byte, *reliability.Failure) {
-	permit, failure := h.breaker.Allow()
-	if failure != nil {
-		failure.Candidate = candidate.Priority
-		failure.Attempt = 1
-		return nil, failure
-	}
-	defer permit.Abandon()
-
-	lease, failure := h.queues.Acquire(ctx, candidate.ProviderID)
-	if failure != nil {
-		failure.Candidate = candidate.Priority
-		failure.Attempt = 1
-		permit.Complete(failure)
-		return nil, failure
-	}
-	defer lease.Release()
-
-	var (
-		responseBody []byte
-		err          error
-	)
-	if candidate.UpstreamModel == requestedModel {
-		responseBody, err = h.client.Chat(ctx, requestID, requestBody)
-	} else {
-		responseBody, err = h.client.ChatModel(ctx, requestID, requestBody, candidate.UpstreamModel)
-	}
-	failure = reliability.FromProvider(ctx, candidate.ProviderID, candidate.Priority, 1, err)
-	lease.Release()
-	permit.Complete(failure)
-	return responseBody, failure
 }
 
 func writeCacheStatusHeader(c *gin.Context, status responsecache.Status) {
@@ -354,7 +312,7 @@ func hasJSONContentType(contentType string) bool {
 	return err == nil && mediaType == "application/json"
 }
 
-func validateChatRequest(request *chatRequest) (message string, param *string, code string) {
+func validateChatRequest(request provider.ChatRequest) (message string, param *string, code string) {
 	if strings.TrimSpace(request.Model) == "" {
 		return "model is required", stringPointer("model"), "missing_model"
 	}
@@ -366,8 +324,14 @@ func validateChatRequest(request *chatRequest) (message string, param *string, c
 		if !supportedMessageRole(message.Role) {
 			return fmt.Sprintf("messages[%d].role is not supported", index), stringPointer("messages"), "invalid_message_role"
 		}
-		if strings.TrimSpace(message.Content) == "" {
+		switch messageContentStatus(message.Content) {
+		case "missing":
+			if message.Role == "assistant" && (message.HasField("tool_calls") || message.HasField("function_call")) {
+				continue
+			}
 			return fmt.Sprintf("messages[%d].content is required", index), stringPointer("messages"), "missing_message_content"
+		case "invalid":
+			return fmt.Sprintf("messages[%d].content must be text or a non-empty content-parts array", index), stringPointer("messages"), "invalid_message_content"
 		}
 	}
 
@@ -378,9 +342,46 @@ func validateChatRequest(request *chatRequest) (message string, param *string, c
 	return "", nil, ""
 }
 
+func messageContentStatus(raw json.RawMessage) string {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return "missing"
+	}
+	if raw[0] == '"' {
+		var text string
+		if err := json.Unmarshal(raw, &text); err != nil {
+			return "invalid"
+		}
+		if strings.TrimSpace(text) == "" {
+			return "missing"
+		}
+		return ""
+	}
+	if raw[0] != '[' {
+		return "invalid"
+	}
+
+	var parts []json.RawMessage
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		return "invalid"
+	}
+	if len(parts) == 0 {
+		return "missing"
+	}
+	for _, rawPart := range parts {
+		var part struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(rawPart, &part); err != nil || strings.TrimSpace(part.Type) == "" {
+			return "invalid"
+		}
+	}
+	return ""
+}
+
 func supportedMessageRole(role string) bool {
 	switch role {
-	case "system", "user", "assistant":
+	case "system", "developer", "user", "assistant", "tool":
 		return true
 	default:
 		return false
@@ -398,6 +399,24 @@ func writeReliabilityError(c *gin.Context, failure *reliability.Failure) {
 	switch failure.Category {
 	case reliability.CategoryTimeout:
 		writeAPIError(c, http.StatusGatewayTimeout, "upstream request timed out", "upstream_error", nil, "upstream_timeout")
+	case reliability.CategoryUnsupportedCapability:
+		writeAPIError(
+			c,
+			http.StatusBadRequest,
+			"no configured provider supports a requested capability",
+			"invalid_request_error",
+			nil,
+			"unsupported_provider_capability",
+		)
+	case reliability.CategoryUnsupportedResponse:
+		writeAPIError(
+			c,
+			http.StatusBadGateway,
+			"upstream returned output this gateway cannot represent",
+			"upstream_error",
+			nil,
+			"unsupported_upstream_response",
+		)
 	case reliability.CategoryUpstreamProtocol:
 		switch {
 		case errors.Is(failure, provider.ErrResponseTooLarge):
@@ -413,9 +432,15 @@ func writeReliabilityError(c *gin.Context, failure *reliability.Failure) {
 		} else {
 			writeAPIError(c, http.StatusBadGateway, "upstream request failed", "upstream_error", nil, "upstream_http_error")
 		}
+	case reliability.CategoryModelUnavailable:
+		writeAPIError(c, http.StatusServiceUnavailable, "requested model is unavailable from configured providers", "upstream_error", stringPointer("model"), "model_unavailable")
 	case reliability.CategoryUpstreamRateLimit:
+		if failure.RetryAfterSet {
+			seconds := int64((failure.RetryAfter + time.Second - 1) / time.Second)
+			c.Header("Retry-After", strconv.FormatInt(seconds, 10))
+		}
 		writeAPIError(c, http.StatusTooManyRequests, "upstream rate limit exceeded", "upstream_error", nil, "upstream_rate_limited")
-	case reliability.CategoryKeyRejected, reliability.CategoryUpstream5xx:
+	case reliability.CategoryKeyUnauthorized, reliability.CategoryKeyForbidden, reliability.CategoryUpstream5xx:
 		writeAPIError(c, http.StatusBadGateway, "upstream request failed", "upstream_error", nil, "upstream_http_error")
 	case reliability.CategoryBreaker:
 		if failure.RetryAfter > 0 {
@@ -423,6 +448,12 @@ func writeReliabilityError(c *gin.Context, failure *reliability.Failure) {
 			c.Header("Retry-After", strconv.FormatInt(seconds, 10))
 		}
 		writeAPIError(c, http.StatusServiceUnavailable, "provider circuit is temporarily open", "upstream_error", nil, "provider_circuit_open")
+	case reliability.CategoryKeyExhausted:
+		if failure.RetryAfter > 0 {
+			seconds := int64((failure.RetryAfter + time.Second - 1) / time.Second)
+			c.Header("Retry-After", strconv.FormatInt(seconds, 10))
+		}
+		writeAPIError(c, http.StatusServiceUnavailable, "provider has no available API key", "upstream_error", nil, "provider_keys_exhausted")
 	case reliability.CategoryQueue:
 		switch failure.Queue {
 		case reliability.QueueFull:

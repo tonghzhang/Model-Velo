@@ -6,21 +6,22 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"model-velo/internal/provider"
 )
 
-const ProviderTypeOpenAICompatible = "openai-compatible"
-
 var (
-	ErrNoRoute        = errors.New("no route is configured for the requested model")
-	identifierPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
-	versionPattern    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+	ErrNoRoute               = errors.New("no route is configured for the requested model")
+	ErrCapabilityUnavailable = errors.New("no route supports the requested capabilities")
+	identifierPattern        = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
 )
 
 type Provider struct {
-	ID            string
-	Type          string
-	Models        []string
-	ConfigVersion string
+	ID                string
+	Type              string
+	BaseURL           string
+	Models            []string
+	ModelCapabilities map[string][]provider.Capability
 }
 
 type Target struct {
@@ -34,22 +35,18 @@ type Rule struct {
 }
 
 type Definition struct {
-	Version   string
 	Providers []Provider
 	Rules     []Rule
 }
 
 type Candidate struct {
 	ProviderID    string
-	ProviderType  string
 	UpstreamModel string
 	Priority      int
 }
 
 type Plan struct {
-	TenantID       string
 	RequestedModel string
-	ConfigVersion  string
 	Candidates     []Candidate
 }
 
@@ -61,25 +58,24 @@ func (p Plan) Primary() (Candidate, bool) {
 }
 
 type Router struct {
-	version        string
-	providers      map[string]Provider
+	providers      map[string]routeProvider
 	exact          map[string][]Target
 	defaultTargets []Target
 }
 
-func New(definition Definition) (*Router, error) {
-	version := strings.TrimSpace(definition.Version)
-	if !versionPattern.MatchString(version) {
-		return nil, errors.New("routing config version must be a 1 to 64 character identifier")
-	}
+type routeProvider struct {
+	id           string
+	models       []string
+	capabilities map[string]map[provider.Capability]struct{}
+}
 
-	providers, err := validateProviders(definition.Providers, version)
+func New(definition Definition) (*Router, error) {
+	providers, err := validateProviders(definition.Providers)
 	if err != nil {
 		return nil, err
 	}
 
 	router := &Router{
-		version:   version,
 		providers: providers,
 		exact:     make(map[string][]Target),
 	}
@@ -111,26 +107,9 @@ func New(definition Definition) (*Router, error) {
 	return router, nil
 }
 
-func SingleProviderDefinition(providerID, version string) Definition {
-	return Definition{
-		Version: version,
-		Providers: []Provider{{
-			ID:            providerID,
-			Type:          ProviderTypeOpenAICompatible,
-			Models:        []string{"*"},
-			ConfigVersion: version,
-		}},
-		Rules: []Rule{{
-			Model:      "*",
-			Candidates: []Target{{ProviderID: providerID}},
-		}},
-	}
-}
-
-func (r *Router) Plan(tenantID, requestedModel string) (Plan, error) {
-	tenantID = strings.TrimSpace(tenantID)
+func (r *Router) Plan(requestedModel string, required []provider.Capability) (Plan, error) {
 	requestedModel = strings.TrimSpace(requestedModel)
-	if tenantID == "" || requestedModel == "" {
+	if requestedModel == "" {
 		return Plan{}, ErrNoRoute
 	}
 
@@ -143,6 +122,7 @@ func (r *Router) Plan(tenantID, requestedModel string) (Plan, error) {
 	}
 
 	candidates := make([]Candidate, 0, len(targets))
+	modelAvailable := false
 	for priority, target := range targets {
 		provider := r.providers[target.ProviderID]
 		upstreamModel := target.UpstreamModel
@@ -152,54 +132,66 @@ func (r *Router) Plan(tenantID, requestedModel string) (Plan, error) {
 		if !providerSupports(provider, upstreamModel) {
 			continue
 		}
+		modelAvailable = true
+		if !providerSupportsCapabilities(provider, upstreamModel, required) {
+			continue
+		}
 		candidates = append(candidates, Candidate{
-			ProviderID:    provider.ID,
-			ProviderType:  provider.Type,
+			ProviderID:    provider.id,
 			UpstreamModel: upstreamModel,
 			Priority:      priority,
 		})
 	}
 	if len(candidates) == 0 {
+		if modelAvailable {
+			return Plan{}, ErrCapabilityUnavailable
+		}
 		return Plan{}, ErrNoRoute
 	}
 
 	return Plan{
-		TenantID:       tenantID,
 		RequestedModel: requestedModel,
-		ConfigVersion:  r.version,
 		Candidates:     candidates,
 	}, nil
 }
 
-func validateProviders(configured []Provider, version string) (map[string]Provider, error) {
+func validateProviders(configured []Provider) (map[string]routeProvider, error) {
 	if len(configured) == 0 {
 		return nil, errors.New("routing config must contain at least one provider")
 	}
 
-	providers := make(map[string]Provider, len(configured))
-	for index, provider := range configured {
-		provider.ID = strings.TrimSpace(provider.ID)
-		provider.Type = strings.TrimSpace(provider.Type)
-		provider.ConfigVersion = strings.TrimSpace(provider.ConfigVersion)
-		if !identifierPattern.MatchString(provider.ID) {
+	providers := make(map[string]routeProvider, len(configured))
+	for index, configuredProvider := range configured {
+		configuredProvider.ID = strings.TrimSpace(configuredProvider.ID)
+		configuredProvider.Type = strings.TrimSpace(configuredProvider.Type)
+		configuredProvider.BaseURL = strings.TrimSpace(configuredProvider.BaseURL)
+		if !identifierPattern.MatchString(configuredProvider.ID) {
 			return nil, fmt.Errorf("provider %d has an invalid ID", index)
 		}
-		if provider.Type != ProviderTypeOpenAICompatible {
-			return nil, fmt.Errorf("provider %q has unsupported type %q", provider.ID, provider.Type)
+		if !provider.SupportedProtocol(configuredProvider.Type) {
+			return nil, fmt.Errorf("provider %q has unsupported type %q", configuredProvider.ID, configuredProvider.Type)
 		}
-		if provider.ConfigVersion != version {
-			return nil, fmt.Errorf("provider %q config version does not match routing version", provider.ID)
-		}
-		if _, exists := providers[provider.ID]; exists {
-			return nil, fmt.Errorf("routing config contains duplicate provider %q", provider.ID)
+		if _, exists := providers[configuredProvider.ID]; exists {
+			return nil, fmt.Errorf("routing config contains duplicate provider %q", configuredProvider.ID)
 		}
 
-		models, err := normalizeModels(provider.Models)
+		models, err := normalizeModels(configuredProvider.Models)
 		if err != nil {
-			return nil, fmt.Errorf("provider %q: %w", provider.ID, err)
+			return nil, fmt.Errorf("provider %q: %w", configuredProvider.ID, err)
 		}
-		provider.Models = models
-		providers[provider.ID] = provider
+		capabilities, err := normalizeCapabilities(
+			models,
+			configuredProvider.Type,
+			configuredProvider.ModelCapabilities,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("provider %q: %w", configuredProvider.ID, err)
+		}
+		providers[configuredProvider.ID] = routeProvider{
+			id:           configuredProvider.ID,
+			models:       models,
+			capabilities: capabilities,
+		}
 	}
 	return providers, nil
 }
@@ -226,7 +218,7 @@ func normalizeModels(configured []string) ([]string, error) {
 	return models, nil
 }
 
-func validateTargets(configured []Target, routeModel string, providers map[string]Provider) ([]Target, error) {
+func validateTargets(configured []Target, routeModel string, providers map[string]routeProvider) ([]Target, error) {
 	if len(configured) == 0 {
 		return nil, errors.New("candidates must not be empty")
 	}
@@ -265,11 +257,95 @@ func validateTargets(configured []Target, routeModel string, providers map[strin
 	return targets, nil
 }
 
-func providerSupports(provider Provider, model string) bool {
-	for _, supportedModel := range provider.Models {
+func providerSupports(provider routeProvider, model string) bool {
+	for _, supportedModel := range provider.models {
 		if supportedModel == "*" || supportedModel == model {
 			return true
 		}
 	}
 	return false
+}
+
+func normalizeCapabilities(
+	models []string,
+	protocol string,
+	configured map[string][]provider.Capability,
+) (map[string]map[provider.Capability]struct{}, error) {
+	modelSet := make(map[string]struct{}, len(models))
+	wildcard := false
+	for _, model := range models {
+		modelSet[model] = struct{}{}
+		wildcard = wildcard || model == "*"
+	}
+
+	capabilities := make(map[string]map[provider.Capability]struct{}, len(models)+len(configured))
+	for configuredModel, values := range configured {
+		model := strings.TrimSpace(configuredModel)
+		if model == "" {
+			return nil, errors.New("model capabilities contain an empty model")
+		}
+		if _, ok := modelSet[model]; !ok && !wildcard {
+			return nil, fmt.Errorf("model capabilities reference unsupported model %q", model)
+		}
+		if _, duplicate := capabilities[model]; duplicate {
+			return nil, fmt.Errorf("model capabilities contain duplicate model %q", model)
+		}
+		set, err := normalizeCapabilitySet(protocol, values)
+		if err != nil {
+			return nil, fmt.Errorf("model %q: %w", model, err)
+		}
+		capabilities[model] = set
+	}
+	for _, model := range models {
+		if capabilities[model] == nil {
+			capabilities[model] = map[provider.Capability]struct{}{provider.CapabilityText: {}}
+		}
+	}
+	return capabilities, nil
+}
+
+func normalizeCapabilitySet(
+	protocol string,
+	configured []provider.Capability,
+) (map[provider.Capability]struct{}, error) {
+	if len(configured) == 0 {
+		return nil, errors.New("capabilities must not be empty")
+	}
+	set := make(map[provider.Capability]struct{}, len(configured))
+	for _, capability := range configured {
+		capability = provider.Capability(strings.ToLower(strings.TrimSpace(string(capability))))
+		switch capability {
+		case provider.CapabilityText, provider.CapabilityImage, provider.CapabilityTools:
+			if !provider.ProtocolSupportsCapability(protocol, capability) {
+				return nil, fmt.Errorf("protocol %q cannot carry capability %q", protocol, capability)
+			}
+			if _, duplicate := set[capability]; duplicate {
+				return nil, fmt.Errorf("capabilities contain duplicate %q", capability)
+			}
+			set[capability] = struct{}{}
+		default:
+			return nil, fmt.Errorf("unsupported capability %q", capability)
+		}
+	}
+	if _, ok := set[provider.CapabilityText]; !ok {
+		return nil, errors.New("chat capabilities must include text")
+	}
+	return set, nil
+}
+
+func providerSupportsCapabilities(
+	providerConfig routeProvider,
+	model string,
+	required []provider.Capability,
+) bool {
+	available := providerConfig.capabilities[model]
+	if available == nil {
+		available = providerConfig.capabilities["*"]
+	}
+	for _, capability := range required {
+		if _, ok := available[capability]; !ok {
+			return false
+		}
+	}
+	return true
 }

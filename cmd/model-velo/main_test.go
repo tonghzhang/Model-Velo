@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -24,13 +25,9 @@ func TestNewHTTPServerAddress(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			setValidUpstreamEnv(t)
 			t.Setenv(httpAddressEnv, test.env)
 
-			server, err := newHTTPServer(mainTestAccessController{}, mainTestRateLimiter{}, mainTestResponseCache{})
-			if err != nil {
-				t.Fatalf("newHTTPServer() error = %v", err)
-			}
+			server := newConfiguredHTTPServer(t)
 			if server.Addr != test.want {
 				t.Fatalf("server address = %q, want %q", server.Addr, test.want)
 			}
@@ -39,12 +36,8 @@ func TestNewHTTPServerAddress(t *testing.T) {
 }
 
 func TestNewHTTPServerDefaults(t *testing.T) {
-	setValidUpstreamEnv(t)
 	t.Setenv(httpAddressEnv, "")
-	server, err := newHTTPServer(mainTestAccessController{}, mainTestRateLimiter{}, mainTestResponseCache{})
-	if err != nil {
-		t.Fatalf("newHTTPServer() error = %v", err)
-	}
+	server := newConfiguredHTTPServer(t)
 
 	if server.Handler == nil {
 		t.Fatal("server handler is nil")
@@ -60,58 +53,6 @@ func TestNewHTTPServerDefaults(t *testing.T) {
 	}
 	if server.IdleTimeout != 60*time.Second {
 		t.Errorf("IdleTimeout = %s, want %s", server.IdleTimeout, 60*time.Second)
-	}
-}
-
-func TestNewHTTPServerValidatesUpstreamConfig(t *testing.T) {
-	tests := []struct {
-		name    string
-		baseURL string
-		apiKey  string
-		timeout string
-	}{
-		{name: "missing URL", baseURL: "", apiKey: "provider-test-key", timeout: "30s"},
-		{name: "missing key", baseURL: "https://example.com", apiKey: "", timeout: "30s"},
-		{name: "invalid timeout", baseURL: "https://example.com", apiKey: "provider-test-key", timeout: "invalid"},
-		{name: "non-positive timeout", baseURL: "https://example.com", apiKey: "provider-test-key", timeout: "0s"},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			t.Setenv(upstreamBaseURLEnv, test.baseURL)
-			t.Setenv(upstreamAPIKeyEnv, test.apiKey)
-			t.Setenv(upstreamTimeoutEnv, test.timeout)
-
-			server, err := newHTTPServer(mainTestAccessController{}, mainTestRateLimiter{}, mainTestResponseCache{})
-			if err == nil {
-				t.Fatalf("newHTTPServer() = %#v, nil; want error", server)
-			}
-		})
-	}
-}
-
-func TestLoadUpstreamTimeout(t *testing.T) {
-	tests := []struct {
-		name string
-		env  string
-		want time.Duration
-	}{
-		{name: "default", env: "", want: 30 * time.Second},
-		{name: "configured", env: " 12s ", want: 12 * time.Second},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			t.Setenv(upstreamTimeoutEnv, test.env)
-
-			got, err := loadUpstreamTimeout()
-			if err != nil {
-				t.Fatalf("loadUpstreamTimeout() error = %v", err)
-			}
-			if got != test.want {
-				t.Fatalf("loadUpstreamTimeout() = %s, want %s", got, test.want)
-			}
-		})
 	}
 }
 
@@ -151,6 +92,7 @@ func TestLoadShutdownTimeout(t *testing.T) {
 
 func TestLoadStartupConfig(t *testing.T) {
 	setValidInfrastructureEnv(t)
+	setValidRoutingEnv(t)
 	t.Setenv(shutdownTimeoutEnv, "4s")
 
 	got, err := loadStartupConfig()
@@ -172,8 +114,19 @@ func TestLoadStartupConfig(t *testing.T) {
 	if got.rateLimit.Environment != "test" || got.rateLimit.MaxRequests != 60 {
 		t.Errorf("rate limit config = %#v", got.rateLimit)
 	}
-	if got.responseCache.TTL != 5*time.Minute || got.responseCache.RouteVersion != "single-provider-v1" {
+	if got.responseCache.TTL != 5*time.Minute || got.responseCache.RouteVersion != "routes-v1" {
 		t.Errorf("response cache config = %#v", got.responseCache)
+	}
+}
+
+func TestLoadStartupConfigRequiresRouting(t *testing.T) {
+	setValidInfrastructureEnv(t)
+	setValidRoutingEnv(t)
+	t.Setenv("MODEL_VELO_ROUTING_JSON", "")
+
+	_, err := loadStartupConfig()
+	if err == nil || !strings.Contains(err.Error(), "MODEL_VELO_ROUTING_JSON is required") {
+		t.Fatalf("loadStartupConfig() error = %v, want missing routing error", err)
 	}
 }
 
@@ -193,12 +146,41 @@ func TestLoadStartupConfigRejectsInfrastructureBeforeListening(t *testing.T) {
 	}
 }
 
-func setValidUpstreamEnv(t *testing.T) {
+func newConfiguredHTTPServer(t *testing.T) *http.Server {
 	t.Helper()
-	t.Setenv(upstreamBaseURLEnv, "https://example.com")
-	t.Setenv(upstreamAPIKeyEnv, "provider-test-key")
-	t.Setenv(upstreamTimeoutEnv, "")
+	setValidInfrastructureEnv(t)
+	setValidRoutingEnv(t)
+
+	startup, err := loadStartupConfig()
+	if err != nil {
+		t.Fatalf("loadStartupConfig() error = %v", err)
+	}
+	server, err := newHTTPServer(
+		mainTestAccessController{},
+		mainTestRateLimiter{},
+		mainTestResponseCache{},
+		startup.routing,
+		startup.adapters,
+		startup.breakers,
+		startup.queues,
+		startup.providerKeys,
+		startup.retry,
+	)
+	if err != nil {
+		t.Fatalf("newHTTPServer() error = %v", err)
+	}
+	return server
 }
+
+func setValidRoutingEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("MODEL_VELO_ROUTING_JSON", validRoutingJSON)
+	t.Setenv("MODEL_VELO_PROVIDER_KEYS_JSON", validProviderKeysJSON)
+}
+
+const validRoutingJSON = `{"providers":[{"id":"upstream","vendor":"custom","type":"openai-compatible","base_url":"https://example.com","models":["*"]}],"routes":[{"model":"*","candidates":[{"provider":"upstream"}]}]}`
+
+const validProviderKeysJSON = `{"providers":[{"provider_id":"upstream","keys":[{"id":"default","secret":"provider-test-key"}]}]}`
 
 func setValidInfrastructureEnv(t *testing.T) {
 	t.Helper()

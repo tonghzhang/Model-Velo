@@ -205,6 +205,17 @@ func NewQueueRegistry(providerIDs []string, config QueueConfig) (*QueueRegistry,
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
+	configs := make(map[string]QueueConfig, len(providerIDs))
+	for _, providerID := range providerIDs {
+		configs[strings.TrimSpace(providerID)] = config
+	}
+	return NewQueueRegistryWithConfigs(providerIDs, configs)
+}
+
+func NewQueueRegistryWithConfigs(
+	providerIDs []string,
+	configs map[string]QueueConfig,
+) (*QueueRegistry, error) {
 	registry := &QueueRegistry{queues: make(map[string]*ProviderQueue, len(providerIDs))}
 	for index, providerID := range providerIDs {
 		providerID = strings.TrimSpace(providerID)
@@ -213,6 +224,10 @@ func NewQueueRegistry(providerIDs []string, config QueueConfig) (*QueueRegistry,
 		}
 		if _, exists := registry.queues[providerID]; exists {
 			return nil, fmt.Errorf("queue provider ID %q is duplicated", providerID)
+		}
+		config, ok := configs[providerID]
+		if !ok {
+			return nil, fmt.Errorf("queue config for provider %q is missing", providerID)
 		}
 		queue, err := NewProviderQueue(providerID, config)
 		if err != nil {

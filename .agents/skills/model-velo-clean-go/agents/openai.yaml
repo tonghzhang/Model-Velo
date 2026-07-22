@@ -1,0 +1,4 @@
+interface:
+  display_name: "Model-Velo Clean Go"
+  short_description: "Keep Model-Velo Go code concise and domain-shaped"
+  default_prompt: "Use $model-velo-clean-go to review this Go change for accidental complexity."

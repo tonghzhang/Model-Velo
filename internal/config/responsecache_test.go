@@ -14,9 +14,9 @@ func TestLoadResponseCache(t *testing.T) {
 		wantRoute    string
 		wantErr      bool
 	}{
-		{name: "defaults", wantTTL: 5 * time.Minute, wantRoute: "single-provider-v1"},
+		{name: "defaults", wantTTL: 5 * time.Minute, wantRoute: "routes-v1"},
 		{name: "configured", ttl: "30s", routeVersion: "routes-2026-07", wantTTL: 30 * time.Second, wantRoute: "routes-2026-07"},
-		{name: "disabled", ttl: "off", wantRoute: "single-provider-v1"},
+		{name: "disabled", ttl: "off", wantRoute: "routes-v1"},
 		{name: "ttl too short", ttl: "500ms", wantErr: true},
 		{name: "ttl too long", ttl: "25h", wantErr: true},
 		{name: "invalid route version", routeVersion: "route/version", wantErr: true},

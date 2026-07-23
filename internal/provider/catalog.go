@@ -6,6 +6,7 @@ import (
 )
 
 const (
+	// ProtocolOpenAICompatible 用于用户自定义的 OpenAI Chat Completions 兼容端点。
 	ProtocolOpenAICompatible = "openai-compatible"
 	ProtocolOpenAI           = "openai"
 	ProtocolAnthropic        = "anthropic"
@@ -26,6 +27,7 @@ const (
 )
 
 const (
+	// VendorCustom 表示没有内置地址、必须显式提供 base_url 的兼容厂商。
 	VendorCustom     = "custom"
 	VendorOpenAI     = "openai"
 	VendorAnthropic  = "anthropic"
@@ -45,11 +47,13 @@ const (
 	VendorCloudflare = "cloudflare"
 )
 
+// Preset 是厂商解析后的协议和基础地址，不包含密钥或运行时状态。
 type Preset struct {
 	Protocol string
 	BaseURL  string
 }
 
+// presets 保存每个厂商推荐的原生协议和默认公开地址。
 var presets = map[string]Preset{
 	VendorCustom:     {Protocol: ProtocolOpenAICompatible},
 	VendorOpenAI:     {Protocol: ProtocolOpenAI, BaseURL: "https://api.openai.com/v1"},
@@ -70,6 +74,7 @@ var presets = map[string]Preset{
 	VendorCloudflare: {Protocol: ProtocolCloudflare},
 }
 
+// compatibleBaseURLs 仅列出官方提供 OpenAI 兼容入口的厂商。
 var compatibleBaseURLs = map[string]string{
 	VendorOpenAI:   "https://api.openai.com/v1",
 	VendorGoogle:   "https://generativelanguage.googleapis.com/v1beta/openai",
@@ -83,6 +88,8 @@ var compatibleBaseURLs = map[string]string{
 	VendorTogether: "https://api.together.ai/v1",
 }
 
+// Resolve 校验 vendor、protocol 和 base_url 的组合，并补齐可信的默认地址。
+// 自定义、Azure、Bedrock 和 Cloudflare 的地址包含部署信息，因此不猜测默认值。
 func Resolve(vendor, protocol, configuredBaseURL string) (Preset, error) {
 	vendor = strings.ToLower(strings.TrimSpace(vendor))
 	protocol = strings.ToLower(strings.TrimSpace(protocol))
@@ -131,6 +138,7 @@ func Resolve(vendor, protocol, configuredBaseURL string) (Preset, error) {
 	return Preset{Protocol: protocol, BaseURL: baseURL}, nil
 }
 
+// SupportedProtocol 判断工厂是否有对应的协议实现。
 func SupportedProtocol(protocol string) bool {
 	switch strings.ToLower(strings.TrimSpace(protocol)) {
 	case ProtocolOpenAICompatible,

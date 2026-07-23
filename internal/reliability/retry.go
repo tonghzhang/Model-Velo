@@ -97,6 +97,13 @@ func (policy *RetryPolicy) RequestTimeout() time.Duration {
 	return policy.config.RequestTimeout
 }
 
+func (policy *RetryPolicy) AttemptTimeout() time.Duration {
+	if policy == nil {
+		return 0
+	}
+	return policy.config.AttemptTimeout
+}
+
 func (policy *RetryPolicy) RequestContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(ctx, policy.config.RequestTimeout)
 }

@@ -60,6 +60,9 @@ func NewAttemptExecutor(
 	if queues == nil {
 		return nil, errors.New("attempt executor requires a provider queue registry")
 	}
+	if keys == nil && len(adapters.KeyedProviderIDs()) > 0 {
+		return nil, errors.New("attempt executor requires a provider key registry for API-key adapters")
+	}
 	if retries == nil {
 		return nil, errors.New("attempt executor requires a retry policy")
 	}

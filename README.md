@@ -1,6 +1,6 @@
 # Model-Velo
 
-Model-Velo 是一个用 Go 和 Gin 编写的 OpenAI-compatible LLM 网关。目前已经进入阶段 3：非流式 Chat Completions、PostgreSQL 鉴权、Redis 租户限流、Exact Response Cache、有序 Route Plan 和多 Provider 运行时已经接入请求链。
+Model-Velo 是一个用 Go 和 Gin 编写的 OpenAI-compatible LLM 网关。目前已经进入阶段 4：非流式与 SSE Chat Completions、PostgreSQL 鉴权、Redis 租户限流、Exact Response Cache、有序 Route Plan 和多 Provider 可靠性运行时已经接入请求链。
 
 ## 当前已经实现
 
@@ -29,12 +29,19 @@ Model-Velo 是一个用 Go 和 Gin 编写的 OpenAI-compatible LLM 网关。目�
 - Provider 多 Key 安全身份与并发轮换：401 永久禁用错误 Key，403 只在当前请求内换 Key，429 按 `Retry-After` 临时冷却；
 - 按 Provider ID 隔离的 Adapter、Circuit Breaker、Queue 和 Key Registry；
 - 单候选 Attempt Executor：每个候选独立执行 Breaker、Queue、Key、有限 Retry 和上游调用；
+- API Key Adapter 在装配时必须具备 Key Registry，错误装配会在启动边界失败而不是在请求期空指针崩溃；
 - 有序 Fallback Orchestrator：成功立即停止，普通 400/取消停止，模型不可用等策略允许的失败进入下一候选；Fallback 成功响应不写 Exact Cache；
 - Provider 执行总预算、单次调用超时和 Context-aware 退避取消；
 - 每个 Provider 可独立覆盖 Breaker、Queue、Retry、Attempt Timeout 与 HTTP 连接池；
-- 非流式文本与 VLM `text`/`image_url` 内容：兼容协议原样透传，原生协议转换并归一化响应。
+- 非流式文本与 VLM `text`/`image_url` 内容：兼容协议原样透传，原生协议转换并归一化响应；
+- 流式预提交可靠性链：每次按 Breaker→Queue→Key→Adapter 建流并验证首事件，候选内支持有限 Retry，耗尽后按 Route Plan 有序 Fallback；最终 PreparedStream 持有成功流资源和完整安全 Trail，直到显式结束。
+- OpenAI-compatible 客户端 SSE：有效首事件后才提交 Header，逐事件同步 Write/Flush，正常转发 `[DONE]`，客户端断开会取消上游并释放 Queue。
 
-SSE 和 Usage 数据链路尚未实现。当前请求会按 Route Plan 顺序执行候选；每个候选内部在策略允许时进行有限 Retry，耗尽后只有具备 Fallback 信号的失败才进入下一候选。合法请求所需的能力不被当前 Provider 支持时会直接尝试下一候选，不消耗 Retry，也不计入 Breaker；所有候选都不支持时返回 `400 unsupported_provider_capability`。`POST /v1/chat/completions` 必须携带有效的 Model-Velo API Key，请求模型必须存在于该租户的模型授权表，并依次通过租户限流和 Route Plan；缓存未命中后，每次 Provider 调用都会重新取得目标 Provider 的 Breaker Permit、Queue 槽位和可用 Provider Key。`GET /healthz` 保持公开。
+Usage 数据链路尚未实现。SSE 请求强制上游 `stream=true`，校验状态码与 `text/event-stream`，有界解析 `data:`/心跳/多行事件并识别 `[DONE]`。首事件前的 5xx、非 SSE、超时、EOF、坏 Chunk 和取消会沿用可靠性分类，可 Retry/Fallback，并在下一次尝试前释放资源；预提交总预算不会成为成功长流的上游 deadline。首事件提交后禁止切换 Provider，后续失败只安全记录并结束当前流。上游 heartbeat 注释当前不向客户端透传；每次只同步处理一个最大 2 MiB 的事件，不创建无界 Chunk 队列。流式 Server 写超时的长期连接调整仍待完成。
+
+阶段 3 的生产功能、合并故障矩阵、全量测试、vet 和独立性复查已经完成；Breaker、Queue、Key 并发用例也已通过普通执行，但 race detector 仍被本机 Go/race 工具链阻止，因此不能宣称 race 已通过。详细证据见 `STAGE3_GATE.md`。
+
+当前请求会按 Route Plan 顺序执行候选；每个候选内部在策略允许时进行有限 Retry，耗尽后只有具备 Fallback 信号的失败才进入下一候选。合法请求所需的能力不被当前 Provider 支持时会直接尝试下一候选，不消耗 Retry，也不计入 Breaker；所有候选都不支持时返回 `400 unsupported_provider_capability`。`POST /v1/chat/completions` 必须携带有效的 Model-Velo API Key，请求模型必须存在于该租户的模型授权表，并依次通过租户限流和 Route Plan；缓存未命中后，每次 Provider 调用都会重新取得目标 Provider 的 Breaker Permit、Queue 槽位和可用 Provider Key。`GET /healthz` 保持公开。
 
 ## 当前 Chat 契约
 
@@ -46,7 +53,7 @@ SSE 和 Usage 数据链路尚未实现。当前请求会按 Route Plan 顺序执
 | `messages` | 必填且至少包含一条消息。 |
 | `messages[].role` | 接受 `system`、`developer`、`user`、`assistant`、`tool`；`developer`/`tool` 会要求目标模型声明 `tools` 能力。 |
 | `messages[].content` | 接受非空字符串或非空内容块数组。当前跨协议保证 `text` 与 `image_url`；其他内容块只在目标 OpenAI-compatible 上游自行支持时原样透传。 |
-| `stream` | 省略或为 `false` 时按非流式处理；`true` 返回 `stream_not_supported`，不会调用上游。 |
+| `stream` | 省略或为 `false` 时返回完整 JSON；`true` 时绕过 Exact Cache，并以 `text/event-stream` 逐事件返回兼容 Chunk 与 `[DONE]`。 |
 
 OpenAI、Mistral、DeepSeek、xAI、Zhipu、Groq、NVIDIA 和 Together 均由各自的厂商 Adapter 装配端点与能力边界；由于这些厂商当前公开的 Chat API 使用 OpenAI Chat 报文，它们复用同一套 wire codec 和 HTTP 安全边界，并保留客户端原始 JSON，只在路由配置要求时改写 `model`。这与把所有厂商注册成同一个 OpenAI Adapter 不同。Anthropic、Gemini、DashScope、Cohere、Ollama、Bedrock 和 Cloudflare 等原生协议只转换当前明确支持的公共字段：消息、`max_tokens`/`max_completion_tokens`、`temperature`、`top_p` 和 `stop`；未知厂商扩展不会被伪装成已支持。
 
@@ -104,9 +111,9 @@ OpenAI、Mistral、DeepSeek、xAI、Zhipu、Groq、NVIDIA 和 Together 均由各
 | `MODEL_VELO_RETRY_BACKOFF_MULTIPLIER` | 否 | `2` | 退避倍数，范围 1–10。 |
 | `MODEL_VELO_RETRY_JITTER_RATIO` | 否 | `0.2` | 退避随机抖动比例，范围 0–1。 |
 | `MODEL_VELO_REQUEST_TIMEOUT` | 否 | `45s` | Cache miss 后 Retry 与全部 Fallback 候选共享的执行预算，范围 `1s`–`5m`。 |
-| `MODEL_VELO_ATTEMPT_TIMEOUT` | 否 | `20s` | 单次上游 HTTP 调用期限，至少 `100ms` 且不得超过 Provider 执行总预算。 |
+| `MODEL_VELO_ATTEMPT_TIMEOUT` | 否 | `20s` | 非流式单次调用或流式建连+首事件等待期限，至少 `100ms` 且不得超过 Provider 执行总预算。 |
 
-上游 `http.Client` 不再维护第三套总超时；网络调用完全服从 Attempt Context 和父级请求预算。非流式 HTTP Server 的写超时由请求预算加 15 秒前置处理/收尾余量派生，避免静态 Server 超时先于可靠性层截断响应。
+上游 `http.Client` 不再维护第三套总超时。非流式调用服从 Attempt Context 和父级请求预算；流式调用在首事件前同时受 Attempt Timeout 与父 Context 约束，首事件验证通过后不再沿用短 Attempt deadline，只保留父 Context 取消。流式空闲保护和 Server 写超时调整尚未完成。非流式 HTTP Server 的写超时由请求预算加 15 秒前置处理/收尾余量派生，避免静态 Server 超时先于可靠性层截断响应。
 
 ### Provider 厂商预设
 

@@ -52,9 +52,9 @@ func TestOpenAIAdapterValidatesConfig(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			adapter, err := newOpenAIAdapter(test.baseURL, DefaultHTTPConfig())
+			adapter, err := newTestOpenAIAdapter(test.baseURL)
 			if err == nil {
-				t.Fatalf("newOpenAIAdapter() = %#v, nil; want error", adapter)
+				t.Fatalf("newTestOpenAIAdapter() = %#v, nil; want error", adapter)
 			}
 		})
 	}
@@ -94,9 +94,9 @@ func TestOpenAIAdapterComplete(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	adapter, err := newOpenAIAdapter(upstream.URL+"/v1", DefaultHTTPConfig())
+	adapter, err := newTestOpenAIAdapter(upstream.URL + "/v1")
 	if err != nil {
-		t.Fatalf("newOpenAIAdapter() error = %v", err)
+		t.Fatalf("newTestOpenAIAdapter() error = %v", err)
 	}
 
 	responseBody, err := adapter.Complete(context.Background(), ChatInput{
@@ -115,9 +115,9 @@ func TestOpenAIAdapterPropagatesCancellation(t *testing.T) {
 	requestStarted := make(chan struct{})
 	upstreamCancelled := make(chan struct{})
 
-	adapter, err := newOpenAIAdapter("https://example.com/v1", DefaultHTTPConfig())
+	adapter, err := newTestOpenAIAdapter("https://example.com/v1")
 	if err != nil {
-		t.Fatalf("newOpenAIAdapter() error = %v", err)
+		t.Fatalf("newTestOpenAIAdapter() error = %v", err)
 	}
 	adapter.transport.client.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		close(requestStarted)
@@ -178,9 +178,9 @@ func TestOpenAIAdapterRejectsInvalidResponse(t *testing.T) {
 			}))
 			defer upstream.Close()
 
-			adapter, err := newOpenAIAdapter(upstream.URL+"/v1", DefaultHTTPConfig())
+			adapter, err := newTestOpenAIAdapter(upstream.URL + "/v1")
 			if err != nil {
-				t.Fatalf("newOpenAIAdapter() error = %v", err)
+				t.Fatalf("newTestOpenAIAdapter() error = %v", err)
 			}
 
 			_, err = adapter.Complete(context.Background(), ChatInput{
@@ -201,9 +201,9 @@ func TestOpenAIAdapterLimitsResponseBody(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	adapter, err := newOpenAIAdapter(upstream.URL+"/v1", DefaultHTTPConfig())
+	adapter, err := newTestOpenAIAdapter(upstream.URL + "/v1")
 	if err != nil {
-		t.Fatalf("newOpenAIAdapter() error = %v", err)
+		t.Fatalf("newTestOpenAIAdapter() error = %v", err)
 	}
 	adapter.transport.maxResponseBytes = 16
 
@@ -218,9 +218,9 @@ func TestOpenAIAdapterLimitsResponseBody(t *testing.T) {
 
 func TestOpenAIAdapterClosesBodyAfterReadError(t *testing.T) {
 	body := &failingReadCloser{}
-	adapter, err := newOpenAIAdapter("https://example.com/v1", DefaultHTTPConfig())
+	adapter, err := newTestOpenAIAdapter("https://example.com/v1")
 	if err != nil {
-		t.Fatalf("newOpenAIAdapter() error = %v", err)
+		t.Fatalf("newTestOpenAIAdapter() error = %v", err)
 	}
 	adapter.transport.client.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		return &http.Response{
@@ -260,4 +260,8 @@ func (f *failingReadCloser) Read(_ []byte) (int, error) {
 func (f *failingReadCloser) Close() error {
 	f.closed = true
 	return nil
+}
+
+func newTestOpenAIAdapter(baseURL string) (*compatibleChatAdapter, error) {
+	return newCompatibleChatAdapter(ProtocolOpenAI, baseURL, DefaultHTTPConfig())
 }

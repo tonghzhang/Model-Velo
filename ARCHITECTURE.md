@@ -1,10 +1,10 @@
 # Model-Velo 架构设计
 
-> 状态：用户已明确授权开始阶段 3。阶段 2 的 PostgreSQL/Redis 生产链与真实依赖门禁已经完成，race 环境缺口仍保留。阶段 3 已接入有序 Route Plan、稳定错误分类、多 Provider Adapter/Breaker/Queue/Key Registry、单候选 Attempt Executor，以及共享总预算的有限 Retry 与有序 Fallback。
+> 状态：用户已明确授权进入阶段 4。阶段 3 的生产链与非 race 门禁已完成，3 个 race 证据项继续保留；阶段 4 已完成客户端 SSE 主链、首事件前 Retry/Fallback、提交后禁止切换 Provider 和取消传播，Server 超时与阶段门禁尚未收口。
 
 ## 0. 当前实现边界
 
-截至 2026-07-22，仓库中已经运行的是一条可在多个 Provider 之间有序 Fallback 的非流式请求链：
+截至 2026-07-23，仓库中已经运行的是一条可在多个 Provider 之间有序 Fallback 的非流式请求链：
 
 ```text
 HTTP Client
@@ -26,11 +26,13 @@ HTTP Client
   -> 兼容响应原样返回；原生响应归一化为 OpenAI Chat Completion
 ```
 
-`cmd/model-velo` 负责环境变量、依赖装配、HTTP Server 和优雅关闭，`internal/httpapi` 负责传输协议，`internal/apikey` 负责认证授权，`internal/ratelimit` 负责 Redis 原子限流，`internal/routing` 负责纯内存有序路由计划，`internal/responsecache` 负责 Exact Cache Key 与读写，`internal/reliability` 负责 Orchestrator、Attempt Executor、安全 Failure、Retry Policy、时间预算以及按 Provider 隔离的 Breaker、Queue 和 Key 状态，`internal/provider` 负责 16 个厂商配置、Adapter Registry、协议转换和统一 HTTP 错误边界。当前还没有 SSE 或 Usage Worker。
+`cmd/model-velo` 负责环境变量、依赖装配、HTTP Server 和优雅关闭，`internal/httpapi` 负责传输协议，`internal/apikey` 负责认证授权，`internal/ratelimit` 负责 Redis 原子限流，`internal/routing` 负责纯内存有序路由计划，`internal/responsecache` 负责 Exact Cache Key 与读写，`internal/reliability` 负责 Orchestrator、Attempt Executor、安全 Failure、Retry Policy、时间预算以及按 Provider 隔离的 Breaker、Queue 和 Key 状态，`internal/provider` 负责 16 个厂商配置、Adapter Registry、协议转换和统一 HTTP 错误边界。当前客户端 SSE 已接通，Usage Worker 尚未实现；Provider 层负责兼容 SSE 建流与解析，reliability 层负责候选内流式 Retry 和候选间有序 Fallback，HTTP Handler 只负责最终事件写入与 Flush。
 
-启动配置没有隐式 Provider：`MODEL_VELO_ROUTING_JSON` 必须显式声明 Provider 与 Route，一个 Provider 也按相同格式配置；缺失或空白会在连接外部基础设施和监听 HTTP 前失败。生产 HTTP 装配只接受完整的 Adapter、Breaker、Queue、Key 与 Route Registry，不再保留单 Provider 快捷构造路径。
+启动配置没有隐式 Provider：`MODEL_VELO_ROUTING_JSON` 必须显式声明 Provider 与 Route，一个 Provider 也按相同格式配置；缺失或空白会在连接外部基础设施和监听 HTTP 前失败。生产 HTTP 装配只接受完整的 Adapter、Breaker、Queue 与 Route Registry；只要存在需要 API Key 的 Adapter，就必须同时提供 Key Registry，错误装配在 Attempt Executor 构造时失败。全部 Adapter 均为无鉴权类型时允许 Key Registry 为空。当前不保留单 Provider 快捷构造路径。
 
-阶段 1 的全量测试、静态检查、异常矩阵和独立性检查已经通过；race detector 因本机缺少 GCC 尚未执行成功。用户已允许在保留该缺口的前提下继续。阶段 3 会先按请求所需的 `text`、`image`、`tools` 能力过滤 Route Plan，再在统一预算内按顺序执行候选：每个候选内部按 Provider ID 有限 Retry，401 永久停用无效 Key，403 只在当前请求内换 Key，429 优先换未冷却 Key；全部 Key 冷却时，只有最早恢复时间能放入剩余预算才在释放准入资源后等待；指定 5xx、网络和上游超时有界退避，每次调用重新进入 Breaker、Queue 和 Key 选择。候选耗尽后，普通 400 与取消停止，明确的模型不可用 4xx 等策略失败进入下一候选。VLM `text`/`image_url` 内容在兼容协议中原样透传，在 Anthropic、Gemini、Ollama 和 Bedrock 中显式转换；Adapter 明确不支持某种输入时只触发 Fallback，不 Retry、不计 Breaker，全部候选都不支持时返回明确 400。上游模型自身的实际模态能力仍由厂商响应决定。总预算取消和 race 仍留在阶段门禁。实际阶段 1 门禁证据见 `STAGE1_GATE.md`。
+阶段 3 会先按请求所需的 `text`、`image`、`tools` 能力过滤 Route Plan，再在统一预算内按顺序执行候选：每个候选内部按 Provider ID 有限 Retry，401 永久停用无效 Key，403 只在当前请求内换 Key，429 优先换未冷却 Key；全部 Key 冷却时，只有最早恢复时间能放入剩余预算才在释放准入资源后等待；指定 5xx、网络和上游超时有界退避，每次调用重新进入 Breaker、Queue 和 Key 选择。候选耗尽后，普通 400 与取消停止，明确的模型不可用 4xx 等策略失败进入下一候选。VLM `text`/`image_url` 内容在兼容协议中原样透传，在 Anthropic、Gemini、Ollama 和 Bedrock 中显式转换；Adapter 明确不支持某种输入时只触发 Fallback，不 Retry、不计 Breaker，全部候选都不支持时返回明确 400。上游模型自身的实际模态能力仍由厂商响应决定。总预算与跨 Fallback 取消已有端到端证据；仅 race 环境门禁仍未完成。阶段 1 历史证据见 `STAGE1_GATE.md`，阶段 3 收口证据见 `STAGE3_GATE.md`。
+
+阶段 4 的 Provider 边界实现了 `StreamingAdapter.OpenStream`。兼容请求会强制 `stream=true` 并保留未知字段，Transport 在移交 Body 前校验状态和 `text/event-stream`；`ChatEventStream` 以 1 MiB 单行、2 MiB 单事件上限读取，跳过且不向客户端透传注释/心跳，合并多行 `data:`，校验 choices/delta 或 usage-only Chunk，并把完整 `[DONE]` 标记为终止。reliability 层的流式 Attempt 会让每次尝试重新进入 Breaker、Queue、Key 和 Adapter，在 Attempt Timeout 内读取首个有效内容事件；策略允许时进行候选内 Retry，耗尽后由 `Orchestrator.OpenStream` 有序 Fallback。失败流会在下一次尝试前关闭 Body、取消上游并释放准入资源，成功 PreparedStream 只持有最终流的资源。预提交总预算使用独立 Context，成功上游流继承原客户端 Context。HTTP Handler 在检查底层 Flusher 后才调用这条链，有效首事件返回后设置 SSE Header，随后同步逐事件写入和 Flush；`[DONE]` 标记成功，提交后失败只记录稳定类别并结束当前流，不再 Retry/Fallback 或追加 JSON 错误体。
 
 ## 1. 项目定位
 

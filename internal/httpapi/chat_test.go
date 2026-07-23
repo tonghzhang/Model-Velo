@@ -76,6 +76,302 @@ func TestChatCompletionSuccess(t *testing.T) {
 	}
 }
 
+func TestChatCompletionStreaming(t *testing.T) {
+	t.Run("forwards validated events and bypasses cache", func(t *testing.T) {
+		var cacheLookups atomic.Int32
+		var cacheStores atomic.Int32
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, ": upstream heartbeat\n\n")
+			_, _ = io.WriteString(w, "data: { \"choices\" : [{ \"delta\" : { \"role\" : \"assistant\" } }] }\n\n")
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n")
+			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		}))
+		defer upstream.Close()
+
+		adapter := newTestCompatibleAdapter(t, upstream.URL)
+		queues, err := reliability.NewQueueRegistry([]string{"upstream"}, reliability.DefaultQueueConfig())
+		if err != nil {
+			t.Fatalf("reliability.NewQueueRegistry() error = %v", err)
+		}
+		router := newSingleProviderTestRouter(
+			t,
+			adapter,
+			testAccessController{},
+			testRateLimiter{decision: ratelimit.Decision{Allowed: true}},
+			testResponseCache{
+				onLookup: func(string, string, []byte) { cacheLookups.Add(1) },
+				onStore:  func(string, string, []byte, []byte) { cacheStores.Add(1) },
+			},
+			nil,
+			nil,
+			queues,
+		)
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, chatRequest(
+			`{"model":"demo-model","messages":[{"role":"user","content":"hello"}],"stream":true}`,
+		))
+
+		if response.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body = %s", response.Code, response.Body.String())
+		}
+		if got := response.Header().Get("Content-Type"); got != "text/event-stream; charset=utf-8" {
+			t.Errorf("Content-Type = %q", got)
+		}
+		if got := response.Header().Get("Cache-Control"); got != "no-cache, no-transform" {
+			t.Errorf("Cache-Control = %q", got)
+		}
+		if got := response.Header().Get("X-Model-Velo-Cache"); got != string(responsecache.StatusBypass) {
+			t.Errorf("cache status = %q, want %q", got, responsecache.StatusBypass)
+		}
+		if !response.Flushed {
+			t.Fatal("stream response was not flushed")
+		}
+		wantBody := "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n" +
+			"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n" +
+			"data: [DONE]\n\n"
+		if got := response.Body.String(); got != wantBody {
+			t.Fatalf("stream body = %q, want %q", got, wantBody)
+		}
+		if cacheLookups.Load() != 0 || cacheStores.Load() != 0 {
+			t.Fatalf("stream cache calls = lookup:%d store:%d", cacheLookups.Load(), cacheStores.Load())
+		}
+		if snapshot, _ := queues.Snapshot("upstream"); snapshot.Active != 0 || snapshot.Waiting != 0 {
+			t.Fatalf("queue after completed stream = %#v", snapshot)
+		}
+	})
+
+	t.Run("does not fallback after first event", func(t *testing.T) {
+		var primaryCalls atomic.Int32
+		primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			primaryCalls.Add(1)
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n")
+			_, _ = io.WriteString(w, "data: not-json\n\n")
+		}))
+		defer primary.Close()
+
+		var secondaryCalls atomic.Int32
+		secondary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			secondaryCalls.Add(1)
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"secondary\"}}]}\n\n")
+			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		}))
+		defer secondary.Close()
+
+		router := newFallbackTestRouter(t, primary.URL, secondary.URL, "", "", testResponseCache{})
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, chatRequest(
+			`{"model":"demo-model","messages":[{"role":"user","content":"hello"}],"stream":true}`,
+		))
+
+		if response.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body = %s", response.Code, response.Body.String())
+		}
+		if got := response.Body.String(); got != "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n" {
+			t.Fatalf("body after upstream interruption = %q", got)
+		}
+		if primaryCalls.Load() != 1 || secondaryCalls.Load() != 0 {
+			t.Fatalf("provider calls = primary:%d secondary:%d", primaryCalls.Load(), secondaryCalls.Load())
+		}
+	})
+
+	t.Run("keeps an HTTP error available before the first event", func(t *testing.T) {
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "data: not-json\n\n")
+		}))
+		defer upstream.Close()
+
+		router := newTestRouter(t, upstream.URL, time.Second)
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, chatRequest(
+			`{"model":"demo-model","messages":[{"role":"user","content":"hello"}],"stream":true}`,
+		))
+
+		if response.Code != http.StatusBadGateway {
+			t.Fatalf("status = %d, want 502; body = %s", response.Code, response.Body.String())
+		}
+		if response.Flushed {
+			t.Fatal("invalid first event flushed a response")
+		}
+		if got := responseErrorCode(t, response); got != "upstream_protocol_error" {
+			t.Fatalf("error code = %q, want upstream_protocol_error", got)
+		}
+	})
+
+	t.Run("falls back before the first event", func(t *testing.T) {
+		var primaryCalls atomic.Int32
+		primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			primaryCalls.Add(1)
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "data: not-json\n\n")
+		}))
+		defer primary.Close()
+
+		var secondaryCalls atomic.Int32
+		secondary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			secondaryCalls.Add(1)
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"secondary\"}}]}\n\n")
+			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		}))
+		defer secondary.Close()
+
+		router := newFallbackTestRouter(t, primary.URL, secondary.URL, "", "", testResponseCache{})
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, chatRequest(
+			`{"model":"demo-model","messages":[{"role":"user","content":"hello"}],"stream":true}`,
+		))
+
+		if response.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body = %s", response.Code, response.Body.String())
+		}
+		wantBody := "data: {\"choices\":[{\"delta\":{\"content\":\"secondary\"}}]}\n\n" +
+			"data: [DONE]\n\n"
+		if got := response.Body.String(); got != wantBody {
+			t.Fatalf("fallback stream body = %q, want %q", got, wantBody)
+		}
+		if primaryCalls.Load() != 1 || secondaryCalls.Load() != 1 {
+			t.Fatalf("provider calls = primary:%d secondary:%d", primaryCalls.Load(), secondaryCalls.Load())
+		}
+	})
+
+	t.Run("client cancellation reaches upstream and releases queue", func(t *testing.T) {
+		upstreamCanceled := make(chan struct{})
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"started\"}}]}\n\n")
+			w.(http.Flusher).Flush()
+			<-request.Context().Done()
+			close(upstreamCanceled)
+		}))
+		defer upstream.Close()
+
+		queues, err := reliability.NewQueueRegistry([]string{"upstream"}, reliability.DefaultQueueConfig())
+		if err != nil {
+			t.Fatalf("reliability.NewQueueRegistry() error = %v", err)
+		}
+		router := newSingleProviderTestRouter(
+			t,
+			newTestCompatibleAdapter(t, upstream.URL),
+			testAccessController{},
+			testRateLimiter{decision: ratelimit.Decision{Allowed: true}},
+			testResponseCache{},
+			nil,
+			nil,
+			queues,
+		)
+		gateway := httptest.NewServer(router)
+		defer gateway.Close()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		request, err := http.NewRequestWithContext(
+			ctx,
+			http.MethodPost,
+			gateway.URL+"/v1/chat/completions",
+			strings.NewReader(`{"model":"demo-model","messages":[{"role":"user","content":"hello"}],"stream":true}`),
+		)
+		if err != nil {
+			t.Fatalf("http.NewRequestWithContext() error = %v", err)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Authorization", "Bearer model-velo-test-key")
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatalf("stream request error = %v", err)
+		}
+		firstFrame := "data: {\"choices\":[{\"delta\":{\"content\":\"started\"}}]}\n\n"
+		gotFrame := make([]byte, len(firstFrame))
+		if _, err := io.ReadFull(response.Body, gotFrame); err != nil {
+			response.Body.Close()
+			t.Fatalf("read first stream frame: %v", err)
+		}
+		if string(gotFrame) != firstFrame {
+			response.Body.Close()
+			t.Fatalf("first frame = %q, want %q", gotFrame, firstFrame)
+		}
+
+		cancel()
+		response.Body.Close()
+		select {
+		case <-upstreamCanceled:
+		case <-time.After(time.Second):
+			t.Fatal("client cancellation did not reach upstream")
+		}
+		deadline := time.NewTimer(time.Second)
+		defer deadline.Stop()
+		for {
+			snapshot, _ := queues.Snapshot("upstream")
+			if snapshot.Active == 0 && snapshot.Waiting == 0 {
+				break
+			}
+			select {
+			case <-deadline.C:
+				t.Fatalf("queue after client cancellation = %#v", snapshot)
+			case <-time.After(time.Millisecond):
+			}
+		}
+	})
+
+	t.Run("rejects a response writer without flush support before upstream", func(t *testing.T) {
+		var upstreamCalls atomic.Int32
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			upstreamCalls.Add(1)
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		}))
+		defer upstream.Close()
+
+		router := newTestRouter(t, upstream.URL, time.Second)
+		response := &nonFlushingResponseWriter{}
+		router.ServeHTTP(response, chatRequest(
+			`{"model":"demo-model","messages":[{"role":"user","content":"hello"}],"stream":true}`,
+		))
+
+		if response.status != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500; body = %s", response.status, response.body)
+		}
+		var envelope struct {
+			Error struct {
+				Code string `json:"code"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(response.body, &envelope); err != nil || envelope.Error.Code != "streaming_unavailable" {
+			t.Fatalf("response = %s, error = %v", response.body, err)
+		}
+		if upstreamCalls.Load() != 0 {
+			t.Fatalf("upstream calls = %d, want 0", upstreamCalls.Load())
+		}
+	})
+}
+
+type nonFlushingResponseWriter struct {
+	header http.Header
+	body   []byte
+	status int
+}
+
+func (writer *nonFlushingResponseWriter) Header() http.Header {
+	if writer.header == nil {
+		writer.header = make(http.Header)
+	}
+	return writer.header
+}
+
+func (writer *nonFlushingResponseWriter) Write(body []byte) (int, error) {
+	if writer.status == 0 {
+		writer.status = http.StatusOK
+	}
+	writer.body = append(writer.body, body...)
+	return len(body), nil
+}
+
+func (writer *nonFlushingResponseWriter) WriteHeader(status int) {
+	writer.status = status
+}
+
 func TestChatCompletionUsesOrderedRoutePlan(t *testing.T) {
 	var upstreamCalls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -892,7 +1188,6 @@ func TestChatCompletionRejectsInvalidRequests(t *testing.T) {
 		{name: "unsupported role", contentType: "application/json", body: `{"model":"demo-model","messages":[{"role":"critic","content":"hello"}]}`, wantStatus: http.StatusBadRequest, wantCode: "invalid_message_role"},
 		{name: "missing content", contentType: "application/json", body: `{"model":"demo-model","messages":[{"role":"user","content":""}]}`, wantStatus: http.StatusBadRequest, wantCode: "missing_message_content"},
 		{name: "empty content parts", contentType: "application/json", body: `{"model":"demo-model","messages":[{"role":"user","content":[]}]}`, wantStatus: http.StatusBadRequest, wantCode: "missing_message_content"},
-		{name: "streaming", contentType: "application/json", body: `{"model":"demo-model","messages":[{"role":"user","content":"hello"}],"stream":true}`, wantStatus: http.StatusBadRequest, wantCode: "stream_not_supported"},
 	}
 
 	router := newTestRouter(t, upstream.URL, time.Second)

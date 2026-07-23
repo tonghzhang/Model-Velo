@@ -9,11 +9,13 @@ import (
 	"strings"
 )
 
+// dashScopeAdapter 使用通义千问原生 text-generation 接口。
 type dashScopeAdapter struct {
 	endpoint  string
 	transport *jsonTransport
 }
 
+// dashScopeRequest 把消息放入 input，把生成参数放入 parameters。
 type dashScopeRequest struct {
 	Model      string              `json:"model"`
 	Input      dashScopeInput      `json:"input"`
@@ -49,6 +51,7 @@ func (adapter *dashScopeAdapter) Authentication() Authentication {
 	return AuthenticationAPIKey
 }
 
+// Complete 强制 result_format=message，使上游返回结构化消息而不是裸文本。
 func (adapter *dashScopeAdapter) Complete(
 	ctx context.Context,
 	input ChatInput,
@@ -90,6 +93,7 @@ func (adapter *dashScopeAdapter) Complete(
 	return decodeDashScopeResponse(responseBody, request.Model, input.RequestID)
 }
 
+// decodeDashScopeResponse 读取首个候选，并拒绝当前阶段无法表示的工具调用结果。
 func decodeDashScopeResponse(body []byte, model string, requestID string) ([]byte, error) {
 	var response struct {
 		RequestID string `json:"request_id"`
@@ -112,7 +116,8 @@ func decodeDashScopeResponse(body []byte, model string, requestID string) ([]byt
 		return nil, ErrInvalidResponse
 	}
 	choice := response.Output.Choices[0]
-	if toolCalls := bytes.TrimSpace(choice.Message.ToolCalls); len(toolCalls) > 0 && !bytes.Equal(toolCalls, []byte("null")) {
+	toolCalls := bytes.TrimSpace(choice.Message.ToolCalls)
+	if len(toolCalls) > 0 && !bytes.Equal(toolCalls, []byte("null")) {
 		return nil, fmt.Errorf("%w: DashScope tool output", ErrUnsupportedResponse)
 	}
 	finishReason := strings.ToLower(choice.FinishReason)

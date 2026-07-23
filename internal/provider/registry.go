@@ -8,20 +8,13 @@ import (
 	"strings"
 )
 
-var ErrUnknownProvider = errors.New("provider adapter is not configured")
-
-type AdapterConfig struct {
-	ProviderID string
-	Protocol   string
-	BaseURL    string
-	HTTP       HTTPConfig
-}
-
+// AdapterRegistry 保存启动时构造完成的 Provider Adapter，只提供只读查询。
 type AdapterRegistry struct {
 	adapters map[string]Adapter
 	ids      []string
 }
 
+// NewAdapterRegistry 校验 Provider ID，并从配置创建不可变的 Adapter 索引。
 func NewAdapterRegistry(configured []AdapterConfig) (*AdapterRegistry, error) {
 	adapters := make(map[string]Adapter, len(configured))
 	for index, config := range configured {
@@ -41,6 +34,7 @@ func NewAdapterRegistry(configured []AdapterConfig) (*AdapterRegistry, error) {
 	return NewAdapterRegistryFromAdapters(adapters)
 }
 
+// NewAdapterRegistryFromAdapters 用于注入已经构造好的 Adapter，也会拒绝接口中的类型化 nil。
 func NewAdapterRegistryFromAdapters(configured map[string]Adapter) (*AdapterRegistry, error) {
 	registry := &AdapterRegistry{adapters: make(map[string]Adapter, len(configured))}
 	for configuredID, adapter := range configured {
@@ -64,6 +58,7 @@ func NewAdapterRegistryFromAdapters(configured map[string]Adapter) (*AdapterRegi
 	return registry, nil
 }
 
+// nilAdapter 处理 interface 本身非 nil、内部指针却为 nil 的 Go 边界情况。
 func nilAdapter(adapter Adapter) bool {
 	if adapter == nil {
 		return true
@@ -72,6 +67,7 @@ func nilAdapter(adapter Adapter) bool {
 	return value.Kind() == reflect.Pointer && value.IsNil()
 }
 
+// Adapter 按 Provider ID 查找对应的协议实现。
 func (registry *AdapterRegistry) Adapter(providerID string) (Adapter, bool) {
 	if registry == nil {
 		return nil, false
@@ -80,6 +76,7 @@ func (registry *AdapterRegistry) Adapter(providerID string) (Adapter, bool) {
 	return adapter, adapter != nil
 }
 
+// ProviderIDs 返回副本，避免调用方修改注册表内部的稳定顺序。
 func (registry *AdapterRegistry) ProviderIDs() []string {
 	if registry == nil {
 		return nil
@@ -87,6 +84,7 @@ func (registry *AdapterRegistry) ProviderIDs() []string {
 	return append([]string(nil), registry.ids...)
 }
 
+// KeyedProviderIDs 只返回需要 Provider Key 选择器参与的上游。
 func (registry *AdapterRegistry) KeyedProviderIDs() []string {
 	if registry == nil {
 		return nil

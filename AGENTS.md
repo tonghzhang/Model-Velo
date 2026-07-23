@@ -192,4 +192,4 @@ Model-Velo 是一个使用 **Go、Gin、GORM、Redis、PostgreSQL** 实现的 Op
 
 ## 9. 当前边界
 
-用户已明确开始阶段 3，阶段 2 的 PostgreSQL、鉴权、Redis 限流和缓存生产链路均已完成；race 环境缺口只记录、不反复处理。阶段 3 当前已接入有序 Route Plan、稳定错误分类、Provider Circuit Breaker 和 Provider 有界 Queue，下一步继续 Key、Retry、Attempt 与 Fallback 的生产纵向链，不先铺测试框架。未经用户明确确认不得进入阶段 4 或实现 SSE。
+用户已于 2026-07-23 明确允许进入阶段 4。阶段 3 的生产链与非 race 门禁已经完成，Breaker、Queue 和 Key 的 3 个 race 证据项仍因本机 Go/race 工具链阻塞而保留。阶段 4 已完成兼容上游 `StreamingAdapter`、有界 SSE 解析、首事件缓冲、候选内有限 Retry、候选间有序 Fallback，以及公开 `stream=true` 的 Header/Flush、`[DONE]`、提交后禁止切换 Provider 和客户端取消传播。流式 Handler 绕过 Exact Cache，并以同步写入保持有界背压。下一步处理长流 Server 超时与 SSE 格式攻击矩阵，再进行可执行的阶段 4 门禁；未经用户明确确认不得进入阶段 5 或实现 Usage Worker。

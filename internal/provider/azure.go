@@ -6,6 +6,7 @@ import (
 	"strings"
 )
 
+// azureOpenAIAdapter 使用 OpenAI 消息格式，但端点规则和 api-key 鉴权由 Azure 定义。
 type azureOpenAIAdapter struct {
 	endpoint  string
 	transport *jsonTransport
@@ -23,6 +24,7 @@ func (adapter *azureOpenAIAdapter) Authentication() Authentication {
 	return AuthenticationAPIKey
 }
 
+// Complete 保留 OpenAI 请求字段，只替换路由选出的模型并使用 Azure 鉴权头。
 func (adapter *azureOpenAIAdapter) Complete(
 	ctx context.Context,
 	input ChatInput,
@@ -44,6 +46,7 @@ func (adapter *azureOpenAIAdapter) Complete(
 	return responseBody, nil
 }
 
+// azureChatEndpoint 兼容资源根地址、/openai/v1 前缀以及完整 Chat 端点。
 func azureChatEndpoint(rawBaseURL string) (string, error) {
 	parsed, err := parseBaseURL(rawBaseURL)
 	if err != nil {

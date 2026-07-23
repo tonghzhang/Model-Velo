@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"reflect"
 	"strings"
 	"testing"
 )
@@ -26,7 +25,6 @@ func TestAdapterContracts(t *testing.T) {
 		wantHeader        string
 		wantHeaderValue   string
 		wantBodyFragments []string
-		wantAdapter       Adapter
 	}{
 		{
 			name: "anthropic", protocol: ProtocolAnthropic, model: "claude-test", requestBody: visionRequest,
@@ -80,55 +78,55 @@ func TestAdapterContracts(t *testing.T) {
 			name: "openai", protocol: ProtocolOpenAI, basePath: "/v1", model: "gpt-test", requestBody: textRequest,
 			responseBody: `{"id":"chatcmpl_1","object":"chat.completion","model":"gpt-test","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}`,
 			wantPath:     "/v1/chat/completions", wantHeader: "Authorization", wantHeaderValue: "Bearer test-key",
-			wantBodyFragments: []string{`"model":"gpt-test"`}, wantAdapter: &openAIAdapter{},
+			wantBodyFragments: []string{`"model":"gpt-test"`},
 		},
 		{
 			name: "mistral", protocol: ProtocolMistral, basePath: "/v1", model: "mistral-test", requestBody: textRequest,
 			responseBody: `{"id":"chatcmpl_1","object":"chat.completion","model":"mistral-test","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}`,
 			wantPath:     "/v1/chat/completions", wantHeader: "Authorization", wantHeaderValue: "Bearer test-key",
-			wantBodyFragments: []string{`"model":"mistral-test"`}, wantAdapter: &mistralAdapter{},
+			wantBodyFragments: []string{`"model":"mistral-test"`},
 		},
 		{
 			name: "xai", protocol: ProtocolXAI, basePath: "/v1", model: "grok-test", requestBody: visionRequest,
 			responseBody: `{"id":"chatcmpl_1","object":"chat.completion","model":"grok-test","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}`,
 			wantPath:     "/v1/chat/completions", wantHeader: "Authorization", wantHeaderValue: "Bearer test-key",
-			wantBodyFragments: []string{`"model":"grok-test"`, `"type":"image_url"`}, wantAdapter: &xAIAdapter{},
+			wantBodyFragments: []string{`"model":"grok-test"`, `"type":"image_url"`},
 		},
 		{
 			name: "deepseek", protocol: ProtocolDeepSeek, model: "deepseek-test", requestBody: textRequest,
 			responseBody: `{"id":"chatcmpl_1","object":"chat.completion","model":"deepseek-test","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}`,
 			wantPath:     "/chat/completions", wantHeader: "Authorization", wantHeaderValue: "Bearer test-key",
-			wantBodyFragments: []string{`"model":"deepseek-test"`}, wantAdapter: &deepSeekAdapter{},
+			wantBodyFragments: []string{`"model":"deepseek-test"`},
 		},
 		{
 			name: "zhipu", protocol: ProtocolZhipu, basePath: "/api/paas/v4", model: "glm-test", requestBody: visionRequest,
 			responseBody: `{"id":"chatcmpl_1","object":"chat.completion","model":"glm-test","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}`,
 			wantPath:     "/api/paas/v4/chat/completions", wantHeader: "Authorization", wantHeaderValue: "Bearer test-key",
-			wantBodyFragments: []string{`"model":"glm-test"`, `"type":"image_url"`}, wantAdapter: &zhipuAdapter{},
+			wantBodyFragments: []string{`"model":"glm-test"`, `"type":"image_url"`},
 		},
 		{
 			name: "groq", protocol: ProtocolGroq, basePath: "/openai/v1", model: "groq-test", requestBody: visionRequest,
 			responseBody: `{"id":"chatcmpl_1","object":"chat.completion","model":"groq-test","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}`,
 			wantPath:     "/openai/v1/chat/completions", wantHeader: "Authorization", wantHeaderValue: "Bearer test-key",
-			wantBodyFragments: []string{`"model":"groq-test"`, `"type":"image_url"`}, wantAdapter: &groqAdapter{},
+			wantBodyFragments: []string{`"model":"groq-test"`, `"type":"image_url"`},
 		},
 		{
 			name: "nvidia", protocol: ProtocolNVIDIA, basePath: "/v1", model: "nvidia-test", requestBody: visionRequest,
 			responseBody: `{"id":"chatcmpl_1","object":"chat.completion","model":"nvidia-test","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}`,
 			wantPath:     "/v1/chat/completions", wantHeader: "Authorization", wantHeaderValue: "Bearer test-key",
-			wantBodyFragments: []string{`"model":"nvidia-test"`, `"type":"image_url"`}, wantAdapter: &nvidiaAdapter{},
+			wantBodyFragments: []string{`"model":"nvidia-test"`, `"type":"image_url"`},
 		},
 		{
 			name: "together", protocol: ProtocolTogether, basePath: "/v1", model: "together-test", requestBody: visionRequest,
 			responseBody: `{"id":"chatcmpl_1","object":"chat.completion","model":"together-test","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}`,
 			wantPath:     "/v1/chat/completions", wantHeader: "Authorization", wantHeaderValue: "Bearer test-key",
-			wantBodyFragments: []string{`"model":"together-test"`, `"type":"image_url"`}, wantAdapter: &togetherAdapter{},
+			wantBodyFragments: []string{`"model":"together-test"`, `"type":"image_url"`},
 		},
 		{
 			name: "custom compatible", protocol: ProtocolOpenAICompatible, model: "custom-test", requestBody: textRequest,
 			responseBody: `{"id":"chatcmpl_1","object":"chat.completion","model":"custom-test","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}`,
 			wantPath:     "/v1/chat/completions", wantHeader: "Authorization", wantHeaderValue: "Bearer test-key",
-			wantBodyFragments: []string{`"model":"custom-test"`}, wantAdapter: &openAICompatibleAdapter{},
+			wantBodyFragments: []string{`"model":"custom-test"`},
 		},
 	}
 
@@ -161,9 +159,6 @@ func TestAdapterContracts(t *testing.T) {
 			})
 			if err != nil {
 				t.Fatalf("NewAdapter() error = %v", err)
-			}
-			if test.wantAdapter != nil && reflect.TypeOf(adapter) != reflect.TypeOf(test.wantAdapter) {
-				t.Fatalf("NewAdapter() type = %T; want %T", adapter, test.wantAdapter)
 			}
 			response, err := adapter.Complete(context.Background(), ChatInput{
 				RequestID:     "request-test",

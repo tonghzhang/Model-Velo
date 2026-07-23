@@ -4,36 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"strings"
 )
 
-const maxResponseBodyBytes int64 = 8 << 20
-
-var (
-	ErrInvalidRequest        = errors.New("upstream request could not be prepared")
-	ErrUnsupportedCapability = errors.New("provider does not support a requested capability")
-	ErrUnsupportedResponse   = errors.New("provider returned a capability the gateway cannot represent")
-	ErrInvalidResponse       = errors.New("upstream response is not valid JSON")
-	ErrResponseTooLarge      = errors.New("upstream response exceeds the size limit")
-)
-
-type HTTPError struct {
-	StatusCode int
-	RetryAfter string
-	Code       string
-}
-
-func (e *HTTPError) Error() string {
-	return fmt.Sprintf("upstream returned HTTP status %d", e.StatusCode)
-}
-
-// compatibleChatAdapter owns the OpenAI Chat wire format shared by providers
-// whose public chat API uses that format. Provider identity stays in the
-// concrete adapter returned by the factory.
 type compatibleChatAdapter struct {
 	endpoint           string
 	protocol           string
@@ -41,63 +16,37 @@ type compatibleChatAdapter struct {
 	transport          *jsonTransport
 }
 
-type openAICompatibleAdapter struct {
-	*compatibleChatAdapter
-}
-
-func newOpenAICompatibleAdapter(baseURL string, httpConfig HTTPConfig) (*openAICompatibleAdapter, error) {
-	endpoint, err := compatibleChatCompletionsEndpoint(baseURL)
-	if err != nil {
-		return nil, err
-	}
-	chat := newCompatibleChatAdapter(ProtocolOpenAICompatible, endpoint, true, httpConfig)
-	return &openAICompatibleAdapter{compatibleChatAdapter: chat}, nil
-}
-
-func newVendorCompatibleChat(
-	protocol string,
-	baseURL string,
-	supportsImageInput bool,
-	httpConfig HTTPConfig,
-) (*compatibleChatAdapter, error) {
-	endpoint, err := fixedEndpoint(baseURL, "chat/completions")
-	if err != nil {
-		return nil, err
-	}
-	return newCompatibleChatAdapter(protocol, endpoint, supportsImageInput, httpConfig), nil
-}
-
+// newCompatibleChatAdapter 创建共享 OpenAI Chat Completions wire format 的 Adapter。
+// 厂商身份仍由 protocol 保留，用于能力检查和错误说明。
 func newCompatibleChatAdapter(
 	protocol string,
-	endpoint string,
-	supportsImageInput bool,
+	baseURL string,
 	httpConfig HTTPConfig,
-) *compatibleChatAdapter {
+) (*compatibleChatAdapter, error) {
+	endpoint, err := compatibleChatEndpoint(protocol, baseURL)
+	if err != nil {
+		return nil, err
+	}
 	return &compatibleChatAdapter{
 		endpoint:           endpoint,
 		protocol:           protocol,
-		supportsImageInput: supportsImageInput,
+		supportsImageInput: ProtocolSupportsCapability(protocol, CapabilityImage),
 		transport:          newJSONTransport(httpConfig),
-	}
+	}, nil
 }
 
 func (adapter *compatibleChatAdapter) Authentication() Authentication {
 	return AuthenticationAPIKey
 }
 
+// Complete 原样保留兼容请求字段，仅承担能力校验、鉴权和一次上游调用。
 func (adapter *compatibleChatAdapter) Complete(
 	ctx context.Context,
 	input ChatInput,
 	apiKey string,
 ) ([]byte, error) {
-	if !adapter.supportsImageInput {
-		usesImage, err := requestUsesImage(input)
-		if err != nil {
-			return nil, err
-		}
-		if usesImage {
-			return nil, fmt.Errorf("%w: %s image content", ErrUnsupportedCapability, adapter.protocol)
-		}
+	if err := adapter.validateInput(input); err != nil {
+		return nil, err
 	}
 
 	apiKey = strings.TrimSpace(apiKey)
@@ -120,6 +69,53 @@ func (adapter *compatibleChatAdapter) Complete(
 	return responseBody, nil
 }
 
+// OpenStream 建立一次兼容 SSE 调用，不读取首事件，也不决定 Retry/Fallback。
+func (adapter *compatibleChatAdapter) OpenStream(
+	ctx context.Context,
+	input ChatInput,
+	apiKey string,
+) (*ChatEventStream, error) {
+	if err := adapter.validateInput(input); err != nil {
+		return nil, err
+	}
+
+	apiKey = strings.TrimSpace(apiKey)
+	if apiKey == "" {
+		return nil, ErrInvalidRequest
+	}
+	body, err := compatibleStreamRequestBody(input)
+	if err != nil {
+		return nil, err
+	}
+	headers := make(http.Header)
+	headers.Set("Authorization", "Bearer "+apiKey)
+	responseBody, err := adapter.transport.postStream(ctx, adapter.endpoint, input.RequestID, body, headers)
+	if err != nil {
+		return nil, err
+	}
+	stream, err := newChatEventStream(responseBody)
+	if err != nil {
+		responseBody.Close()
+		return nil, err
+	}
+	return stream, nil
+}
+
+func (adapter *compatibleChatAdapter) validateInput(input ChatInput) error {
+	if adapter.supportsImageInput {
+		return nil
+	}
+	usesImage, err := requestUsesImage(input)
+	if err != nil {
+		return err
+	}
+	if usesImage {
+		return fmt.Errorf("%w: %s image content", ErrUnsupportedCapability, adapter.protocol)
+	}
+	return nil
+}
+
+// validateCompatibleChatResponse 拦截 HTTP 200 中夹带的错误体和缺失消息的畸形响应。
 func validateCompatibleChatResponse(body []byte) error {
 	var envelope struct {
 		Error   json.RawMessage `json:"error"`
@@ -181,6 +177,15 @@ func requestUsesImage(input ChatInput) (bool, error) {
 	return false, nil
 }
 
+// compatibleChatEndpoint 区分自定义兼容地址与厂商已带版本前缀的地址。
+func compatibleChatEndpoint(protocol, baseURL string) (string, error) {
+	if protocol == ProtocolOpenAICompatible {
+		return compatibleChatCompletionsEndpoint(baseURL)
+	}
+	return fixedEndpoint(baseURL, "chat/completions")
+}
+
+// compatibleChatCompletionsEndpoint 允许用户传入主机、版本前缀或完整端点。
 func compatibleChatCompletionsEndpoint(rawBaseURL string) (string, error) {
 	parsed, err := parseBaseURL(rawBaseURL)
 	if err != nil {
@@ -198,26 +203,4 @@ func compatibleChatCompletionsEndpoint(rawBaseURL string) (string, error) {
 	}
 	parsed.RawPath = ""
 	return parsed.String(), nil
-}
-
-func parseBaseURL(rawBaseURL string) (*url.URL, error) {
-	baseURL := strings.TrimSpace(rawBaseURL)
-	if baseURL == "" {
-		return nil, errors.New("upstream base URL is required")
-	}
-
-	parsed, err := url.Parse(baseURL)
-	if err != nil {
-		return nil, errors.New("upstream base URL is invalid")
-	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return nil, errors.New("upstream base URL must use http or https")
-	}
-	if parsed.Host == "" {
-		return nil, errors.New("upstream base URL must include a host")
-	}
-	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return nil, errors.New("upstream base URL must not contain credentials, query, or fragment")
-	}
-	return parsed, nil
 }

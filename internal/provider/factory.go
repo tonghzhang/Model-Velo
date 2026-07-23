@@ -5,6 +5,16 @@ import (
 	"strings"
 )
 
+// AdapterConfig 是构造单个 Provider Adapter 所需的静态配置。
+type AdapterConfig struct {
+	ProviderID string
+	Protocol   string
+	BaseURL    string
+	HTTP       HTTPConfig
+}
+
+// NewAdapter 根据协议选择真实的 wire format 实现。
+// 使用相同 OpenAI 格式的厂商共享一个 Adapter，原生协议保持独立实现。
 func NewAdapter(config AdapterConfig) (Adapter, error) {
 	protocol := strings.ToLower(strings.TrimSpace(config.Protocol))
 	httpConfig := config.HTTP
@@ -32,24 +42,16 @@ func NewAdapter(config AdapterConfig) (Adapter, error) {
 		return newBedrockAdapter(config.BaseURL, httpConfig)
 	case ProtocolCloudflare:
 		return newCloudflareAdapter(config.BaseURL, httpConfig)
-	case ProtocolOpenAI:
-		return newOpenAIAdapter(config.BaseURL, httpConfig)
-	case ProtocolMistral:
-		return newMistralAdapter(config.BaseURL, httpConfig)
-	case ProtocolDeepSeek:
-		return newDeepSeekAdapter(config.BaseURL, httpConfig)
-	case ProtocolXAI:
-		return newXAIAdapter(config.BaseURL, httpConfig)
-	case ProtocolZhipu:
-		return newZhipuAdapter(config.BaseURL, httpConfig)
-	case ProtocolGroq:
-		return newGroqAdapter(config.BaseURL, httpConfig)
-	case ProtocolNVIDIA:
-		return newNVIDIAAdapter(config.BaseURL, httpConfig)
-	case ProtocolTogether:
-		return newTogetherAdapter(config.BaseURL, httpConfig)
-	case ProtocolOpenAICompatible:
-		return newOpenAICompatibleAdapter(config.BaseURL, httpConfig)
+	case ProtocolOpenAICompatible,
+		ProtocolOpenAI,
+		ProtocolMistral,
+		ProtocolDeepSeek,
+		ProtocolXAI,
+		ProtocolZhipu,
+		ProtocolGroq,
+		ProtocolNVIDIA,
+		ProtocolTogether:
+		return newCompatibleChatAdapter(protocol, config.BaseURL, httpConfig)
 	default:
 		return nil, fmt.Errorf("unsupported provider protocol %q", protocol)
 	}

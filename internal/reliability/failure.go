@@ -182,7 +182,9 @@ func FromProvider(
 		failure.Category = CategoryLocalValidation
 		return failure
 	}
-	if errors.Is(err, provider.ErrInvalidResponse) || errors.Is(err, provider.ErrResponseTooLarge) {
+	if errors.Is(err, provider.ErrInvalidResponse) ||
+		errors.Is(err, provider.ErrInvalidStream) ||
+		errors.Is(err, provider.ErrResponseTooLarge) {
 		failure.Category = CategoryUpstreamProtocol
 		return failure
 	}

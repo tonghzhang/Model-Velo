@@ -8,11 +8,13 @@ import (
 	"strings"
 )
 
+// ollamaAdapter 调用本地 Ollama Chat API，不要求 Provider Key。
 type ollamaAdapter struct {
 	endpoint  string
 	transport *jsonTransport
 }
 
+// ollamaRequest 使用 options 承载采样参数，图片则挂在对应消息上。
 type ollamaRequest struct {
 	Model    string                 `json:"model"`
 	Messages []ollamaMessage        `json:"messages"`
@@ -38,6 +40,7 @@ func (adapter *ollamaAdapter) Authentication() Authentication {
 	return AuthenticationNone
 }
 
+// Complete 发送非流式 Ollama 请求；传入的 apiKey 在该协议下没有意义。
 func (adapter *ollamaAdapter) Complete(ctx context.Context, input ChatInput, _ string) ([]byte, error) {
 	request, err := decodeNativeChatRequest(input)
 	if err != nil {
@@ -67,6 +70,7 @@ func (adapter *ollamaAdapter) Complete(ctx context.Context, input ChatInput, _ s
 	return decodeOllamaResponse(responseBody, request.Model, input.RequestID)
 }
 
+// ollamaChatMessage 将文本合并到 content，将图片 data URL 提取为 Base64 数组。
 func ollamaChatMessage(message ChatMessage) (ollamaMessage, error) {
 	parts, err := decodeNativeContent(message.Content)
 	if err != nil {
@@ -89,6 +93,7 @@ func ollamaChatMessage(message ChatMessage) (ollamaMessage, error) {
 	return converted, nil
 }
 
+// ollamaOptions 只写入客户端显式设置的参数，空配置保持省略。
 func ollamaOptions(request ChatRequest) (map[string]interface{}, error) {
 	options := make(map[string]interface{})
 	if request.Temperature != nil {
@@ -113,6 +118,7 @@ func ollamaOptions(request ChatRequest) (map[string]interface{}, error) {
 	return options, nil
 }
 
+// decodeOllamaResponse 要求 done=true，避免把未完成的流式片段误当完整结果。
 func decodeOllamaResponse(body []byte, model string, requestID string) ([]byte, error) {
 	var response struct {
 		Model      string `json:"model"`
@@ -128,7 +134,8 @@ func decodeOllamaResponse(body []byte, model string, requestID string) ([]byte, 
 	if err := json.Unmarshal(body, &response); err != nil || !response.Done {
 		return nil, ErrInvalidResponse
 	}
-	if toolCalls := bytes.TrimSpace(response.Message.ToolCalls); len(toolCalls) > 0 && !bytes.Equal(toolCalls, []byte("null")) {
+	toolCalls := bytes.TrimSpace(response.Message.ToolCalls)
+	if len(toolCalls) > 0 && !bytes.Equal(toolCalls, []byte("null")) {
 		return nil, fmt.Errorf("%w: Ollama tool output", ErrUnsupportedResponse)
 	}
 	if response.Model != "" {

@@ -10,11 +10,14 @@ import (
 
 const anthropicAPIVersion = "2023-06-01"
 
+// anthropicAdapter 使用 Messages API，而不是 OpenAI Chat Completions 格式。
 type anthropicAdapter struct {
 	endpoint  string
 	transport *jsonTransport
 }
 
+// anthropicRequest 是 Anthropic Messages API 的非流式请求结构。
+// system 指令位于顶层，不属于 messages 数组。
 type anthropicRequest struct {
 	Model         string             `json:"model"`
 	MaxTokens     int                `json:"max_tokens"`
@@ -55,6 +58,7 @@ func (adapter *anthropicAdapter) Authentication() Authentication {
 	return AuthenticationAPIKey
 }
 
+// Complete 将统一 Chat 请求转换为 Anthropic 请求，并把结果归一化为 OpenAI 响应。
 func (adapter *anthropicAdapter) Complete(
 	ctx context.Context,
 	input ChatInput,
@@ -109,6 +113,7 @@ func (adapter *anthropicAdapter) Complete(
 	return decodeAnthropicResponse(responseBody, input.RequestID)
 }
 
+// anthropicContents 将 OpenAI 内容块映射为 Anthropic 的 text、url 或 base64 source。
 func anthropicContents(raw json.RawMessage) ([]anthropicContent, error) {
 	parts, err := decodeNativeContent(raw)
 	if err != nil {
@@ -133,6 +138,7 @@ func anthropicContents(raw json.RawMessage) ([]anthropicContent, error) {
 	return content, nil
 }
 
+// decodeAnthropicResponse 只接收当前网关能够表达的文本结果；tool_use 交给后续工具能力阶段处理。
 func decodeAnthropicResponse(body []byte, requestID string) ([]byte, error) {
 	var response struct {
 		ID         string `json:"id"`

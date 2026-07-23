@@ -9,11 +9,13 @@ import (
 	"strings"
 )
 
+// bedrockAdapter 调用 Bedrock Converse API，模型名属于请求路径而不是请求体。
 type bedrockAdapter struct {
 	baseURL   string
 	transport *jsonTransport
 }
 
+// bedrockRequest 对应 Converse API；system 与普通 messages 分开编码。
 type bedrockRequest struct {
 	System          []bedrockContent       `json:"system,omitempty"`
 	Messages        []bedrockMessage       `json:"messages"`
@@ -57,6 +59,7 @@ func (adapter *bedrockAdapter) Authentication() Authentication {
 	return AuthenticationAPIKey
 }
 
+// Complete 构造每个模型独立的 Converse 端点，并执行一次非流式调用。
 func (adapter *bedrockAdapter) Complete(ctx context.Context, input ChatInput, apiKey string) ([]byte, error) {
 	request, err := decodeNativeChatRequest(input)
 	if err != nil {
@@ -109,6 +112,8 @@ func (adapter *bedrockAdapter) Complete(ctx context.Context, input ChatInput, ap
 	return decodeBedrockResponse(responseBody, request.Model, input.RequestID)
 }
 
+// bedrockContents 将图片 data URL 转为 Bedrock 要求的格式和 Base64 字节。
+// 远程图片 URL 不会由网关代下载，避免额外的网络与安全边界。
 func bedrockContents(raw json.RawMessage) ([]bedrockContent, error) {
 	parts, err := decodeNativeContent(raw)
 	if err != nil {
@@ -141,6 +146,7 @@ func bedrockContents(raw json.RawMessage) ([]bedrockContent, error) {
 	return content, nil
 }
 
+// bedrockConverseEndpoint 拒绝可能改变 URL 层级的模型名。
 func bedrockConverseEndpoint(rawBaseURL, model string) (string, error) {
 	parsed, err := parseBaseURL(rawBaseURL)
 	if err != nil {
@@ -155,6 +161,7 @@ func bedrockConverseEndpoint(rawBaseURL, model string) (string, error) {
 	return parsed.String(), nil
 }
 
+// decodeBedrockResponse 合并文本块，并把 Bedrock stopReason 映射为 OpenAI finish_reason。
 func decodeBedrockResponse(body []byte, model string, requestID string) ([]byte, error) {
 	var response struct {
 		Output struct {

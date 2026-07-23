@@ -9,11 +9,13 @@ import (
 	"strings"
 )
 
+// geminiAdapter 调用 Gemini generateContent 原生接口。
 type geminiAdapter struct {
 	baseURL   string
 	transport *jsonTransport
 }
 
+// geminiRequest 将系统指令与普通 contents 分开，并使用 Gemini 的生成参数命名。
 type geminiRequest struct {
 	Contents          []geminiContent        `json:"contents"`
 	SystemInstruction *geminiContent         `json:"systemInstruction,omitempty"`
@@ -53,6 +55,7 @@ func (adapter *geminiAdapter) Authentication() Authentication {
 	return AuthenticationAPIKey
 }
 
+// Complete 将 assistant 角色映射为 model，并把模型名写入 generateContent 端点。
 func (adapter *geminiAdapter) Complete(ctx context.Context, input ChatInput, apiKey string) ([]byte, error) {
 	request, err := decodeNativeChatRequest(input)
 	if err != nil {
@@ -115,6 +118,7 @@ func (adapter *geminiAdapter) Complete(ctx context.Context, input ChatInput, api
 	return decodeGeminiResponse(responseBody, request.Model, input.RequestID)
 }
 
+// geminiParts 将内嵌图片转换为 inlineData；远程 URL 在公共内容层被拒绝。
 func geminiParts(raw json.RawMessage) ([]geminiPart, error) {
 	parts, err := decodeNativeContent(raw)
 	if err != nil {
@@ -135,6 +139,7 @@ func geminiParts(raw json.RawMessage) ([]geminiPart, error) {
 	return result, nil
 }
 
+// decodeGeminiResponse 合并文本 part，并将安全拦截统一映射为 content_filter。
 func decodeGeminiResponse(body []byte, model string, requestID string) ([]byte, error) {
 	var response struct {
 		ResponseID string `json:"responseId"`
@@ -162,7 +167,8 @@ func decodeGeminiResponse(body []byte, model string, requestID string) ([]byte, 
 		if err := json.Unmarshal(rawPart, &part); err != nil {
 			return nil, ErrInvalidResponse
 		}
-		if functionCall := bytes.TrimSpace(part.FunctionCall); len(functionCall) > 0 && !bytes.Equal(functionCall, []byte("null")) {
+		functionCall := bytes.TrimSpace(part.FunctionCall)
+		if len(functionCall) > 0 && !bytes.Equal(functionCall, []byte("null")) {
 			return nil, fmt.Errorf("%w: Gemini function call output", ErrUnsupportedResponse)
 		}
 		if part.Text == nil {

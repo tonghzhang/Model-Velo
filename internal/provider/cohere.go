@@ -8,11 +8,13 @@ import (
 	"strings"
 )
 
+// cohereAdapter 使用 Cohere v2 Chat 的原生消息和响应结构。
 type cohereAdapter struct {
 	endpoint  string
 	transport *jsonTransport
 }
 
+// cohereRequest 中 P 对应 OpenAI 请求里的 top_p。
 type cohereRequest struct {
 	Model         string          `json:"model"`
 	Messages      []cohereMessage `json:"messages"`
@@ -40,6 +42,7 @@ func (adapter *cohereAdapter) Authentication() Authentication {
 	return AuthenticationAPIKey
 }
 
+// Complete 目前只转换 Cohere 可以无损表达的纯文本消息。
 func (adapter *cohereAdapter) Complete(ctx context.Context, input ChatInput, apiKey string) ([]byte, error) {
 	request, err := decodeNativeChatRequest(input)
 	if err != nil {
@@ -76,6 +79,7 @@ func (adapter *cohereAdapter) Complete(ctx context.Context, input ChatInput, api
 	return decodeCohereResponse(responseBody, request.Model, input.RequestID)
 }
 
+// decodeCohereResponse 优先使用实际 tokens，缺失时才回退到 billed_units。
 func decodeCohereResponse(body []byte, model string, requestID string) ([]byte, error) {
 	var response struct {
 		ID      string `json:"id"`

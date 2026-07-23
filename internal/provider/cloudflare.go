@@ -7,11 +7,13 @@ import (
 	"strings"
 )
 
+// cloudflareAdapter 调用 Workers AI 的按模型运行端点。
 type cloudflareAdapter struct {
 	baseURL   string
 	transport *jsonTransport
 }
 
+// cloudflareRequest 使用 Workers AI 当前支持的文本消息格式。
 type cloudflareRequest struct {
 	Messages    []cohereMessage `json:"messages"`
 	Stream      bool            `json:"stream"`
@@ -31,6 +33,7 @@ func (adapter *cloudflareAdapter) Authentication() Authentication {
 	return AuthenticationAPIKey
 }
 
+// Complete 将文本消息提交到 /ai/run/{model}，并统一包装 Workers AI 响应。
 func (adapter *cloudflareAdapter) Complete(ctx context.Context, input ChatInput, apiKey string) ([]byte, error) {
 	request, err := decodeNativeChatRequest(input)
 	if err != nil {
@@ -65,6 +68,7 @@ func (adapter *cloudflareAdapter) Complete(ctx context.Context, input ChatInput,
 	return decodeCloudflareResponse(responseBody, request.Model, input.RequestID)
 }
 
+// cloudflareRunEndpoint 允许模型名包含 @cf/... 层级，但拒绝查询字符和路径回退。
 func cloudflareRunEndpoint(rawBaseURL, model string) (string, error) {
 	parsed, err := parseBaseURL(rawBaseURL)
 	if err != nil {
@@ -79,6 +83,7 @@ func cloudflareRunEndpoint(rawBaseURL, model string) (string, error) {
 	return parsed.String(), nil
 }
 
+// decodeCloudflareResponse 要求 success=true，避免把业务错误包装成成功补全。
 func decodeCloudflareResponse(body []byte, model string, requestID string) ([]byte, error) {
 	var response struct {
 		Success bool `json:"success"`

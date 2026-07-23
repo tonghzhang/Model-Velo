@@ -228,6 +228,10 @@ func (h chatHandler) complete(c *gin.Context) {
 		)
 		return
 	}
+	if request.Stream {
+		h.stream(c, request, routePlan)
+		return
+	}
 	cacheResult := responsecache.Result{Status: responsecache.StatusBypass}
 	if !requestBypassesResponseCache(c.Request) {
 		cacheResult, err = h.cache.Lookup(c.Request.Context(), identity.TenantID, model, requestBody)
@@ -273,6 +277,114 @@ func (h chatHandler) complete(c *gin.Context) {
 
 	writeCacheStatusHeader(c, cacheResult.Status)
 	c.Data(http.StatusOK, "application/json; charset=utf-8", responseBody)
+}
+
+func (h chatHandler) stream(c *gin.Context, request provider.ChatRequest, plan routing.Plan) {
+	flusher, ok := chatStreamFlusher(c.Writer)
+	if !ok {
+		writeAPIError(
+			c,
+			http.StatusInternalServerError,
+			"streaming is unavailable on this HTTP connection",
+			"server_error",
+			nil,
+			"streaming_unavailable",
+		)
+		return
+	}
+
+	prepared, failure := h.orchestrator.OpenStream(c.Request.Context(), reliability.ExecutionInput{
+		RequestID: requestIDFromContext(c.Request.Context()),
+		Request:   request,
+		Plan:      plan,
+	})
+	if failure != nil {
+		writeReliabilityError(c, failure)
+		return
+	}
+	defer prepared.Abort(context.Canceled)
+	if err := c.Request.Context().Err(); err != nil {
+		prepared.Abort(err)
+		return
+	}
+
+	c.Header("Content-Type", "text/event-stream; charset=utf-8")
+	c.Header("Cache-Control", "no-cache, no-transform")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+	writeCacheStatusHeader(c, responsecache.StatusBypass)
+
+	if err := writeChatStreamEvent(c.Writer, prepared.FirstEvent); err != nil {
+		prepared.Abort(err)
+		return
+	}
+	flusher.Flush()
+
+	for {
+		event, err := prepared.Next()
+		if err != nil {
+			failure := prepared.FinishError(c.Request.Context(), err)
+			if failure != nil && failure.Category != reliability.CategoryCanceled {
+				log.Printf(
+					"stream interrupted request_id=%s provider=%s category=%s",
+					requestIDFromContext(c.Request.Context()),
+					failure.ProviderID,
+					failure.Category,
+				)
+			}
+			return
+		}
+		if err := writeChatStreamEvent(c.Writer, event); err != nil {
+			prepared.Abort(err)
+			return
+		}
+		flusher.Flush()
+		if event.Done {
+			prepared.Finish(nil)
+			return
+		}
+	}
+}
+
+type responseWriterUnwrapper interface {
+	Unwrap() http.ResponseWriter
+}
+
+func chatStreamFlusher(writer http.ResponseWriter) (http.Flusher, bool) {
+	for range 8 {
+		unwrapper, ok := writer.(responseWriterUnwrapper)
+		if !ok {
+			break
+		}
+		writer = unwrapper.Unwrap()
+		if writer == nil {
+			return nil, false
+		}
+	}
+	flusher, ok := writer.(http.Flusher)
+	return flusher, ok
+}
+
+func writeChatStreamEvent(writer io.Writer, event provider.ChatStreamEvent) error {
+	payload := []byte("[DONE]")
+	if !event.Done {
+		var compact bytes.Buffer
+		compact.Grow(len(event.Data))
+		if err := json.Compact(&compact, event.Data); err != nil {
+			return provider.ErrInvalidStream
+		}
+		payload = compact.Bytes()
+	}
+
+	frame := make([]byte, 0, len(payload)+8)
+	frame = append(frame, "data: "...)
+	frame = append(frame, payload...)
+	frame = append(frame, '\n', '\n')
+	written, err := writer.Write(frame)
+	if err == nil && written != len(frame) {
+		return io.ErrShortWrite
+	}
+	return err
 }
 
 func writeCacheStatusHeader(c *gin.Context, status responsecache.Status) {
@@ -333,10 +445,6 @@ func validateChatRequest(request provider.ChatRequest) (message string, param *s
 		case "invalid":
 			return fmt.Sprintf("messages[%d].content must be text or a non-empty content-parts array", index), stringPointer("messages"), "invalid_message_content"
 		}
-	}
-
-	if request.Stream {
-		return "streaming chat completions are not supported yet", stringPointer("stream"), "stream_not_supported"
 	}
 
 	return "", nil, ""

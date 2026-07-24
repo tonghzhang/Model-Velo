@@ -149,8 +149,10 @@ func decodeAnthropicResponse(body []byte, requestID string) ([]byte, error) {
 			Text string `json:"text"`
 		} `json:"content"`
 		Usage *struct {
-			InputTokens  *int `json:"input_tokens"`
-			OutputTokens *int `json:"output_tokens"`
+			InputTokens        *int `json:"input_tokens"`
+			OutputTokens       *int `json:"output_tokens"`
+			CacheCreationInput *int `json:"cache_creation_input_tokens"`
+			CacheReadInput     *int `json:"cache_read_input_tokens"`
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(body, &response); err != nil {
@@ -178,7 +180,21 @@ func decodeAnthropicResponse(body []byte, requestID string) ([]byte, error) {
 	}
 	var usage *completionUsage
 	if response.Usage != nil {
-		usage = newCompletionUsage(response.Usage.InputTokens, response.Usage.OutputTokens, nil)
+		inputTokens, valid := inclusiveInputTokens(
+			response.Usage.InputTokens,
+			response.Usage.CacheReadInput,
+			response.Usage.CacheCreationInput,
+		)
+		if !valid {
+			return nil, ErrInvalidResponse
+		}
+		usage = newCompletionUsage(inputTokens, response.Usage.OutputTokens, nil)
+		usage.setInputDetails(
+			nil,
+			nil,
+			response.Usage.CacheReadInput,
+			response.Usage.CacheCreationInput,
+		)
 	}
 	return encodeCompletion(response.ID, requestID, response.Model, text.String(), finishReason, usage)
 }

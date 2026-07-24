@@ -6,6 +6,7 @@ import (
 	"encoding/json" // 校验和解析 JSON
 	"errors"        // 判断具体错误类型
 	"io"            // 读取、关闭响应体，以及 EOF
+	"unicode/utf8"  // 拒绝不符合 SSE UTF-8 编码要求的数据
 )
 
 const (
@@ -29,6 +30,7 @@ type ChatStreamEvent struct {
 type ChatEventStream struct {
 	body     io.ReadCloser // 上游 HTTP 响应体
 	reader   *bufio.Reader // 从响应体中逐行读取数据
+	activity chan struct{} // 通知可靠性层上游仍在发送事件行或心跳
 	finished bool          // 流是否已经结束
 }
 
@@ -40,10 +42,9 @@ func newChatEventStream(body io.ReadCloser) (*ChatEventStream, error) {
 	}
 
 	return &ChatEventStream{
-		body: body,
-
-		// 使用固定大小的缓冲区读取响应体。
-		reader: bufio.NewReaderSize(body, streamReaderBufferBytes),
+		body:     body,
+		reader:   bufio.NewReaderSize(body, streamReaderBufferBytes),
+		activity: make(chan struct{}, 1),
 	}, nil
 }
 
@@ -68,6 +69,7 @@ func (stream *ChatEventStream) Next() (ChatStreamEvent, error) {
 
 			return ChatStreamEvent{}, err
 		}
+		stream.reportActivity()
 
 		// 空行表示一个 SSE 事件结束。
 		if len(line) == 0 {
@@ -107,6 +109,21 @@ func (stream *ChatEventStream) Next() (ChatStreamEvent, error) {
 		}
 
 		data.Write(value)
+	}
+}
+
+// Activity reports bounded upstream activity without exposing heartbeat events to clients.
+func (stream *ChatEventStream) Activity() <-chan struct{} {
+	if stream == nil {
+		return nil
+	}
+	return stream.activity
+}
+
+func (stream *ChatEventStream) reportActivity() {
+	select {
+	case stream.activity <- struct{}{}:
+	default:
 	}
 }
 
@@ -206,8 +223,8 @@ func splitStreamField(line []byte) ([]byte, []byte) {
 
 // validateCompatibleChatChunk 检查事件是否是最基本的 OpenAI 流式响应格式。
 func validateCompatibleChatChunk(data []byte) error {
-	// 必须是合法 JSON。
-	if !json.Valid(data) {
+	// SSE data 必须是 UTF-8 编码的合法 JSON。
+	if !utf8.Valid(data) || !json.Valid(data) {
 		return ErrInvalidStream
 	}
 

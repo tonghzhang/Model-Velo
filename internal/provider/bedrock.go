@@ -171,9 +171,11 @@ func decodeBedrockResponse(body []byte, model string, requestID string) ([]byte,
 		} `json:"output"`
 		StopReason string `json:"stopReason"`
 		Usage      *struct {
-			InputTokens  *int `json:"inputTokens"`
-			OutputTokens *int `json:"outputTokens"`
-			TotalTokens  *int `json:"totalTokens"`
+			InputTokens           *int `json:"inputTokens"`
+			OutputTokens          *int `json:"outputTokens"`
+			TotalTokens           *int `json:"totalTokens"`
+			CacheReadInputTokens  *int `json:"cacheReadInputTokens"`
+			CacheWriteInputTokens *int `json:"cacheWriteInputTokens"`
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(body, &response); err != nil || len(response.Output.Message.Content) == 0 {
@@ -209,7 +211,21 @@ func decodeBedrockResponse(body []byte, model string, requestID string) ([]byte,
 	}
 	var usage *completionUsage
 	if response.Usage != nil {
-		usage = newCompletionUsage(response.Usage.InputTokens, response.Usage.OutputTokens, response.Usage.TotalTokens)
+		inputTokens, valid := inclusiveInputTokens(
+			response.Usage.InputTokens,
+			response.Usage.CacheReadInputTokens,
+			response.Usage.CacheWriteInputTokens,
+		)
+		if !valid {
+			return nil, ErrInvalidResponse
+		}
+		usage = newCompletionUsage(inputTokens, response.Usage.OutputTokens, nil)
+		usage.setInputDetails(
+			nil,
+			nil,
+			response.Usage.CacheReadInputTokens,
+			response.Usage.CacheWriteInputTokens,
+		)
 	}
 	return encodeCompletion("", requestID, model, content.String(), finishReason, usage)
 }

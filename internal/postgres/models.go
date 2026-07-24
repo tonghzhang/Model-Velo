@@ -61,3 +61,60 @@ type TenantModelGrant struct {
 func (TenantModelGrant) TableName() string {
 	return "tenant_model_grants"
 }
+
+type UsageEvent struct {
+	EventID       string `gorm:"size:64;primaryKey"`
+	RedisEntryID  string `gorm:"size:64;not null;index:usage_events_redis_entry_idx"`
+	SchemaVersion int16  `gorm:"not null;check:usage_events_schema_version_check,schema_version > 0"`
+	RequestID     string `gorm:"size:128;not null;index:usage_events_request_idx"`
+	TenantID      string `gorm:"type:uuid;not null;index:usage_events_tenant_started_idx,priority:1;index:usage_events_tenant_model_started_idx,priority:1;index:usage_events_tenant_provider_started_idx,priority:1"`
+	APIKeyID      string `gorm:"size:64;index:usage_events_api_key_started_idx,priority:1"`
+
+	RequestedModel string `gorm:"size:200;not null;index:usage_events_tenant_model_started_idx,priority:2"`
+	ProviderID     string `gorm:"size:100;index:usage_events_provider_started_idx,priority:1;index:usage_events_tenant_provider_started_idx,priority:2"`
+	UpstreamModel  string `gorm:"size:200"`
+	CacheStatus    string `gorm:"size:16;not null"`
+	Stream         bool   `gorm:"not null"`
+	Attempts       int    `gorm:"not null"`
+	Retries        int    `gorm:"not null"`
+	Fallbacks      int    `gorm:"not null"`
+
+	UsageSource        string `gorm:"size:24;not null;default:unknown;check:usage_events_usage_source_check,usage_source IN ('unknown','provider','cache_replay')"`
+	UsageCaveat        string `gorm:"size:256"`
+	InputTokens        *int64
+	OutputTokens       *int64
+	TotalTokens        *int64
+	InputText          *int64
+	InputAudio         *int64
+	InputImage         *int64
+	CachedRead         *int64
+	CachedWrite        *int64
+	OutputText         *int64
+	OutputAudio        *int64
+	Reasoning          *int64
+	AcceptedPrediction *int64
+	RejectedPrediction *int64
+	RawUsage           string `gorm:"type:text"`
+
+	InputCostNanoUSD  *int64
+	OutputCostNanoUSD *int64
+	TotalCostNanoUSD  *int64 `gorm:"index:usage_events_cost_idx"`
+	CostCurrency      string `gorm:"size:3"`
+	CostSource        string `gorm:"size:32"`
+	PricingVersion    string `gorm:"size:100"`
+	CostCaveat        string `gorm:"size:256"`
+
+	FinishReason  string    `gorm:"size:64"`
+	Status        string    `gorm:"size:32;not null;index:usage_events_status_ended_idx,priority:1;check:usage_events_status_check,status IN ('success','cache_hit','failed','cancelled','stream_completed','stream_interrupted')"`
+	ErrorCategory string    `gorm:"size:64"`
+	ErrorCode     string    `gorm:"size:100"`
+	StartedAt     time.Time `gorm:"not null;index:usage_events_tenant_started_idx,priority:2;index:usage_events_provider_started_idx,priority:2;index:usage_events_tenant_model_started_idx,priority:3;index:usage_events_tenant_provider_started_idx,priority:3;index:usage_events_api_key_started_idx,priority:2"`
+	EndedAt       time.Time `gorm:"not null;index:usage_events_status_ended_idx,priority:2"`
+	LatencyMS     int64     `gorm:"not null"`
+	FirstTokenMS  *int64
+	ProcessedAt   time.Time `gorm:"not null"`
+}
+
+func (UsageEvent) TableName() string {
+	return "usage_events"
+}

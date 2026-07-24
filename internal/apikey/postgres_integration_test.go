@@ -230,7 +230,12 @@ func postgresDSNWithSearchPath(dsn, schema string) (string, error) {
 func assertPostgresSchema(t *testing.T, database *gorm.DB) {
 	t.Helper()
 	migrator := database.Migrator()
-	for _, model := range []any{&dbstore.Tenant{}, &dbstore.APIKey{}, &dbstore.TenantModelGrant{}} {
+	for _, model := range []any{
+		&dbstore.Tenant{},
+		&dbstore.APIKey{},
+		&dbstore.TenantModelGrant{},
+		&dbstore.UsageEvent{},
+	} {
 		if !migrator.HasTable(model) {
 			t.Errorf("AutoMigrate did not create table for %T", model)
 		}
@@ -243,6 +248,10 @@ func assertPostgresSchema(t *testing.T, database *gorm.DB) {
 		{&dbstore.APIKey{}, "api_keys_lookup_digest_unique"},
 		{&dbstore.APIKey{}, "api_keys_tenant_status_idx"},
 		{&dbstore.TenantModelGrant{}, "tenant_model_grants_model_idx"},
+		{&dbstore.UsageEvent{}, "usage_events_tenant_started_idx"},
+		{&dbstore.UsageEvent{}, "usage_events_request_idx"},
+		{&dbstore.UsageEvent{}, "usage_events_provider_started_idx"},
+		{&dbstore.UsageEvent{}, "usage_events_status_ended_idx"},
 	} {
 		if !migrator.HasIndex(index.model, index.name) {
 			t.Errorf("AutoMigrate did not create index %s", index.name)

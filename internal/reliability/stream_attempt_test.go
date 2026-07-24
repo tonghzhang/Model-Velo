@@ -56,6 +56,76 @@ func TestPreparedStreamHoldsResourcesUntilFinish(t *testing.T) {
 	}
 }
 
+func TestPreparedStreamTimesOutBetweenEvents(t *testing.T) {
+	upstreamCanceled := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(writer, "data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n")
+		writer.(http.Flusher).Flush()
+		<-request.Context().Done()
+		close(upstreamCanceled)
+	}))
+	defer upstream.Close()
+
+	executor, queues, breakers := newStreamAttemptExecutor(t, upstream.URL, 100*time.Millisecond)
+	prepared, failure := executor.PrepareStream(context.Background(), streamAttemptInput(t))
+	if failure != nil {
+		t.Fatalf("PrepareStream() failure = %v", failure)
+	}
+
+	_, err := prepared.Next()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		prepared.Abort(err)
+		t.Fatalf("Next() error = %v, want deadline exceeded", err)
+	}
+	failure = prepared.FinishError(context.Background(), err)
+	if failure == nil || failure.Category != CategoryTimeout || failure.Timeout != TimeoutUpstream {
+		t.Fatalf("FinishError() = %#v", failure)
+	}
+	assertStreamAttemptReleased(t, queues, breakers, 1)
+
+	select {
+	case <-upstreamCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("stream idle timeout did not cancel the upstream request")
+	}
+}
+
+func TestPreparedStreamHeartbeatResetsIdleTimeout(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(writer, "data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n")
+		writer.(http.Flusher).Flush()
+		for range 7 {
+			time.Sleep(50 * time.Millisecond)
+			_, _ = io.WriteString(writer, ": heartbeat\n\n")
+			writer.(http.Flusher).Flush()
+		}
+		_, _ = io.WriteString(writer, "data: {\"choices\":[{\"delta\":{\"content\":\"second\"}}]}\n\n")
+		_, _ = io.WriteString(writer, "data: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+
+	executor, queues, breakers := newStreamAttemptExecutor(t, upstream.URL, 300*time.Millisecond)
+	prepared, failure := executor.PrepareStream(context.Background(), streamAttemptInput(t))
+	if failure != nil {
+		t.Fatalf("PrepareStream() failure = %v", failure)
+	}
+
+	event, err := prepared.Next()
+	if err != nil || !strings.Contains(string(event.Data), `"content":"second"`) {
+		prepared.Abort(err)
+		t.Fatalf("Next() = %#v, %v; want second content event", event, err)
+	}
+	done, err := prepared.Next()
+	if err != nil || !done.Done {
+		prepared.Abort(err)
+		t.Fatalf("Next() = %#v, %v; want DONE", done, err)
+	}
+	prepared.Finish(nil)
+	assertStreamAttemptReleased(t, queues, breakers, 0)
+}
+
 func TestPrepareStreamClassifiesPrecommitFailures(t *testing.T) {
 	tests := []struct {
 		name                string

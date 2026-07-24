@@ -1,6 +1,6 @@
 # Model-Velo 架构设计
 
-> 状态：用户已明确授权进入阶段 4。阶段 3 的生产链与非 race 门禁已完成，3 个 race 证据项继续保留；阶段 4 已完成客户端 SSE 主链、首事件前 Retry/Fallback、提交后禁止切换 Provider 和取消传播，Server 超时与阶段门禁尚未收口。
+> 状态：用户已明确要求把阶段 5 Usage 扩展到生产工具级别。Usage v2 的详细 token、流式 usage、成本快照、租户查询、历史重算、保留期和可靠 Redis 清理已经实现并通过真实依赖集成测试。Windows race 工具链缺口继续保留，未经确认不进入阶段 6。
 
 ## 0. 当前实现边界
 
@@ -26,13 +26,13 @@ HTTP Client
   -> 兼容响应原样返回；原生响应归一化为 OpenAI Chat Completion
 ```
 
-`cmd/model-velo` 负责环境变量、依赖装配、HTTP Server 和优雅关闭，`internal/httpapi` 负责传输协议，`internal/apikey` 负责认证授权，`internal/ratelimit` 负责 Redis 原子限流，`internal/routing` 负责纯内存有序路由计划，`internal/responsecache` 负责 Exact Cache Key 与读写，`internal/reliability` 负责 Orchestrator、Attempt Executor、安全 Failure、Retry Policy、时间预算以及按 Provider 隔离的 Breaker、Queue 和 Key 状态，`internal/provider` 负责 16 个厂商配置、Adapter Registry、协议转换和统一 HTTP 错误边界。当前客户端 SSE 已接通，Usage Worker 尚未实现；Provider 层负责兼容 SSE 建流与解析，reliability 层负责候选内流式 Retry 和候选间有序 Fallback，HTTP Handler 只负责最终事件写入与 Flush。
+`cmd/model-velo` 负责 API 环境变量、依赖装配、HTTP Server 和优雅关闭，`cmd/model-velo-usage-worker` 只装配 Redis、PostgreSQL 和 Usage Worker。`internal/httpapi` 负责传输协议、请求终态和租户 Usage 查询，`internal/apikey` 负责认证授权，`internal/ratelimit` 负责 Redis 原子限流，`internal/routing` 负责纯内存有序路由计划，`internal/responsecache` 负责 Exact Cache Key 与读写，`internal/reliability` 负责 Orchestrator、Attempt Executor、安全 Failure、Retry Policy、时间预算以及按 Provider 隔离的 Breaker、Queue 和 Key 状态，`internal/provider` 负责厂商协议边界，`internal/usage` 负责版本化事件、详细 token、成本快照、Redis Emitter、consumer group、幂等存储、查询、历史重算和保留期。API 不同步写 Usage 数据库，Worker 也不启动 HTTP 模型调用链。
 
 启动配置没有隐式 Provider：`MODEL_VELO_ROUTING_JSON` 必须显式声明 Provider 与 Route，一个 Provider 也按相同格式配置；缺失或空白会在连接外部基础设施和监听 HTTP 前失败。生产 HTTP 装配只接受完整的 Adapter、Breaker、Queue 与 Route Registry；只要存在需要 API Key 的 Adapter，就必须同时提供 Key Registry，错误装配在 Attempt Executor 构造时失败。全部 Adapter 均为无鉴权类型时允许 Key Registry 为空。当前不保留单 Provider 快捷构造路径。
 
 阶段 3 会先按请求所需的 `text`、`image`、`tools` 能力过滤 Route Plan，再在统一预算内按顺序执行候选：每个候选内部按 Provider ID 有限 Retry，401 永久停用无效 Key，403 只在当前请求内换 Key，429 优先换未冷却 Key；全部 Key 冷却时，只有最早恢复时间能放入剩余预算才在释放准入资源后等待；指定 5xx、网络和上游超时有界退避，每次调用重新进入 Breaker、Queue 和 Key 选择。候选耗尽后，普通 400 与取消停止，明确的模型不可用 4xx 等策略失败进入下一候选。VLM `text`/`image_url` 内容在兼容协议中原样透传，在 Anthropic、Gemini、Ollama 和 Bedrock 中显式转换；Adapter 明确不支持某种输入时只触发 Fallback，不 Retry、不计 Breaker，全部候选都不支持时返回明确 400。上游模型自身的实际模态能力仍由厂商响应决定。总预算与跨 Fallback 取消已有端到端证据；仅 race 环境门禁仍未完成。阶段 1 历史证据见 `STAGE1_GATE.md`，阶段 3 收口证据见 `STAGE3_GATE.md`。
 
-阶段 4 的 Provider 边界实现了 `StreamingAdapter.OpenStream`。兼容请求会强制 `stream=true` 并保留未知字段，Transport 在移交 Body 前校验状态和 `text/event-stream`；`ChatEventStream` 以 1 MiB 单行、2 MiB 单事件上限读取，跳过且不向客户端透传注释/心跳，合并多行 `data:`，校验 choices/delta 或 usage-only Chunk，并把完整 `[DONE]` 标记为终止。reliability 层的流式 Attempt 会让每次尝试重新进入 Breaker、Queue、Key 和 Adapter，在 Attempt Timeout 内读取首个有效内容事件；策略允许时进行候选内 Retry，耗尽后由 `Orchestrator.OpenStream` 有序 Fallback。失败流会在下一次尝试前关闭 Body、取消上游并释放准入资源，成功 PreparedStream 只持有最终流的资源。预提交总预算使用独立 Context，成功上游流继承原客户端 Context。HTTP Handler 在检查底层 Flusher 后才调用这条链，有效首事件返回后设置 SSE Header，随后同步逐事件写入和 Flush；`[DONE]` 标记成功，提交后失败只记录稳定类别并结束当前流，不再 Retry/Fallback 或追加 JSON 错误体。
+阶段 4 的 Provider 边界实现了 `StreamingAdapter.OpenStream`。兼容请求会强制 `stream=true` 并保留未知字段，Transport 在移交 Body 前校验状态和 `text/event-stream`；`ChatEventStream` 以 1 MiB 单行、2 MiB 单事件上限读取，拒绝坏 UTF-8/JSON，跳过且不向客户端透传注释/心跳，合并多行 `data:`，校验 choices/delta 或 usage-only Chunk，并把完整 `[DONE]` 标记为终止。reliability 层的流式 Attempt 会让每次尝试重新进入 Breaker、Queue、Key 和 Adapter，在 Attempt Timeout 内读取首个有效内容事件；策略允许时进行候选内 Retry，耗尽后由 `Orchestrator.OpenStream` 有序 Fallback。失败流会在下一次尝试前关闭 Body、取消上游并释放准入资源，成功 PreparedStream 只持有最终流的资源。预提交总预算使用独立 Context，成功上游流继承原客户端 Context，后续有效事件的静默上限复用 Provider Attempt Timeout，心跳会重置计时器。HTTP Handler 在检查底层 Flusher 后才调用这条链，有效首事件返回后清除当前响应继承的 Server 总写截止时间，每个 SSE 帧使用独立 15 秒 Write/Flush 截止时间；`[DONE]` 标记成功，提交后失败只记录稳定类别并结束当前流，不再 Retry/Fallback 或追加 JSON 错误体。
 
 ## 1. 项目定位
 
@@ -79,7 +79,7 @@ flowchart LR
     API -->|"限流 / Cache / XADD Usage"| Redis[("Redis")]
     API -->|"HTTPS"| Providers["外部模型 Provider<br/>16 个厂商配置 + custom"]
 
-    Worker["model-velo-usage-worker<br/>后续阶段启用"] -->|"XREADGROUP"| Redis
+    Worker["model-velo-usage-worker"] -->|"XREADGROUP / XAUTOCLAIM / XACK"| Redis
     Worker -->|"幂等 INSERT/UPSERT"| PG
 
     Prom["Prometheus<br/>后续阶段启用"] -->|"scrape /metrics"| API
@@ -104,8 +104,8 @@ flowchart TD
     Limit --> Route["Router 生成有序候选路由计划"]
     Route --> Cache{"响应缓存命中？"}
 
-    Cache -->|"命中"| Response["非流式 JSON / SSE replay"]
-    Cache -->|"未命中"| Orch["Request Orchestrator"]
+    Cache -->|"非流式命中"| Response["非流式 JSON"]
+    Cache -->|"未命中 / SSE bypass"| Orch["Request Orchestrator"]
 
     Orch --> Attempt["对当前候选执行 Attempt"]
     Attempt --> Breaker{"Circuit Breaker 准入"}
@@ -158,8 +158,9 @@ flowchart TD
 | Orchestrator | 依次运行候选 Attempt、控制总时间预算和 Fallback | 处理具体 Provider JSON 字段差异 |
 | Attempt Executor | Breaker、Queue、Key、Retry 和一次候选调用 | 跨候选递归 Fallback |
 | Provider Adapter | 上游请求转换、HTTP 调用、响应/错误转换 | 全局限流、数据库写入 |
-| Usage Emitter | 将最终生命周期结果转换成稳定事件 | 阻塞执行复杂统计 SQL |
-| Usage Worker | Redis consumer group、幂等落库、重试/认领 pending | 参与在线模型调用 |
+| Usage Emitter | 将最终生命周期结果转换成稳定事件，并在独立短超时内 XADD | 同步写 PostgreSQL 或执行统计 SQL |
+| Usage Worker | Redis consumer group、幂等落库、成本快照、重试/认领 pending、保留期 | 参与在线模型调用 |
+| Usage Reader | 当前租户的明细、聚合、时间序列与严格查询边界 | 读取其他租户或修改历史记录 |
 
 早期实现可以让几个职责暂时位于同一包中，但不能把它们混进同一个巨大 Handler。只有出现第二个真实实现时才提取通用接口。
 
@@ -270,7 +271,7 @@ Retry 次数不是唯一约束：所有 Retry 和 Fallback 必须共享请求总
 ### PostgreSQL Schema
 
 - Model-Velo 当前统一使用 GORM，不在业务代码中直接调用 pgx，也不维护 `golang-migrate` runner 和手写 SQL migration；模块图中的 pgx 仅是 GORM 官方 PostgreSQL Dialector 的间接依赖。
-- API 启动并 Ping 成功后执行 `AutoMigrate`，同步 `tenants`、`api_keys`、`tenant_model_grants`。
+- API 与 Usage Worker 启动并 Ping 成功后执行 `AutoMigrate`，同步 `tenants`、`api_keys`、`tenant_model_grants`、`usage_events`。
 - 模型标签保留主键、唯一索引、查询索引、外键删除策略和必要的检查约束。
 - `AutoMigrate` 不作为任意破坏性变更工具：删除列、改写存量数据或不兼容约束变更必须单独评审、备份并设计显式升级步骤。
 - 当前没有 schema 版本回退命令；这是阶段 2 选择轻量 GORM 工作流后的明确边界。
@@ -304,13 +305,17 @@ Retry 次数不是唯一约束：所有 Retry 和 Fallback 必须共享请求总
 
 当前 Cache Key schema 为 `model-velo:response-cache:v1:<environment>:tenant:<tenant_sha256>:model:<model_sha256>:route:<route_version_sha256>:request:<canonical_request_sha256>`。整个请求 JSON 被递归规范化：对象字段排序，数组顺序和数字文本保留，缺失字段不与显式默认值合并，重复字段直接 bypass。原始 API Key、tenant、模型和提示词不进入 Key。
 
-只缓存通过认证、授权和限流的非流式请求及其完整成功响应；`Cache-Control: no-store` 显式 bypass。缓存位于限流之后，因此命中也消耗配额。流中断、客户端取消、上游错误和非法响应不写缓存。缓存不可用时固定 fail-open，记录安全错误并继续上游；Context 取消仍直接传播。`HIT/MISS/BYPASS` 同时存在于内部结果和 HTTP Header，供后续 Usage 接入复用。
+只缓存通过认证、授权和限流的非流式请求及其完整成功响应；`Cache-Control: no-store` 显式 bypass。缓存位于限流之后，因此命中也消耗配额。流中断、客户端取消、上游错误和非法响应不写缓存。缓存不可用时固定 fail-open，记录安全错误并继续上游；Context 取消仍直接传播。`HIT/MISS/BYPASS` 同时存在于内部结果、HTTP Header 和最终 Usage Event。
 
-当前调用链为认证→授权→限流→按请求能力过滤 Route Plan→缓存→Fallback Orchestrator 建立 Provider 执行总预算→按序调用单候选 Attempt Executor。每次真正的上游调用都按 Provider ID 重新进入 Adapter/Breaker→Queue→Key Selector→厂商协议端点→Key/Breaker 反馈→Queue 释放；Queue、Breaker 或 Key 冷却等调用前准入等待不占用 `MaxAttempts`，只有策略允许时才在资源释放后用 Timer/select 退避。Chat 请求在 HTTP 边界只解析一次；兼容协议保留原始 JSON 和未知字段，原生协议在转换前明确拒绝无法表达的字段。Adapter Registry 根据路由显式声明的 `vendor`/`type` 构造实现：OpenAI、Mistral、DeepSeek、xAI、Zhipu、Groq、NVIDIA、Together 各自拥有厂商 Adapter，并复用它们共同采用的 OpenAI Chat wire codec 与 HTTP 安全边界；custom-compatible 使用独立的通用兼容 Adapter。Anthropic、Gemini、DashScope、Cohere、Ollama、Bedrock 和 Cloudflare 执行显式请求/响应转换，Azure 使用自己的 Endpoint 与 `api-key` 鉴权。Adapter 不保存默认 API Key，每次调用只接收 Key Selector 为本 attempt 选出的 Secret。Adapter 能力不匹配会跳过当前候选，不消耗 Retry、不污染 Breaker；401 永久停用无效 Key，403 仅在当前请求排除该 Key，429 按 `Retry-After` 冷却并优先选择其他 Key。网络、上游超时与 500/502/503/504 退避重试并优先保持原 Key；普通 4xx 停止，带安全错误码的模型不可用 400/404/422 允许 Fallback。兼容 2xx 必须满足 Chat 响应结构，原生输出无法表示时明确 Fallback；真正的畸形协议响应会计入 Provider Breaker。Fallback 成功结果不写 Exact Cache。全部 Retry 与 Fallback 共享一个请求总预算，Provider 可独立覆盖单次超时、重试、Breaker、Queue 和 HTTP 连接池；连接池默认跟随 Queue 并发上限。Attempt Trail 记录实际 Provider 调用的 Provider/模型/Key ID、序号、类别、状态码和耗时，不记录 Secret 或提示词，并在成功结果与最终 Failure 中保留，供后续 Usage 使用。Queue、Breaker 和 Key 状态都按 Provider ID 隔离；Queue 是进程内容量保护，多实例总容量由每实例配置相加，不提供分布式全局并发上限。总预算取消和 race 证据留在阶段门禁。
+当前调用链为认证→授权→限流→按请求能力过滤 Route Plan→缓存→Fallback Orchestrator 建立 Provider 执行总预算→按序调用单候选 Attempt Executor。每次真正的上游调用都按 Provider ID 重新进入 Adapter/Breaker→Queue→Key Selector→厂商协议端点→Key/Breaker 反馈→Queue 释放；Queue、Breaker 或 Key 冷却等调用前准入等待不占用 `MaxAttempts`，只有策略允许时才在资源释放后用 Timer/select 退避。Chat 请求在 HTTP 边界只解析一次；兼容协议保留原始 JSON 和未知字段，原生协议在转换前明确拒绝无法表达的字段。Adapter Registry 根据路由显式声明的 `vendor`/`type` 构造实现：OpenAI、Mistral、DeepSeek、xAI、Zhipu、Groq、NVIDIA、Together 各自拥有厂商 Adapter，并复用它们共同采用的 OpenAI Chat wire codec 与 HTTP 安全边界；custom-compatible 使用独立的通用兼容 Adapter。Anthropic、Gemini、DashScope、Cohere、Ollama、Bedrock 和 Cloudflare 执行显式请求/响应转换，Azure 使用自己的 Endpoint 与 `api-key` 鉴权。Adapter 不保存默认 API Key，每次调用只接收 Key Selector 为本 attempt 选出的 Secret。Adapter 能力不匹配会跳过当前候选，不消耗 Retry、不污染 Breaker；401 永久停用无效 Key，403 仅在当前请求排除该 Key，429 按 `Retry-After` 冷却并优先选择其他 Key。网络、上游超时与 500/502/503/504 退避重试并优先保持原 Key；普通 4xx 停止，带安全错误码的模型不可用 400/404/422 允许 Fallback。兼容 2xx 必须满足 Chat 响应结构，原生输出无法表示时明确 Fallback；真正的畸形协议响应会计入 Provider Breaker。Fallback 成功结果不写 Exact Cache。全部 Retry 与 Fallback 共享一个请求总预算，Provider 可独立覆盖单次超时、重试、Breaker、Queue 和 HTTP 连接池；连接池默认跟随 Queue 并发上限。Attempt Trail 记录实际 Provider 调用的 Provider/模型/Key ID、序号、类别、状态码和耗时，不记录 Secret 或提示词，并在成功结果与最终 Failure 中保留，供 Usage Collector 记录可靠性元数据。Queue、Breaker 和 Key 状态都按 Provider ID 隔离；Queue 是进程内容量保护，多实例总容量由每实例配置相加，不提供分布式全局并发上限。总预算取消和 race 证据留在阶段门禁。
 
 ### Usage Stream
 
-Usage Event 至少表达：唯一事件 ID、request ID、租户、请求模型、实际 Provider/模型、是否缓存命中、输入/输出 token、状态、错误分类、开始/结束时间和延迟。
+Usage Event schema v2 在 v1 生命周期字段之外增加 API Key ID、usage 来源、input/output token 明细、最大 64 KiB 的原始 usage 子对象、finish reason 和流式 TTFT。Worker 仍能消费遗留 schema v1 事件，并推断其 usage 来源；未知未来版本进入 poison/dead-letter 流程。缺少上游 usage 时数据库 token 列保持 `NULL`，不会用零冒充已知值。终态包括 `success`、`cache_hit`、`failed`、`cancelled`、`stream_completed` 和 `stream_interrupted`；Collector 保证一个请求至多 finalize 一次。
+
+OpenAI-compatible 流请求默认合并 `stream_options.include_usage=true`，Collector 检查所有已验证 SSE 事件：首个 choices Chunk 记录 TTFT，末尾 usage-only Chunk 更新 token，`[DONE]` 只决定完成终态。兼容与原生 Adapter 会把可获得的 cached read/write、audio、image、reasoning 和 prediction token 映射到统一明细。缓存命中保留响应中的逻辑 token，但 usage 来源是 `cache_replay`，本次实际上游成本固定为已知零。
+
+成本不使用二进制浮点。配置中的 USD/百万 token 十进制字符串在启动时转换为整数 nanoUSD，按 Provider、模型、版本和半开生效时间窗口查价；上游明确返回的 USD 成本优先，否则使用本地价目。每条数据库记录保存 input/output/total 成本、来源和价格版本。缺少 usage、找不到价格或溢出时成本列保持 `NULL` 并保存稳定 caveat；Retry/Fallback 后只有最终响应 usage 可见时明确标记成本未覆盖更早失败 attempt。管理命令可在有界时间、过滤条件和显式确认下重算历史成本。
 
 可靠性语义是 **at-least-once**：
 
@@ -320,6 +325,10 @@ Usage Event 至少表达：唯一事件 ID、request ID、租户、请求模型�
 4. 数据库事务成功后再 `XACK`；
 5. Worker 能处理 pending、重试和毒消息；
 6. 不宣称 exactly-once。
+
+API 用独立短超时执行 `XADD`。投递失败只记录 request/event ID，不改变已经完成的客户端响应，但这意味着 Redis 在 XADD 前不可用且进程退出时事件可能丢失。主 Stream 不使用会裁掉 pending 的长度 trimming：Worker 在 PostgreSQL 成功后用一个 Redis 事务执行 `XACK + XDEL`，所以正常 Stream 只保留未完成积压；数据库故障期间不会为了固定长度静默删除未处理事件。Worker 以 `XGROUP CREATE ... MKSTREAM` 幂等创建消费组，先用 `XAUTOCLAIM` 恢复超过 idle 阈值的 pending，再用有界 `XREADGROUP BLOCK` 读取新事件。未知版本或坏事件不会写库，达到投递阈值后在事务中写入有独立长度上限的 dead-letter Stream，并从主流 ACK/删除。
+
+`usage_events.event_id` 是主键。Worker 使用 `ON CONFLICT (event_id) DO NOTHING`，因此数据库提交成功但 Redis 事务未执行时，下一次消费只会命中幂等行，再执行 ACK/删除；若事务已执行但响应丢失，数据库行已经是最终防线。查询索引覆盖 tenant+时间、tenant+模型+时间、tenant+Provider+时间、API Key+时间、request、状态和成本。认证后的 `/v1/usage/events|summary|series` 同时强制注入当前 tenant 与 API Key 条件，并限制时间窗口、分页、分组数量、字段和值；在项目拥有明确管理员 Scope 前，不允许普通模型 Key 跨 Key 读取租户账单。Worker 收到退出信号后停止新读取，当前批次使用独立有界时间完成；它还按配置保留期持续分批删除过期行，`0` 明确表示禁用自动清理。
 
 ## 10. 分阶段演进
 

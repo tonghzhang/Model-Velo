@@ -13,6 +13,7 @@ type compatibleChatAdapter struct {
 	endpoint           string
 	protocol           string
 	supportsImageInput bool
+	enforceStreamUsage bool
 	transport          *jsonTransport
 }
 
@@ -23,6 +24,15 @@ func newCompatibleChatAdapter(
 	baseURL string,
 	httpConfig HTTPConfig,
 ) (*compatibleChatAdapter, error) {
+	return newCompatibleChatAdapterWithUsage(protocol, baseURL, httpConfig, true)
+}
+
+func newCompatibleChatAdapterWithUsage(
+	protocol string,
+	baseURL string,
+	httpConfig HTTPConfig,
+	enforceStreamUsage bool,
+) (*compatibleChatAdapter, error) {
 	endpoint, err := compatibleChatEndpoint(protocol, baseURL)
 	if err != nil {
 		return nil, err
@@ -31,6 +41,7 @@ func newCompatibleChatAdapter(
 		endpoint:           endpoint,
 		protocol:           protocol,
 		supportsImageInput: ProtocolSupportsCapability(protocol, CapabilityImage),
+		enforceStreamUsage: enforceStreamUsage,
 		transport:          newJSONTransport(httpConfig),
 	}, nil
 }
@@ -83,7 +94,7 @@ func (adapter *compatibleChatAdapter) OpenStream(
 	if apiKey == "" {
 		return nil, ErrInvalidRequest
 	}
-	body, err := compatibleStreamRequestBody(input)
+	body, err := compatibleStreamRequestBody(input, adapter.enforceStreamUsage)
 	if err != nil {
 		return nil, err
 	}

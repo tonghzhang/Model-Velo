@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -20,6 +21,7 @@ import (
 	"model-velo/internal/reliability"
 	"model-velo/internal/responsecache"
 	"model-velo/internal/routing"
+	"model-velo/internal/usage"
 )
 
 func TestChatCompletionSuccess(t *testing.T) {
@@ -74,6 +76,199 @@ func TestChatCompletionSuccess(t *testing.T) {
 	if got := response.Body.String(); got != wantResponseBody {
 		t.Errorf("body = %s, want %s", got, wantResponseBody)
 	}
+}
+
+func TestChatCompletionUsageLifecycle(t *testing.T) {
+	t.Run("records non-stream success and tokens once", func(t *testing.T) {
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(
+				w,
+				`{"choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}`,
+			)
+		}))
+		defer upstream.Close()
+
+		emitter := &recordingUsageEmitter{err: errors.New("Redis unavailable")}
+		router := newSingleProviderTestRouterWithUsage(
+			t,
+			newTestCompatibleAdapter(t, upstream.URL),
+			testAccessController{},
+			testRateLimiter{decision: ratelimit.Decision{Allowed: true}},
+			testResponseCache{},
+			nil,
+			nil,
+			nil,
+			singleAttemptRetryPolicy(t, time.Second),
+			emitter,
+		)
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, validChatRequest())
+		if response.Code != http.StatusOK {
+			t.Fatalf("status = %d; body = %s", response.Code, response.Body.String())
+		}
+
+		event := singleUsageEvent(t, emitter)
+		if event.Status != usage.StatusSuccess ||
+			event.TenantID != "tenant-test-id" ||
+			event.APIKeyID != "api-key-test-id" ||
+			event.RequestedModel != "demo-model" ||
+			event.ProviderID != "upstream" ||
+			event.UpstreamModel != "demo-model" ||
+			event.Attempts != 1 ||
+			event.Retries != 0 ||
+			event.Fallbacks != 0 {
+			t.Fatalf("usage event = %#v", event)
+		}
+		if event.Usage == nil ||
+			event.UsageSource != usage.UsageSourceProvider ||
+			event.Usage.Input != 7 ||
+			event.Usage.Output != 3 ||
+			event.Usage.Total != 10 {
+			t.Fatalf("token usage = %#v", event.Usage)
+		}
+	})
+
+	t.Run("records cache hit without a provider", func(t *testing.T) {
+		upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			t.Fatal("cache hit called upstream")
+		}))
+		defer upstream.Close()
+
+		emitter := &recordingUsageEmitter{}
+		router := newSingleProviderTestRouterWithUsage(
+			t,
+			newTestCompatibleAdapter(t, upstream.URL),
+			testAccessController{},
+			testRateLimiter{decision: ratelimit.Decision{Allowed: true}},
+			testResponseCache{result: responsecache.Result{
+				Status: responsecache.StatusHit,
+				Body:   []byte(`{"choices":[],"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}`),
+			}},
+			nil,
+			nil,
+			nil,
+			singleAttemptRetryPolicy(t, time.Second),
+			emitter,
+		)
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, validChatRequest())
+		if response.Code != http.StatusOK {
+			t.Fatalf("status = %d; body = %s", response.Code, response.Body.String())
+		}
+
+		event := singleUsageEvent(t, emitter)
+		if event.Status != usage.StatusCacheHit ||
+			event.CacheStatus != string(responsecache.StatusHit) ||
+			event.UsageSource != usage.UsageSourceCacheReplay ||
+			event.ProviderID != "" ||
+			event.Attempts != 0 ||
+			event.Usage == nil ||
+			event.Usage.Total != 6 {
+			t.Fatalf("cache usage event = %#v", event)
+		}
+	})
+
+	t.Run("records a safe failure category and code", func(t *testing.T) {
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, `{"error":{"message":"internal"}}`)
+		}))
+		defer upstream.Close()
+
+		emitter := &recordingUsageEmitter{}
+		router := newSingleProviderTestRouterWithUsage(
+			t,
+			newTestCompatibleAdapter(t, upstream.URL),
+			testAccessController{},
+			testRateLimiter{decision: ratelimit.Decision{Allowed: true}},
+			testResponseCache{},
+			nil,
+			nil,
+			nil,
+			singleAttemptRetryPolicy(t, time.Second),
+			emitter,
+		)
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, validChatRequest())
+		if response.Code != http.StatusBadGateway {
+			t.Fatalf("status = %d; body = %s", response.Code, response.Body.String())
+		}
+
+		event := singleUsageEvent(t, emitter)
+		if event.Status != usage.StatusFailed ||
+			event.ErrorCategory != string(reliability.CategoryUpstream5xx) ||
+			event.ErrorCode != "upstream_http_error" ||
+			event.Attempts != 1 {
+			t.Fatalf("failure usage event = %#v", event)
+		}
+	})
+
+	t.Run("collects usage from a stream chunk", func(t *testing.T) {
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")
+			_, _ = io.WriteString(w, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}\n\n")
+			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		}))
+		defer upstream.Close()
+
+		emitter := &recordingUsageEmitter{}
+		router := newSingleProviderTestRouterWithUsage(
+			t,
+			newTestCompatibleAdapter(t, upstream.URL),
+			testAccessController{},
+			testRateLimiter{decision: ratelimit.Decision{Allowed: true}},
+			testResponseCache{},
+			nil,
+			nil,
+			nil,
+			singleAttemptRetryPolicy(t, time.Second),
+			emitter,
+		)
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, chatRequest(
+			`{"model":"demo-model","messages":[{"role":"user","content":"hello"}],"stream":true}`,
+		))
+		if response.Code != http.StatusOK {
+			t.Fatalf("status = %d; body = %s", response.Code, response.Body.String())
+		}
+
+		event := singleUsageEvent(t, emitter)
+		if event.Status != usage.StatusStreamCompleted ||
+			!event.Stream ||
+			event.FirstTokenMS == nil ||
+			event.UsageSource != usage.UsageSourceProvider ||
+			event.CacheStatus != string(responsecache.StatusBypass) ||
+			event.Usage == nil ||
+			event.Usage.Total != 7 {
+			t.Fatalf("stream usage event = %#v", event)
+		}
+	})
+}
+
+func singleUsageEvent(t *testing.T, emitter *recordingUsageEmitter) usage.Event {
+	t.Helper()
+	events := emitter.snapshot()
+	if len(events) != 1 {
+		t.Fatalf("usage events = %d, want 1", len(events))
+	}
+	return events[0]
+}
+
+func waitForSingleUsageEvent(t *testing.T, emitter *recordingUsageEmitter) usage.Event {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		events := emitter.snapshot()
+		if len(events) == 1 {
+			return events[0]
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("usage event was not emitted")
+	return usage.Event{}
 }
 
 func TestChatCompletionStreaming(t *testing.T) {
@@ -138,6 +333,50 @@ func TestChatCompletionStreaming(t *testing.T) {
 		}
 		if snapshot, _ := queues.Snapshot("upstream"); snapshot.Active != 0 || snapshot.Waiting != 0 {
 			t.Fatalf("queue after completed stream = %#v", snapshot)
+		}
+	})
+
+	t.Run("continues beyond the server write timeout", func(t *testing.T) {
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n")
+			w.(http.Flusher).Flush()
+			time.Sleep(120 * time.Millisecond)
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"second\"}}]}\n\n")
+			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		}))
+		defer upstream.Close()
+
+		gateway := httptest.NewUnstartedServer(newTestRouter(t, upstream.URL, time.Second))
+		gateway.Config.WriteTimeout = 40 * time.Millisecond
+		gateway.Start()
+		defer gateway.Close()
+
+		request, err := http.NewRequest(
+			http.MethodPost,
+			gateway.URL+"/v1/chat/completions",
+			strings.NewReader(`{"model":"demo-model","messages":[{"role":"user","content":"hello"}],"stream":true}`),
+		)
+		if err != nil {
+			t.Fatalf("http.NewRequest() error = %v", err)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Authorization", "Bearer model-velo-test-key")
+		response, err := gateway.Client().Do(request)
+		if err != nil {
+			t.Fatalf("stream request error = %v", err)
+		}
+		defer response.Body.Close()
+
+		body, err := io.ReadAll(response.Body)
+		if err != nil {
+			t.Fatalf("read stream response: %v", err)
+		}
+		wantBody := "data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n" +
+			"data: {\"choices\":[{\"delta\":{\"content\":\"second\"}}]}\n\n" +
+			"data: [DONE]\n\n"
+		if string(body) != wantBody {
+			t.Fatalf("stream body = %q, want %q", body, wantBody)
 		}
 	})
 
@@ -253,7 +492,8 @@ func TestChatCompletionStreaming(t *testing.T) {
 		if err != nil {
 			t.Fatalf("reliability.NewQueueRegistry() error = %v", err)
 		}
-		router := newSingleProviderTestRouter(
+		emitter := &recordingUsageEmitter{}
+		router := newSingleProviderTestRouterWithUsage(
 			t,
 			newTestCompatibleAdapter(t, upstream.URL),
 			testAccessController{},
@@ -262,6 +502,8 @@ func TestChatCompletionStreaming(t *testing.T) {
 			nil,
 			nil,
 			queues,
+			singleAttemptRetryPolicy(t, time.Second),
+			emitter,
 		)
 		gateway := httptest.NewServer(router)
 		defer gateway.Close()
@@ -312,6 +554,112 @@ func TestChatCompletionStreaming(t *testing.T) {
 				t.Fatalf("queue after client cancellation = %#v", snapshot)
 			case <-time.After(time.Millisecond):
 			}
+		}
+		event := waitForSingleUsageEvent(t, emitter)
+		if event.Status != usage.StatusCanceled ||
+			event.ErrorCategory != string(reliability.CategoryCanceled) ||
+			event.ErrorCode != "client_canceled" {
+			t.Fatalf("canceled usage event = %#v", event)
+		}
+	})
+
+	t.Run("concurrent streams release provider capacity", func(t *testing.T) {
+		const streamCount = 8
+
+		allArrived := make(chan struct{})
+		var active atomic.Int32
+		var calls atomic.Int32
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls.Add(1)
+			if active.Add(1) == streamCount {
+				close(allArrived)
+			}
+			defer active.Add(-1)
+
+			select {
+			case <-allArrived:
+			case <-r.Context().Done():
+				return
+			case <-time.After(time.Second):
+				w.WriteHeader(http.StatusGatewayTimeout)
+				return
+			}
+
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")
+			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		}))
+		defer upstream.Close()
+
+		queues, err := reliability.NewQueueRegistry([]string{"upstream"}, reliability.DefaultQueueConfig())
+		if err != nil {
+			t.Fatalf("reliability.NewQueueRegistry() error = %v", err)
+		}
+		router := newSingleProviderTestRouter(
+			t,
+			newTestCompatibleAdapter(t, upstream.URL),
+			testAccessController{},
+			testRateLimiter{decision: ratelimit.Decision{Allowed: true}},
+			testResponseCache{},
+			nil,
+			nil,
+			queues,
+		)
+		gateway := httptest.NewServer(router)
+		defer gateway.Close()
+
+		results := make(chan error, streamCount)
+		var clients sync.WaitGroup
+		for range streamCount {
+			clients.Add(1)
+			go func() {
+				defer clients.Done()
+				request, err := http.NewRequest(
+					http.MethodPost,
+					gateway.URL+"/v1/chat/completions",
+					strings.NewReader(`{"model":"demo-model","messages":[{"role":"user","content":"hello"}],"stream":true}`),
+				)
+				if err != nil {
+					results <- err
+					return
+				}
+				request.Header.Set("Content-Type", "application/json")
+				request.Header.Set("Authorization", "Bearer model-velo-test-key")
+				response, err := gateway.Client().Do(request)
+				if err != nil {
+					results <- err
+					return
+				}
+				body, readErr := io.ReadAll(response.Body)
+				closeErr := response.Body.Close()
+				if readErr != nil {
+					results <- readErr
+					return
+				}
+				if closeErr != nil {
+					results <- closeErr
+					return
+				}
+				if response.StatusCode != http.StatusOK || !strings.HasSuffix(string(body), "data: [DONE]\n\n") {
+					results <- fmt.Errorf("stream status/body = %d, %q", response.StatusCode, body)
+					return
+				}
+				results <- nil
+			}()
+		}
+		clients.Wait()
+		close(results)
+
+		for err := range results {
+			if err != nil {
+				t.Errorf("concurrent stream error: %v", err)
+			}
+		}
+		if calls.Load() != streamCount || active.Load() != 0 {
+			t.Fatalf("upstream calls/active = %d/%d, want %d/0", calls.Load(), active.Load(), streamCount)
+		}
+		if snapshot, _ := queues.Snapshot("upstream"); snapshot.Active != 0 || snapshot.Waiting != 0 {
+			t.Fatalf("queue after concurrent streams = %#v", snapshot)
 		}
 	})
 
@@ -1598,6 +1946,8 @@ func newRetryTestRouter(t *testing.T, baseURL string) http.Handler {
 		queues,
 		keys,
 		retry,
+		&recordingUsageEmitter{},
+		emptyUsageReader{},
 	)
 }
 
@@ -1779,7 +2129,28 @@ func newFallbackTestRouter(
 		queues,
 		keys,
 		retry,
+		&recordingUsageEmitter{},
+		emptyUsageReader{},
 	)
+}
+
+type recordingUsageEmitter struct {
+	mu     sync.Mutex
+	events []usage.Event
+	err    error
+}
+
+func (emitter *recordingUsageEmitter) Emit(_ context.Context, event usage.Event) (string, error) {
+	emitter.mu.Lock()
+	defer emitter.mu.Unlock()
+	emitter.events = append(emitter.events, event)
+	return "test-entry", emitter.err
+}
+
+func (emitter *recordingUsageEmitter) snapshot() []usage.Event {
+	emitter.mu.Lock()
+	defer emitter.mu.Unlock()
+	return append([]usage.Event(nil), emitter.events...)
 }
 
 func testModelCapabilities(protocol string) map[string][]provider.Capability {

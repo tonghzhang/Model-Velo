@@ -7,9 +7,73 @@ import (
 )
 
 type completionUsage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens            int                           `json:"prompt_tokens"`
+	PromptTokensDetails     *completionInputTokenDetails  `json:"prompt_tokens_details,omitempty"`
+	CompletionTokens        int                           `json:"completion_tokens"`
+	CompletionTokensDetails *completionOutputTokenDetails `json:"completion_tokens_details,omitempty"`
+	TotalTokens             int                           `json:"total_tokens"`
+}
+
+type completionInputTokenDetails struct {
+	Audio       int `json:"audio_tokens,omitempty"`
+	Image       int `json:"image_tokens,omitempty"`
+	CachedRead  int `json:"cached_read_tokens,omitempty"`
+	CachedWrite int `json:"cached_write_tokens,omitempty"`
+}
+
+type completionOutputTokenDetails struct {
+	Audio     int `json:"audio_tokens,omitempty"`
+	Reasoning int `json:"reasoning_tokens,omitempty"`
+}
+
+func (usage *completionUsage) setInputDetails(audio, image, cachedRead, cachedWrite *int) {
+	if usage == nil || (audio == nil && image == nil && cachedRead == nil && cachedWrite == nil) {
+		return
+	}
+	usage.PromptTokensDetails = &completionInputTokenDetails{
+		Audio:       intValue(audio),
+		Image:       intValue(image),
+		CachedRead:  intValue(cachedRead),
+		CachedWrite: intValue(cachedWrite),
+	}
+}
+
+func (usage *completionUsage) setOutputDetails(audio, reasoning *int) {
+	if usage == nil || (audio == nil && reasoning == nil) {
+		return
+	}
+	usage.CompletionTokensDetails = &completionOutputTokenDetails{
+		Audio:     intValue(audio),
+		Reasoning: intValue(reasoning),
+	}
+}
+
+func intValue(value *int) int {
+	if value == nil {
+		return 0
+	}
+	return *value
+}
+
+func inclusiveInputTokens(base, cachedRead, cachedWrite *int) (*int, bool) {
+	if base == nil && cachedRead == nil && cachedWrite == nil {
+		return nil, true
+	}
+	var total int64
+	for _, value := range []*int{base, cachedRead, cachedWrite} {
+		if value == nil {
+			continue
+		}
+		if *value < 0 {
+			return nil, false
+		}
+		total += int64(*value)
+		if total > int64(^uint(0)>>1) {
+			return nil, false
+		}
+	}
+	normalized := int(total)
+	return &normalized, true
 }
 
 // newCompletionUsage 在上游完全没有返回用量时返回 nil，避免伪造零值 usage。

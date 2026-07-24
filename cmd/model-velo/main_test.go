@@ -10,6 +10,7 @@ import (
 	"model-velo/internal/apikey"
 	"model-velo/internal/ratelimit"
 	"model-velo/internal/responsecache"
+	"model-velo/internal/usage"
 )
 
 func TestNewHTTPServerAddress(t *testing.T) {
@@ -165,11 +166,33 @@ func newConfiguredHTTPServer(t *testing.T) *http.Server {
 		startup.queues,
 		startup.providerKeys,
 		startup.retry,
+		mainTestUsageEmitter{},
+		mainTestUsageReader{},
 	)
 	if err != nil {
 		t.Fatalf("newHTTPServer() error = %v", err)
 	}
 	return server
+}
+
+type mainTestUsageEmitter struct{}
+
+func (mainTestUsageEmitter) Emit(context.Context, usage.Event) (string, error) {
+	return "test-entry", nil
+}
+
+type mainTestUsageReader struct{}
+
+func (mainTestUsageReader) List(context.Context, string, usage.ListParams) (usage.Page, error) {
+	return usage.Page{}, nil
+}
+
+func (mainTestUsageReader) Summary(context.Context, string, usage.SummaryParams) (usage.Summary, error) {
+	return usage.Summary{}, nil
+}
+
+func (mainTestUsageReader) Series(context.Context, string, usage.SeriesParams) ([]usage.SeriesPoint, error) {
+	return nil, nil
 }
 
 func setValidRoutingEnv(t *testing.T) {
@@ -207,6 +230,22 @@ func setValidInfrastructureEnv(t *testing.T) {
 	t.Setenv("MODEL_VELO_RATE_LIMIT_FAILURE_POLICY", "")
 	t.Setenv("MODEL_VELO_CACHE_TTL", "")
 	t.Setenv("MODEL_VELO_CACHE_ROUTE_VERSION", "")
+	t.Setenv("MODEL_VELO_USAGE_DEAD_LETTER_MAX_LEN", "")
+	t.Setenv("MODEL_VELO_USAGE_STREAM_MAX_LEN", "")
+	t.Setenv("MODEL_VELO_USAGE_EMIT_TIMEOUT", "")
+	t.Setenv("MODEL_VELO_USAGE_GROUP", "")
+	t.Setenv("MODEL_VELO_USAGE_CONSUMER", "test-consumer")
+	t.Setenv("MODEL_VELO_USAGE_BATCH_SIZE", "")
+	t.Setenv("MODEL_VELO_USAGE_READ_BLOCK", "")
+	t.Setenv("MODEL_VELO_USAGE_CLAIM_IDLE", "")
+	t.Setenv("MODEL_VELO_USAGE_MAX_DELIVERIES", "")
+	t.Setenv("MODEL_VELO_USAGE_RETRY_BACKOFF", "")
+	t.Setenv("MODEL_VELO_USAGE_WORKER_TIMEOUT", "")
+	t.Setenv("MODEL_VELO_USAGE_ENFORCE_STREAM", "")
+	t.Setenv("MODEL_VELO_USAGE_RETENTION_DAYS", "")
+	t.Setenv("MODEL_VELO_USAGE_MAINTENANCE_INTERVAL", "")
+	t.Setenv("MODEL_VELO_USAGE_MAINTENANCE_BATCH_SIZE", "")
+	t.Setenv("MODEL_VELO_USAGE_PRICING_JSON", "")
 }
 
 type mainTestAccessController struct{}

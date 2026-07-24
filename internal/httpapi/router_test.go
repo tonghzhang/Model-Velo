@@ -14,6 +14,7 @@ import (
 	"model-velo/internal/reliability"
 	"model-velo/internal/responsecache"
 	"model-velo/internal/routing"
+	"model-velo/internal/usage"
 )
 
 func TestHealthz(t *testing.T) {
@@ -33,6 +34,80 @@ func TestHealthz(t *testing.T) {
 
 	if got := response.Body.String(); got != `{"status":"ok"}` {
 		t.Errorf("body = %q, want %q", got, `{"status":"ok"}`)
+	}
+}
+
+func TestUsageSummaryUsesAuthenticatedTenantAndStrictFilters(t *testing.T) {
+	reader := &recordingUsageReader{
+		summary: usage.Summary{Totals: usage.Totals{Requests: 3}},
+	}
+	router := newSingleProviderTestRouterWithUsageReader(
+		t,
+		newTestCompatibleAdapter(t, "https://example.com"),
+		testAccessController{
+			identity: apikey.Identity{
+				TenantID: "tenant-usage",
+				APIKeyID: "api-key-usage",
+			},
+		},
+		testRateLimiter{decision: ratelimit.Decision{Allowed: true}},
+		testResponseCache{},
+		nil,
+		nil,
+		nil,
+		singleAttemptRetryPolicy(t, time.Second),
+		&recordingUsageEmitter{},
+		reader,
+	)
+
+	request := httptest.NewRequest(
+		http.MethodGet,
+		"/v1/usage/summary?group_by=model&request_id=request-filter",
+		nil,
+	)
+	request.Header.Set("Authorization", "Bearer model-velo-test-key")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK ||
+		reader.tenantID != "tenant-usage" ||
+		reader.params.GroupBy != "model" ||
+		reader.params.Filter.APIKeyID != "api-key-usage" ||
+		reader.params.Filter.RequestID != "request-filter" {
+		t.Fatalf(
+			"usage summary status=%d tenant=%q params=%#v body=%s",
+			response.Code,
+			reader.tenantID,
+			reader.params,
+			response.Body.String(),
+		)
+	}
+	if response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", response.Header().Get("Cache-Control"))
+	}
+
+	invalid := httptest.NewRequest(
+		http.MethodGet,
+		"/v1/usage/summary?group_by=model&unknown=true",
+		nil,
+	)
+	invalid.Header.Set("Authorization", "Bearer model-velo-test-key")
+	invalidResponse := httptest.NewRecorder()
+	router.ServeHTTP(invalidResponse, invalid)
+	if invalidResponse.Code != http.StatusBadRequest {
+		t.Fatalf("invalid query status = %d, want 400", invalidResponse.Code)
+	}
+
+	otherKey := httptest.NewRequest(
+		http.MethodGet,
+		"/v1/usage/summary?api_key_id=another-key",
+		nil,
+	)
+	otherKey.Header.Set("Authorization", "Bearer model-velo-test-key")
+	otherKeyResponse := httptest.NewRecorder()
+	router.ServeHTTP(otherKeyResponse, otherKey)
+	if otherKeyResponse.Code != http.StatusBadRequest {
+		t.Fatalf("other API key query status = %d, want 400", otherKeyResponse.Code)
 	}
 }
 
@@ -85,6 +160,60 @@ func newSingleProviderTestRouterWithRetry(
 	breaker *reliability.Breaker,
 	queues *reliability.QueueRegistry,
 	retry *reliability.RetryPolicy,
+) http.Handler {
+	return newSingleProviderTestRouterWithUsage(
+		t,
+		adapter,
+		access,
+		limiter,
+		cache,
+		routes,
+		breaker,
+		queues,
+		retry,
+		&recordingUsageEmitter{},
+	)
+}
+
+func newSingleProviderTestRouterWithUsage(
+	t *testing.T,
+	adapter provider.Adapter,
+	access httpapi.AccessController,
+	limiter httpapi.RateLimiter,
+	cache httpapi.ResponseCache,
+	routes *routing.Router,
+	breaker *reliability.Breaker,
+	queues *reliability.QueueRegistry,
+	retry *reliability.RetryPolicy,
+	usageEmitter usage.Emitter,
+) http.Handler {
+	return newSingleProviderTestRouterWithUsageReader(
+		t,
+		adapter,
+		access,
+		limiter,
+		cache,
+		routes,
+		breaker,
+		queues,
+		retry,
+		usageEmitter,
+		emptyUsageReader{},
+	)
+}
+
+func newSingleProviderTestRouterWithUsageReader(
+	t *testing.T,
+	adapter provider.Adapter,
+	access httpapi.AccessController,
+	limiter httpapi.RateLimiter,
+	cache httpapi.ResponseCache,
+	routes *routing.Router,
+	breaker *reliability.Breaker,
+	queues *reliability.QueueRegistry,
+	retry *reliability.RetryPolicy,
+	usageEmitter usage.Emitter,
+	usageReader httpapi.UsageReader,
 ) http.Handler {
 	t.Helper()
 
@@ -144,7 +273,51 @@ func newSingleProviderTestRouterWithRetry(
 		queues,
 		providerKeys,
 		retry,
+		usageEmitter,
+		usageReader,
 	)
+}
+
+type emptyUsageReader struct{}
+
+func (emptyUsageReader) List(context.Context, string, usage.ListParams) (usage.Page, error) {
+	return usage.Page{}, nil
+}
+
+func (emptyUsageReader) Summary(context.Context, string, usage.SummaryParams) (usage.Summary, error) {
+	return usage.Summary{}, nil
+}
+
+func (emptyUsageReader) Series(context.Context, string, usage.SeriesParams) ([]usage.SeriesPoint, error) {
+	return nil, nil
+}
+
+type recordingUsageReader struct {
+	tenantID string
+	params   usage.SummaryParams
+	summary  usage.Summary
+}
+
+func (*recordingUsageReader) List(context.Context, string, usage.ListParams) (usage.Page, error) {
+	return usage.Page{}, nil
+}
+
+func (reader *recordingUsageReader) Summary(
+	_ context.Context,
+	tenantID string,
+	params usage.SummaryParams,
+) (usage.Summary, error) {
+	reader.tenantID = tenantID
+	reader.params = params
+	return reader.summary, nil
+}
+
+func (*recordingUsageReader) Series(
+	context.Context,
+	string,
+	usage.SeriesParams,
+) ([]usage.SeriesPoint, error) {
+	return nil, nil
 }
 
 func singleAttemptRetryPolicy(t *testing.T, attemptTimeout time.Duration) *reliability.RetryPolicy {

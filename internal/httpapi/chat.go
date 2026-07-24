@@ -1,66 +1,74 @@
-package httpapi
+package httpapi // HTTP 接口处理层。
 
 import (
-	"bytes"
-	"context"
-	"encoding/json"
-	"errors"
-	"fmt"
-	"io"
-	"log"
-	"mime"
-	"net/http"
-	"strconv"
-	"strings"
-	"time"
+	"bytes"         // 处理字节切片和 JSON 内容。
+	"context"       // 传递请求取消和超时信号。
+	"encoding/json" // 解析、压缩 JSON。
+	"errors"        // 判断具体错误类型。
+	"fmt"           // 生成带下标的错误信息。
+	"io"            // 读取请求体、写入流数据。
+	"log"           // 记录缓存和流式请求异常。
+	"mime"          // 解析 Content-Type。
+	"net/http"      // HTTP 状态码、请求和响应接口。
+	"strconv"       // 将限流数值转换成响应头字符串。
+	"strings"       // 清理字符串、解析请求头。
+	"time"          // 处理重试等待时间。
 
-	"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin" // Gin HTTP 框架。
 
-	"model-velo/internal/apikey"
-	"model-velo/internal/provider"
-	"model-velo/internal/ratelimit"
-	"model-velo/internal/reliability"
-	"model-velo/internal/responsecache"
-	"model-velo/internal/routing"
+	"model-velo/internal/apikey"        // API Key 权限错误。
+	"model-velo/internal/provider"      // 聊天请求、Adapter 和流事件。
+	"model-velo/internal/ratelimit"     // 租户限流结果。
+	"model-velo/internal/reliability"   // 重试、熔断、队列和 Provider 回退。
+	"model-velo/internal/responsecache" // 非流式响应缓存。
+	"model-velo/internal/routing"       // 模型路由计划。
+	"model-velo/internal/usage"
 )
 
-const maxChatRequestBodyBytes int64 = 1 << 20
+const (
+	maxChatRequestBodyBytes int64 = 1 << 20
+	streamFrameWriteTimeout       = 15 * time.Second
+)
 
+// chatHandler 保存聊天接口需要的服务。
 type chatHandler struct {
-	access       AccessController
-	limiter      RateLimiter
-	cache        ResponseCache
-	routes       *routing.Router
-	orchestrator *reliability.Orchestrator
+	access       AccessController          // 检查租户是否有权使用模型。
+	limiter      RateLimiter               // 检查租户请求额度。
+	cache        ResponseCache             // 查询和写入响应缓存。
+	routes       *routing.Router           // 根据模型生成 Provider 路由。
+	orchestrator *reliability.Orchestrator // 执行重试、熔断和 Provider 回退。
+	usageEmitter usage.Emitter
 }
 
+// ResponseCache 约束响应缓存需要提供的方法。
 type ResponseCache interface {
-	Lookup(ctx context.Context, tenantID, model string, requestBody []byte) (responsecache.Result, error)
-	Store(ctx context.Context, tenantID, model string, requestBody, responseBody []byte) error
+	Lookup(ctx context.Context, tenantID, model string, requestBody []byte) (responsecache.Result, error) // 查询缓存。
+	Store(ctx context.Context, tenantID, model string, requestBody, responseBody []byte) error            // 保存响应。
 }
 
+// complete 处理聊天接口请求。
 func (h chatHandler) complete(c *gin.Context) {
-	if !hasJSONContentType(c.GetHeader("Content-Type")) {
+	if !hasJSONContentType(c.GetHeader("Content-Type")) { // 请求体必须声明为 JSON。
 		writeAPIError(
 			c,
-			http.StatusUnsupportedMediaType,
-			"request Content-Type must be application/json",
-			"invalid_request_error",
-			nil,
-			"invalid_content_type",
+			http.StatusUnsupportedMediaType, // 返回 415。
+			"request Content-Type must be application/json", // 对外错误信息。
+			"invalid_request_error",                         // OpenAI 风格错误类型。
+			nil,                                             // 没有具体参数。
+			"invalid_content_type",                          // 网关内部错误码。
 		)
-		return
+		return // 结束请求。
 	}
 
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxChatRequestBodyBytes)
-	requestBody, err := io.ReadAll(c.Request.Body)
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxChatRequestBodyBytes) // 限制请求体最大长度。
+	requestBody, err := io.ReadAll(c.Request.Body)                                          // 读取完整原始 JSON。
 	if err != nil {
-		var maxBytesError *http.MaxBytesError
-		if errors.As(err, &maxBytesError) {
+		var maxBytesError *http.MaxBytesError // 用于识别请求体过大错误。
+		if errors.As(err, &maxBytesError) {   // 判断是否超过 1 MiB。
 			writeAPIError(
 				c,
-				http.StatusRequestEntityTooLarge,
-				"request body exceeds the size limit",
+				http.StatusRequestEntityTooLarge,      // 返回 413。
+				"request body exceeds the size limit", // 请求体太大。
 				"invalid_request_error",
 				nil,
 				"request_too_large",
@@ -70,7 +78,7 @@ func (h chatHandler) complete(c *gin.Context) {
 
 		writeAPIError(
 			c,
-			http.StatusBadRequest,
+			http.StatusBadRequest, // 其他读取错误返回 400。
 			"request body could not be read",
 			"invalid_request_error",
 			nil,
@@ -79,11 +87,11 @@ func (h chatHandler) complete(c *gin.Context) {
 		return
 	}
 
-	request, err := provider.ParseChatRequest(requestBody)
+	request, err := provider.ParseChatRequest(requestBody) // 把原始 JSON 解析为 ChatRequest。
 	if err != nil {
 		writeAPIError(
 			c,
-			http.StatusBadRequest,
+			http.StatusBadRequest, // JSON 格式错误返回 400。
 			"request body must be a valid JSON object",
 			"invalid_request_error",
 			nil,
@@ -92,16 +100,16 @@ func (h chatHandler) complete(c *gin.Context) {
 		return
 	}
 
-	if message, param, code := validateChatRequest(request); code != "" {
-		writeAPIError(c, http.StatusBadRequest, message, "invalid_request_error", param, code)
+	if message, param, code := validateChatRequest(request); code != "" { // 校验 model、messages、role 和 content。
+		writeAPIError(c, http.StatusBadRequest, message, "invalid_request_error", param, code) // 返回具体校验错误。
 		return
 	}
 
-	identity, ok := identityFromContext(c.Request.Context())
+	identity, ok := identityFromContext(c.Request.Context()) // 读取认证中间件写入的租户身份。
 	if !ok {
 		writeAPIError(
 			c,
-			http.StatusInternalServerError,
+			http.StatusInternalServerError, // 身份丢失属于服务内部错误。
 			"authenticated identity is unavailable",
 			"server_error",
 			nil,
@@ -110,12 +118,22 @@ func (h chatHandler) complete(c *gin.Context) {
 		return
 	}
 
-	model := strings.TrimSpace(request.Model)
-	requiredCapabilities, err := request.RequiredCapabilities()
+	model := strings.TrimSpace(request.Model) // 清理客户端请求的模型名。
+	usageSession := newUsageSession(
+		c.Request.Context(),
+		h.usageEmitter,
+		identity.TenantID,
+		identity.APIKeyID,
+		model,
+		request.Stream,
+	)
+	defer usageSession.finish(c)
+
+	requiredCapabilities, err := request.RequiredCapabilities() // 分析请求需要的图像、工具等能力。
 	if err != nil {
 		writeAPIError(
 			c,
-			http.StatusBadRequest,
+			http.StatusBadRequest, // 请求使用了网关无法识别的能力。
 			"request uses a capability that is not supported by this gateway",
 			"invalid_request_error",
 			nil,
@@ -123,21 +141,22 @@ func (h chatHandler) complete(c *gin.Context) {
 		)
 		return
 	}
-	if err := h.access.AuthorizeModel(
+
+	if err := h.access.AuthorizeModel( // 检查该租户是否允许使用当前模型。
 		c.Request.Context(),
 		identity.TenantID,
 		model,
 	); err != nil {
-		if c.Request.Context().Err() != nil {
+		if c.Request.Context().Err() != nil { // 请求已经取消时不再写响应。
 			return
 		}
-		if errors.Is(err, apikey.ErrModelNotAllowed) {
+		if errors.Is(err, apikey.ErrModelNotAllowed) { // API Key 没有模型权限。
 			writeAPIError(
 				c,
-				http.StatusForbidden,
+				http.StatusForbidden, // 返回 403。
 				"API key is not allowed to use the requested model",
 				"permission_error",
-				stringPointer("model"),
+				stringPointer("model"), // 指明错误参数是 model。
 				"model_not_allowed",
 			)
 			return
@@ -145,7 +164,7 @@ func (h chatHandler) complete(c *gin.Context) {
 
 		writeAPIError(
 			c,
-			http.StatusServiceUnavailable,
+			http.StatusServiceUnavailable, // 授权服务本身不可用。
 			"model authorization service is unavailable",
 			"server_error",
 			nil,
@@ -154,12 +173,12 @@ func (h chatHandler) complete(c *gin.Context) {
 		return
 	}
 
-	limitDecision, err := h.limiter.Allow(c.Request.Context(), identity.TenantID, model)
+	limitDecision, err := h.limiter.Allow(c.Request.Context(), identity.TenantID, model) // 查询租户和模型的限流额度。
 	if err != nil {
-		if c.Request.Context().Err() != nil {
+		if c.Request.Context().Err() != nil { // 请求已经取消。
 			return
 		}
-		if errors.Is(err, ratelimit.ErrUnavailable) {
+		if errors.Is(err, ratelimit.ErrUnavailable) { // Redis 等限流依赖不可用。
 			writeAPIError(
 				c,
 				http.StatusServiceUnavailable,
@@ -173,7 +192,7 @@ func (h chatHandler) complete(c *gin.Context) {
 
 		writeAPIError(
 			c,
-			http.StatusInternalServerError,
+			http.StatusInternalServerError, // 其他限流计算错误。
 			"rate limit decision could not be evaluated",
 			"server_error",
 			nil,
@@ -181,11 +200,12 @@ func (h chatHandler) complete(c *gin.Context) {
 		)
 		return
 	}
-	writeRateLimitHeaders(c, limitDecision)
-	if !limitDecision.Allowed {
+
+	writeRateLimitHeaders(c, limitDecision) // 把额度、剩余额度和重置时间写入响应头。
+	if !limitDecision.Allowed {             // 当前租户已超过额度。
 		writeAPIError(
 			c,
-			http.StatusTooManyRequests,
+			http.StatusTooManyRequests, // 返回 429。
 			"tenant request quota exceeded for this model",
 			"rate_limit_error",
 			nil,
@@ -194,9 +214,9 @@ func (h chatHandler) complete(c *gin.Context) {
 		return
 	}
 
-	routePlan, err := h.routes.Plan(model, requiredCapabilities)
+	routePlan, err := h.routes.Plan(model, requiredCapabilities) // 生成符合模型和能力要求的候选 Provider。
 	if err != nil {
-		if errors.Is(err, routing.ErrCapabilityUnavailable) {
+		if errors.Is(err, routing.ErrCapabilityUnavailable) { // 没有 Provider 支持请求能力。
 			writeAPIError(
 				c,
 				http.StatusBadRequest,
@@ -207,7 +227,7 @@ func (h chatHandler) complete(c *gin.Context) {
 			)
 			return
 		}
-		if errors.Is(err, routing.ErrNoRoute) {
+		if errors.Is(err, routing.ErrNoRoute) { // 没有为该模型配置路由。
 			writeAPIError(
 				c,
 				http.StatusServiceUnavailable,
@@ -218,9 +238,10 @@ func (h chatHandler) complete(c *gin.Context) {
 			)
 			return
 		}
+
 		writeAPIError(
 			c,
-			http.StatusInternalServerError,
+			http.StatusInternalServerError, // 其他路由生成错误。
 			"provider route could not be planned",
 			"server_error",
 			nil,
@@ -228,38 +249,63 @@ func (h chatHandler) complete(c *gin.Context) {
 		)
 		return
 	}
-	if request.Stream {
-		h.stream(c, request, routePlan)
-		return
-	}
-	cacheResult := responsecache.Result{Status: responsecache.StatusBypass}
-	if !requestBypassesResponseCache(c.Request) {
-		cacheResult, err = h.cache.Lookup(c.Request.Context(), identity.TenantID, model, requestBody)
-		if err != nil {
-			if c.Request.Context().Err() != nil {
-				return
-			}
-			log.Printf("response cache lookup bypass request_id=%s: %v", requestIDFromContext(c.Request.Context()), err)
-			cacheResult = responsecache.Result{Status: responsecache.StatusBypass}
-		}
-	}
-	if cacheResult.Status == responsecache.StatusHit {
-		writeCacheStatusHeader(c, cacheResult.Status)
-		c.Data(http.StatusOK, "application/json; charset=utf-8", cacheResult.Body)
+
+	if request.Stream { // 流式请求不走普通响应缓存流程。
+		usageSession.setCacheStatus(string(responsecache.StatusBypass))
+		h.stream(c, request, routePlan, usageSession) // 转入 SSE 处理。
 		return
 	}
 
-	execution, failure := h.orchestrator.Execute(c.Request.Context(), reliability.ExecutionInput{
-		RequestID: requestIDFromContext(c.Request.Context()),
-		Request:   request,
-		Plan:      routePlan,
-	})
-	if failure != nil {
-		writeReliabilityError(c, failure)
+	cacheResult := responsecache.Result{Status: responsecache.StatusBypass} // 默认标记为绕过缓存。
+	if !requestBypassesResponseCache(c.Request) {                           // 请求头没有 no-store 时才查询缓存。
+		cacheResult, err = h.cache.Lookup(c.Request.Context(), identity.TenantID, model, requestBody) // 用租户、模型和请求体查缓存。
+		if err != nil {
+			if c.Request.Context().Err() != nil { // 请求取消时停止处理。
+				return
+			}
+			log.Printf("response cache lookup bypass request_id=%s: %v", requestIDFromContext(c.Request.Context()), err) // 记录缓存查询错误。
+			cacheResult = responsecache.Result{Status: responsecache.StatusBypass}                                       // 缓存故障时继续请求模型。
+		}
+	}
+
+	if cacheResult.Status == responsecache.StatusHit { // 缓存命中。
+		usageSession.setCacheStatus(string(cacheResult.Status))
+		usageSession.observe(cacheResult.Body)
+		usageSession.finalize(usage.Outcome{Status: usage.StatusCacheHit})
+		writeCacheStatusHeader(c, cacheResult.Status)                              // 写入 HIT 响应头。
+		c.Data(http.StatusOK, "application/json; charset=utf-8", cacheResult.Body) // 直接返回缓存响应。
 		return
 	}
-	responseBody := execution.Body
-	if cacheResult.Status == responsecache.StatusMiss && execution.Fallbacks == 0 {
+	usageSession.setCacheStatus(string(cacheResult.Status))
+
+	execution, failure := h.orchestrator.Execute(c.Request.Context(), reliability.ExecutionInput{ // 执行 Provider 调用和回退。
+		RequestID: requestIDFromContext(c.Request.Context()), // 当前网关请求 ID。
+		Request:   request,                                   // 解析后的聊天请求。
+		Plan:      routePlan,                                 // 路由候选计划。
+	})
+	if failure != nil {
+		usageSession.recordFailure(failure)
+		writeReliabilityError(c, failure) // 把内部 Failure 转成 HTTP 错误。
+		status := usage.StatusFailed
+		errorCode := apiErrorCode(c)
+		if failure.Category == reliability.CategoryCanceled {
+			status = usage.StatusCanceled
+			if errorCode == "" {
+				errorCode = "client_canceled"
+			}
+		}
+		usageSession.finalize(usage.Outcome{
+			Status:        status,
+			ErrorCategory: string(failure.Category),
+			ErrorCode:     errorCode,
+		})
+		return
+	}
+
+	responseBody := execution.Body // 取得最终 Provider 响应体。
+	usageSession.recordExecution(execution)
+	usageSession.observe(responseBody)
+	if cacheResult.Status == responsecache.StatusMiss && execution.Fallbacks == 0 { // 只有缓存未命中且未切换 Provider 时才缓存。
 		if err := h.cache.Store(
 			c.Request.Context(),
 			identity.TenantID,
@@ -267,21 +313,78 @@ func (h chatHandler) complete(c *gin.Context) {
 			requestBody,
 			responseBody,
 		); err != nil {
-			if c.Request.Context().Err() != nil {
+			if c.Request.Context().Err() != nil { // 请求取消时停止。
 				return
 			}
-			log.Printf("response cache store bypass request_id=%s: %v", requestIDFromContext(c.Request.Context()), err)
-			cacheResult.Status = responsecache.StatusBypass
+			log.Printf("response cache store bypass request_id=%s: %v", requestIDFromContext(c.Request.Context()), err) // 记录缓存写入错误。
+			cacheResult.Status = responsecache.StatusBypass                                                             // 告诉客户端本次缓存已绕过。
 		}
 	}
 
-	writeCacheStatusHeader(c, cacheResult.Status)
-	c.Data(http.StatusOK, "application/json; charset=utf-8", responseBody)
+	writeCacheStatusHeader(c, cacheResult.Status) // 写入 MISS、BYPASS 等缓存状态。
+	usageSession.setCacheStatus(string(cacheResult.Status))
+	usageSession.finalize(usage.Outcome{Status: usage.StatusSuccess})
+	c.Data(http.StatusOK, "application/json; charset=utf-8", responseBody) // 返回最终 JSON。
 }
 
-func (h chatHandler) stream(c *gin.Context, request provider.ChatRequest, plan routing.Plan) {
-	flusher, ok := chatStreamFlusher(c.Writer)
+// stream 处理 SSE 流式聊天响应。
+func (h chatHandler) stream(
+	c *gin.Context,
+	request provider.ChatRequest,
+	plan routing.Plan,
+	usageSession *usageSession,
+) {
+	streamController, ok := chatStreamController(c.Writer)
 	if !ok {
+		writeAPIError(
+			c,
+			http.StatusInternalServerError,
+			"streaming is unavailable on this HTTP connection", // 当前连接不支持流式刷新。
+			"server_error",
+			nil,
+			"streaming_unavailable",
+		)
+		return
+	}
+
+	prepared, failure := h.orchestrator.OpenStream(c.Request.Context(), reliability.ExecutionInput{ // 打开上游流并取得首个事件。
+		RequestID: requestIDFromContext(c.Request.Context()),
+		Request:   request,
+		Plan:      plan,
+	})
+	if failure != nil {
+		usageSession.recordFailure(failure)
+		writeReliabilityError(c, failure) // 打开流失败时返回统一错误。
+		status := usage.StatusFailed
+		errorCode := apiErrorCode(c)
+		if failure.Category == reliability.CategoryCanceled {
+			status = usage.StatusCanceled
+			if errorCode == "" {
+				errorCode = "client_canceled"
+			}
+		}
+		usageSession.finalize(usage.Outcome{
+			Status:        status,
+			ErrorCategory: string(failure.Category),
+			ErrorCode:     errorCode,
+		})
+		return
+	}
+	usageSession.recordStream(prepared)
+	usageSession.observeStream(prepared.FirstEvent.Data)
+
+	defer prepared.Abort(context.Canceled) // 函数异常退出时确保关闭上游流。
+	if err := c.Request.Context().Err(); err != nil {
+		prepared.Abort(err) // 客户端已经取消时中止流。
+		usageSession.finalize(usage.Outcome{
+			Status:        usage.StatusCanceled,
+			ErrorCategory: "client",
+			ErrorCode:     "client_canceled",
+		})
+		return
+	}
+	if err := setChatStreamWriteDeadline(streamController, time.Time{}); err != nil {
+		prepared.Abort(err)
 		writeAPIError(
 			c,
 			http.StatusInternalServerError,
@@ -290,156 +393,208 @@ func (h chatHandler) stream(c *gin.Context, request provider.ChatRequest, plan r
 			nil,
 			"streaming_unavailable",
 		)
+		usageSession.finalize(usage.Outcome{
+			Status:        usage.StatusFailed,
+			ErrorCategory: "gateway",
+			ErrorCode:     apiErrorCode(c),
+		})
 		return
 	}
 
-	prepared, failure := h.orchestrator.OpenStream(c.Request.Context(), reliability.ExecutionInput{
-		RequestID: requestIDFromContext(c.Request.Context()),
-		Request:   request,
-		Plan:      plan,
-	})
-	if failure != nil {
-		writeReliabilityError(c, failure)
-		return
-	}
-	defer prepared.Abort(context.Canceled)
-	if err := c.Request.Context().Err(); err != nil {
-		prepared.Abort(err)
+	c.Header("Content-Type", "text/event-stream; charset=utf-8") // 声明 SSE。
+	c.Header("Cache-Control", "no-cache, no-transform")          // 禁止缓存和代理转换。
+	c.Header("Connection", "keep-alive")                         // 保持长连接。
+	c.Header("X-Accel-Buffering", "no")                          // 禁止 Nginx 缓冲。
+	writeCacheStatusHeader(c, responsecache.StatusBypass)        // 流式响应不使用缓存。
+
+	if err := writeAndFlushChatStreamEvent(c.Writer, streamController, prepared.FirstEvent); err != nil {
+		prepared.Abort(err) // 客户端写入失败时关闭上游流。
+		usageSession.finalize(usage.Outcome{
+			Status:        usage.StatusStreamInterrupted,
+			ErrorCategory: "client_write",
+			ErrorCode:     "stream_write_failed",
+		})
 		return
 	}
 
-	c.Header("Content-Type", "text/event-stream; charset=utf-8")
-	c.Header("Cache-Control", "no-cache, no-transform")
-	c.Header("Connection", "keep-alive")
-	c.Header("X-Accel-Buffering", "no")
-	writeCacheStatusHeader(c, responsecache.StatusBypass)
-
-	if err := writeChatStreamEvent(c.Writer, prepared.FirstEvent); err != nil {
-		prepared.Abort(err)
-		return
-	}
-	flusher.Flush()
-
-	for {
-		event, err := prepared.Next()
+	for { // 持续读取后续 SSE 事件。
+		event, err := prepared.Next() // 从上次读取位置继续读取下一个事件。
 		if err != nil {
-			failure := prepared.FinishError(c.Request.Context(), err)
+			failure := prepared.FinishError(c.Request.Context(), err) // 将流读取错误转换为统一 Failure。
 			if failure != nil && failure.Category != reliability.CategoryCanceled {
 				log.Printf(
 					"stream interrupted request_id=%s provider=%s category=%s",
 					requestIDFromContext(c.Request.Context()),
 					failure.ProviderID,
 					failure.Category,
-				)
+				) // 记录非客户端取消导致的流中断。
+			}
+			if failure != nil && failure.Category == reliability.CategoryCanceled {
+				usageSession.finalize(usage.Outcome{
+					Status:        usage.StatusCanceled,
+					ErrorCategory: string(failure.Category),
+					ErrorCode:     "client_canceled",
+				})
+			} else if failure != nil {
+				usageSession.finalize(usage.Outcome{
+					Status:        usage.StatusStreamInterrupted,
+					ErrorCategory: string(failure.Category),
+					ErrorCode:     "stream_interrupted",
+				})
 			}
 			return
 		}
-		if err := writeChatStreamEvent(c.Writer, event); err != nil {
-			prepared.Abort(err)
+
+		usageSession.observeStream(event.Data)
+		if err := writeAndFlushChatStreamEvent(c.Writer, streamController, event); err != nil {
+			prepared.Abort(err) // 写入失败时中止上游流。
+			usageSession.finalize(usage.Outcome{
+				Status:        usage.StatusStreamInterrupted,
+				ErrorCategory: "client_write",
+				ErrorCode:     "stream_write_failed",
+			})
 			return
 		}
-		flusher.Flush()
-		if event.Done {
-			prepared.Finish(nil)
+
+		if event.Done { // 收到上游结束事件。
+			prepared.Finish(nil) // 标记本次流正常结束。
+			usageSession.finalize(usage.Outcome{Status: usage.StatusStreamCompleted})
 			return
 		}
 	}
 }
 
+// responseWriterUnwrapper 表示能够取出底层 ResponseWriter 的包装器。
 type responseWriterUnwrapper interface {
-	Unwrap() http.ResponseWriter
+	Unwrap() http.ResponseWriter // 返回被包装的底层 Writer。
 }
 
-func chatStreamFlusher(writer http.ResponseWriter) (http.Flusher, bool) {
-	for range 8 {
-		unwrapper, ok := writer.(responseWriterUnwrapper)
+// chatStreamController 取得支持 Flush 和单响应写截止时间的底层 Writer。
+func chatStreamController(writer http.ResponseWriter) (*http.ResponseController, bool) {
+	for range 8 { // 最多向下解除八层包装。
+		unwrapper, ok := writer.(responseWriterUnwrapper) // 判断当前 Writer 是否支持解包。
 		if !ok {
-			break
+			break // 已经无法继续解包。
 		}
-		writer = unwrapper.Unwrap()
+		writer = unwrapper.Unwrap() // 取得下一层 Writer。
 		if writer == nil {
-			return nil, false
+			return nil, false // 底层 Writer 无效。
 		}
 	}
-	flusher, ok := writer.(http.Flusher)
-	return flusher, ok
+	if _, ok := writer.(http.Flusher); !ok {
+		return nil, false
+	}
+	return http.NewResponseController(writer), true
 }
 
-func writeChatStreamEvent(writer io.Writer, event provider.ChatStreamEvent) error {
-	payload := []byte("[DONE]")
-	if !event.Done {
-		var compact bytes.Buffer
-		compact.Grow(len(event.Data))
-		if err := json.Compact(&compact, event.Data); err != nil {
-			return provider.ErrInvalidStream
-		}
-		payload = compact.Bytes()
+func writeAndFlushChatStreamEvent(
+	writer io.Writer,
+	controller *http.ResponseController,
+	event provider.ChatStreamEvent,
+) error {
+	if err := setChatStreamWriteDeadline(controller, time.Now().Add(streamFrameWriteTimeout)); err != nil {
+		return err
 	}
+	if err := writeChatStreamEvent(writer, event); err != nil {
+		_ = setChatStreamWriteDeadline(controller, time.Time{})
+		return err
+	}
+	if err := controller.Flush(); err != nil {
+		_ = setChatStreamWriteDeadline(controller, time.Time{})
+		return err
+	}
+	return setChatStreamWriteDeadline(controller, time.Time{})
+}
 
-	frame := make([]byte, 0, len(payload)+8)
-	frame = append(frame, "data: "...)
-	frame = append(frame, payload...)
-	frame = append(frame, '\n', '\n')
-	written, err := writer.Write(frame)
-	if err == nil && written != len(frame) {
-		return io.ErrShortWrite
+func setChatStreamWriteDeadline(controller *http.ResponseController, deadline time.Time) error {
+	err := controller.SetWriteDeadline(deadline)
+	if errors.Is(err, http.ErrNotSupported) {
+		return nil
 	}
 	return err
 }
 
-func writeCacheStatusHeader(c *gin.Context, status responsecache.Status) {
-	if status == "" {
-		status = responsecache.StatusBypass
+// writeChatStreamEvent 把 ChatStreamEvent 写成 SSE data 帧。
+func writeChatStreamEvent(writer io.Writer, event provider.ChatStreamEvent) error {
+	payload := []byte("[DONE]") // 结束事件默认写为 data: [DONE]。
+	if !event.Done {
+		var compact bytes.Buffer      // 保存压缩后的单行 JSON。
+		compact.Grow(len(event.Data)) // 提前申请大致所需容量。
+		if err := json.Compact(&compact, event.Data); err != nil {
+			return provider.ErrInvalidStream // 事件数据不是合法 JSON。
+		}
+		payload = compact.Bytes() // 普通事件使用压缩后的 JSON。
 	}
-	c.Header("X-Model-Velo-Cache", string(status))
+
+	frame := make([]byte, 0, len(payload)+8) // 创建 SSE 帧缓冲区。
+	frame = append(frame, "data: "...)       // 写入 SSE data 前缀。
+	frame = append(frame, payload...)        // 写入事件内容。
+	frame = append(frame, '\n', '\n')        // 空行表示一个 SSE 事件结束。
+	written, err := writer.Write(frame)      // 将完整事件写入客户端连接。
+	if err == nil && written != len(frame) {
+		return io.ErrShortWrite // 没报错但没有完整写入。
+	}
+	return err // 返回底层写入错误或 nil。
 }
 
+// writeCacheStatusHeader 写入响应缓存状态。
+func writeCacheStatusHeader(c *gin.Context, status responsecache.Status) {
+	if status == "" {
+		status = responsecache.StatusBypass // 空状态按 BYPASS 处理。
+	}
+	c.Header("X-Model-Velo-Cache", string(status)) // 告诉客户端本次缓存结果。
+}
+
+// requestBypassesResponseCache 判断请求是否携带 Cache-Control: no-store。
 func requestBypassesResponseCache(request *http.Request) bool {
-	for _, value := range request.Header.Values("Cache-Control") {
-		for _, directive := range strings.Split(value, ",") {
+	for _, value := range request.Header.Values("Cache-Control") { // 遍历所有 Cache-Control 请求头。
+		for _, directive := range strings.Split(value, ",") { // 一个请求头可能包含多个指令。
 			if strings.EqualFold(strings.TrimSpace(directive), "no-store") {
-				return true
+				return true // 客户端明确禁止缓存。
 			}
 		}
 	}
-	return false
+	return false // 可以正常使用缓存。
 }
 
+// writeRateLimitHeaders 把限流结果写入 HTTP 响应头。
 func writeRateLimitHeaders(c *gin.Context, decision ratelimit.Decision) {
 	if decision.Bypassed {
-		c.Header("X-RateLimit-Status", "bypassed")
+		c.Header("X-RateLimit-Status", "bypassed") // 限流服务故障时可能采用 fail-open。
 		return
 	}
 
-	c.Header("X-RateLimit-Limit", strconv.FormatInt(decision.Limit, 10))
-	c.Header("X-RateLimit-Remaining", strconv.FormatInt(decision.Remaining, 10))
-	c.Header("X-RateLimit-Reset", strconv.FormatInt(decision.ResetAtUnix, 10))
+	c.Header("X-RateLimit-Limit", strconv.FormatInt(decision.Limit, 10))         // 当前窗口最大请求数。
+	c.Header("X-RateLimit-Remaining", strconv.FormatInt(decision.Remaining, 10)) // 当前窗口剩余请求数。
+	c.Header("X-RateLimit-Reset", strconv.FormatInt(decision.ResetAtUnix, 10))   // 当前窗口重置时间。
 	if !decision.Allowed {
-		c.Header("Retry-After", strconv.FormatInt(decision.RetryAfterSeconds, 10))
+		c.Header("Retry-After", strconv.FormatInt(decision.RetryAfterSeconds, 10)) // 被限流后建议等待秒数。
 	}
 }
 
+// hasJSONContentType 判断请求 Content-Type 是否为 application/json。
 func hasJSONContentType(contentType string) bool {
-	mediaType, _, err := mime.ParseMediaType(contentType)
-	return err == nil && mediaType == "application/json"
+	mediaType, _, err := mime.ParseMediaType(contentType) // 去除 charset 等附加参数。
+	return err == nil && mediaType == "application/json"  // 解析成功且主类型为 JSON。
 }
 
+// validateChatRequest 校验聊天请求的基本字段。
 func validateChatRequest(request provider.ChatRequest) (message string, param *string, code string) {
 	if strings.TrimSpace(request.Model) == "" {
-		return "model is required", stringPointer("model"), "missing_model"
+		return "model is required", stringPointer("model"), "missing_model" // model 不能为空。
 	}
 	if len(request.Messages) == 0 {
-		return "messages must contain at least one message", stringPointer("messages"), "missing_messages"
+		return "messages must contain at least one message", stringPointer("messages"), "missing_messages" // 至少需要一条消息。
 	}
 
-	for index, message := range request.Messages {
+	for index, message := range request.Messages { // 逐条检查消息。
 		if !supportedMessageRole(message.Role) {
-			return fmt.Sprintf("messages[%d].role is not supported", index), stringPointer("messages"), "invalid_message_role"
+			return fmt.Sprintf("messages[%d].role is not supported", index), stringPointer("messages"), "invalid_message_role" // role 不受支持。
 		}
-		switch messageContentStatus(message.Content) {
+		switch messageContentStatus(message.Content) { // 判断 content 是否缺失或格式错误。
 		case "missing":
 			if message.Role == "assistant" && (message.HasField("tool_calls") || message.HasField("function_call")) {
-				continue
+				continue // assistant 发起工具调用时允许 content 为空。
 			}
 			return fmt.Sprintf("messages[%d].content is required", index), stringPointer("messages"), "missing_message_content"
 		case "invalid":
@@ -447,66 +602,73 @@ func validateChatRequest(request provider.ChatRequest) (message string, param *s
 		}
 	}
 
-	return "", nil, ""
+	return "", nil, "" // 所有字段合法。
 }
 
+// messageContentStatus 返回 content 的状态：missing、invalid 或空字符串。
 func messageContentStatus(raw json.RawMessage) string {
-	raw = bytes.TrimSpace(raw)
+	raw = bytes.TrimSpace(raw) // 去掉 JSON 前后的空白。
 	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
-		return "missing"
+		return "missing" // 没有字段内容或值为 null。
 	}
-	if raw[0] == '"' {
+
+	if raw[0] == '"' { // content 是字符串。
 		var text string
 		if err := json.Unmarshal(raw, &text); err != nil {
-			return "invalid"
+			return "invalid" // 字符串 JSON 无法解析。
 		}
 		if strings.TrimSpace(text) == "" {
-			return "missing"
+			return "missing" // 空字符串视为缺失。
 		}
-		return ""
+		return "" // 非空文本合法。
 	}
+
 	if raw[0] != '[' {
-		return "invalid"
+		return "invalid" // 非字符串内容必须是数组。
 	}
 
 	var parts []json.RawMessage
 	if err := json.Unmarshal(raw, &parts); err != nil {
-		return "invalid"
+		return "invalid" // 内容块数组格式错误。
 	}
 	if len(parts) == 0 {
-		return "missing"
+		return "missing" // 空内容块数组视为缺失。
 	}
-	for _, rawPart := range parts {
+
+	for _, rawPart := range parts { // 检查每个内容块。
 		var part struct {
-			Type string `json:"type"`
+			Type string `json:"type"` // 只提取内容块的 type。
 		}
 		if err := json.Unmarshal(rawPart, &part); err != nil || strings.TrimSpace(part.Type) == "" {
-			return "invalid"
+			return "invalid" // 内容块必须是合法对象并包含非空 type。
 		}
 	}
-	return ""
+	return "" // 内容块数组合法。
 }
 
+// supportedMessageRole 判断消息角色是否受支持。
 func supportedMessageRole(role string) bool {
 	switch role {
 	case "system", "developer", "user", "assistant", "tool":
-		return true
+		return true // 网关支持的角色。
 	default:
-		return false
+		return false // 其他角色不支持。
 	}
 }
 
+// writeReliabilityError 将内部可靠性错误转换成 HTTP API 错误。
 func writeReliabilityError(c *gin.Context, failure *reliability.Failure) {
 	if failure == nil {
-		return
+		return // 没有错误，无需处理。
 	}
 	if failure.Category == reliability.CategoryCanceled && c.Request.Context().Err() != nil {
-		return
+		return // 客户端已经断开时不再尝试写响应。
 	}
 
 	switch failure.Category {
 	case reliability.CategoryTimeout:
-		writeAPIError(c, http.StatusGatewayTimeout, "upstream request timed out", "upstream_error", nil, "upstream_timeout")
+		writeAPIError(c, http.StatusGatewayTimeout, "upstream request timed out", "upstream_error", nil, "upstream_timeout") // 上游超时返回 504。
+
 	case reliability.CategoryUnsupportedCapability:
 		writeAPIError(
 			c,
@@ -515,7 +677,8 @@ func writeReliabilityError(c *gin.Context, failure *reliability.Failure) {
 			"invalid_request_error",
 			nil,
 			"unsupported_provider_capability",
-		)
+		) // Provider 不支持请求能力，返回 400。
+
 	case reliability.CategoryUnsupportedResponse:
 		writeAPIError(
 			c,
@@ -524,58 +687,69 @@ func writeReliabilityError(c *gin.Context, failure *reliability.Failure) {
 			"upstream_error",
 			nil,
 			"unsupported_upstream_response",
-		)
+		) // 上游响应无法转换，返回 502。
+
 	case reliability.CategoryUpstreamProtocol:
 		switch {
 		case errors.Is(failure, provider.ErrResponseTooLarge):
-			writeAPIError(c, http.StatusBadGateway, "upstream response exceeded the size limit", "upstream_error", nil, "upstream_response_too_large")
+			writeAPIError(c, http.StatusBadGateway, "upstream response exceeded the size limit", "upstream_error", nil, "upstream_response_too_large") // 响应体过大。
 		case errors.Is(failure, provider.ErrInvalidResponse):
-			writeAPIError(c, http.StatusBadGateway, "upstream returned an invalid response", "upstream_error", nil, "invalid_upstream_response")
+			writeAPIError(c, http.StatusBadGateway, "upstream returned an invalid response", "upstream_error", nil, "invalid_upstream_response") // 响应不是合法格式。
 		default:
-			writeAPIError(c, http.StatusBadGateway, "upstream returned an unsupported response", "upstream_error", nil, "upstream_protocol_error")
+			writeAPIError(c, http.StatusBadGateway, "upstream returned an unsupported response", "upstream_error", nil, "upstream_protocol_error") // 其他协议错误。
 		}
+
 	case reliability.CategoryUpstream4xx:
 		if failure.StatusCode == http.StatusBadRequest {
-			writeAPIError(c, http.StatusBadRequest, "upstream rejected the request", "invalid_request_error", nil, "upstream_rejected_request")
+			writeAPIError(c, http.StatusBadRequest, "upstream rejected the request", "invalid_request_error", nil, "upstream_rejected_request") // 上游 400 转给客户端。
 		} else {
-			writeAPIError(c, http.StatusBadGateway, "upstream request failed", "upstream_error", nil, "upstream_http_error")
+			writeAPIError(c, http.StatusBadGateway, "upstream request failed", "upstream_error", nil, "upstream_http_error") // 其他上游 4xx 统一转 502。
 		}
+
 	case reliability.CategoryModelUnavailable:
-		writeAPIError(c, http.StatusServiceUnavailable, "requested model is unavailable from configured providers", "upstream_error", stringPointer("model"), "model_unavailable")
+		writeAPIError(c, http.StatusServiceUnavailable, "requested model is unavailable from configured providers", "upstream_error", stringPointer("model"), "model_unavailable") // 所有候选都无法提供模型。
+
 	case reliability.CategoryUpstreamRateLimit:
 		if failure.RetryAfterSet {
-			seconds := int64((failure.RetryAfter + time.Second - 1) / time.Second)
-			c.Header("Retry-After", strconv.FormatInt(seconds, 10))
+			seconds := int64((failure.RetryAfter + time.Second - 1) / time.Second) // 向上取整为秒。
+			c.Header("Retry-After", strconv.FormatInt(seconds, 10))                // 告诉客户端等待多久。
 		}
-		writeAPIError(c, http.StatusTooManyRequests, "upstream rate limit exceeded", "upstream_error", nil, "upstream_rate_limited")
+		writeAPIError(c, http.StatusTooManyRequests, "upstream rate limit exceeded", "upstream_error", nil, "upstream_rate_limited") // 上游限流返回 429。
+
 	case reliability.CategoryKeyUnauthorized, reliability.CategoryKeyForbidden, reliability.CategoryUpstream5xx:
-		writeAPIError(c, http.StatusBadGateway, "upstream request failed", "upstream_error", nil, "upstream_http_error")
+		writeAPIError(c, http.StatusBadGateway, "upstream request failed", "upstream_error", nil, "upstream_http_error") // Key 无效或上游 5xx 返回 502。
+
 	case reliability.CategoryBreaker:
 		if failure.RetryAfter > 0 {
-			seconds := int64((failure.RetryAfter + time.Second - 1) / time.Second)
+			seconds := int64((failure.RetryAfter + time.Second - 1) / time.Second) // 计算熔断剩余秒数。
 			c.Header("Retry-After", strconv.FormatInt(seconds, 10))
 		}
-		writeAPIError(c, http.StatusServiceUnavailable, "provider circuit is temporarily open", "upstream_error", nil, "provider_circuit_open")
+		writeAPIError(c, http.StatusServiceUnavailable, "provider circuit is temporarily open", "upstream_error", nil, "provider_circuit_open") // 熔断器打开返回 503。
+
 	case reliability.CategoryKeyExhausted:
 		if failure.RetryAfter > 0 {
-			seconds := int64((failure.RetryAfter + time.Second - 1) / time.Second)
+			seconds := int64((failure.RetryAfter + time.Second - 1) / time.Second) // 计算最早 Key 恢复时间。
 			c.Header("Retry-After", strconv.FormatInt(seconds, 10))
 		}
-		writeAPIError(c, http.StatusServiceUnavailable, "provider has no available API key", "upstream_error", nil, "provider_keys_exhausted")
+		writeAPIError(c, http.StatusServiceUnavailable, "provider has no available API key", "upstream_error", nil, "provider_keys_exhausted") // 没有可用 Key 返回 503。
+
 	case reliability.CategoryQueue:
 		switch failure.Queue {
 		case reliability.QueueFull:
-			writeAPIError(c, http.StatusServiceUnavailable, "provider queue is full", "upstream_error", nil, "provider_queue_full")
+			writeAPIError(c, http.StatusServiceUnavailable, "provider queue is full", "upstream_error", nil, "provider_queue_full") // 等待队列已满。
 		case reliability.QueueWaitTimeout:
-			writeAPIError(c, http.StatusServiceUnavailable, "provider queue wait timed out", "upstream_error", nil, "provider_queue_timeout")
+			writeAPIError(c, http.StatusServiceUnavailable, "provider queue wait timed out", "upstream_error", nil, "provider_queue_timeout") // 排队等待超时。
 		default:
-			writeAPIError(c, http.StatusServiceUnavailable, "provider capacity is temporarily unavailable", "upstream_error", nil, "provider_queue_unavailable")
+			writeAPIError(c, http.StatusServiceUnavailable, "provider capacity is temporarily unavailable", "upstream_error", nil, "provider_queue_unavailable") // 其他队列错误。
 		}
+
 	case reliability.CategoryLocalValidation:
-		writeAPIError(c, http.StatusInternalServerError, "provider request could not be prepared", "server_error", nil, "provider_request_error")
+		writeAPIError(c, http.StatusInternalServerError, "provider request could not be prepared", "server_error", nil, "provider_request_error") // 网关本地 Provider 配置错误。
+
 	case reliability.CategoryCanceled:
-		writeAPIError(c, http.StatusGatewayTimeout, "upstream request was canceled", "upstream_error", nil, "upstream_canceled")
+		writeAPIError(c, http.StatusGatewayTimeout, "upstream request was canceled", "upstream_error", nil, "upstream_canceled") // 非客户端断开导致的取消。
+
 	default:
-		writeAPIError(c, http.StatusBadGateway, "upstream is unavailable", "upstream_error", nil, "upstream_unavailable")
+		writeAPIError(c, http.StatusBadGateway, "upstream is unavailable", "upstream_error", nil, "upstream_unavailable") // 未分类上游错误统一返回 502。
 	}
 }

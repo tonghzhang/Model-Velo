@@ -77,6 +77,12 @@ func TestCompatibleAdapterOpenStream(t *testing.T) {
 	if string(gotRequest.body["seed"]) != "7" {
 		t.Fatalf("upstream seed = %s", gotRequest.body["seed"])
 	}
+	var streamOptions struct {
+		IncludeUsage bool `json:"include_usage"`
+	}
+	if json.Unmarshal(gotRequest.body["stream_options"], &streamOptions) != nil || !streamOptions.IncludeUsage {
+		t.Fatalf("upstream stream_options = %s, want include_usage=true", gotRequest.body["stream_options"])
+	}
 
 	first, err := stream.Next()
 	if err != nil {
@@ -141,9 +147,15 @@ func TestChatEventStreamBoundaries(t *testing.T) {
 		err  error
 	}{
 		{name: "invalid JSON", body: "data: not-json\n\n", err: ErrInvalidStream},
+		{
+			name: "invalid UTF-8",
+			body: "data: {\"choices\":[{\"delta\":{\"content\":\"\xff\"}}]}\n\n",
+			err:  ErrInvalidStream,
+		},
 		{name: "error envelope", body: `data: {"error":{"message":"nope"}}` + "\n\n", err: ErrInvalidStream},
 		{name: "missing delta", body: `data: {"choices":[{}]}` + "\n\n", err: ErrInvalidStream},
 		{name: "oversized line", body: "data: " + strings.Repeat("x", maxStreamLineBytes) + "\n\n", err: ErrResponseTooLarge},
+		{name: "fake done token", body: "data: [DONE] trailing\n\n", err: ErrInvalidStream},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -166,6 +178,53 @@ func TestChatEventStreamBoundaries(t *testing.T) {
 	if _, err := stream.Next(); !errors.Is(err, io.EOF) {
 		t.Fatalf("heartbeat-only Next() error = %v, want EOF", err)
 	}
+
+	t.Run("unbounded line is rejected at the configured limit", func(t *testing.T) {
+		stream, err := newChatEventStream(endlessStreamBody{})
+		if err != nil {
+			t.Fatalf("newChatEventStream() error = %v", err)
+		}
+		defer stream.Close()
+
+		if _, err := stream.Next(); !errors.Is(err, ErrResponseTooLarge) {
+			t.Fatalf("Next() error = %v, want %v", err, ErrResponseTooLarge)
+		}
+	})
+
+	t.Run("multi-line event is bounded", func(t *testing.T) {
+		value := strings.Repeat("x", 700<<10)
+		body := "data: " + value + "\n" +
+			"data: " + value + "\n" +
+			"data: " + value + "\n\n"
+		stream, err := newChatEventStream(io.NopCloser(strings.NewReader(body)))
+		if err != nil {
+			t.Fatalf("newChatEventStream() error = %v", err)
+		}
+		defer stream.Close()
+
+		if _, err := stream.Next(); !errors.Is(err, ErrResponseTooLarge) {
+			t.Fatalf("Next() error = %v, want %v", err, ErrResponseTooLarge)
+		}
+	})
+
+	t.Run("done text inside JSON is not a terminator", func(t *testing.T) {
+		body := "data: {\"choices\":[{\"delta\":{\"content\":\"[DONE]\"}}]}\n\n" +
+			"data: [DONE]\n\n"
+		stream, err := newChatEventStream(io.NopCloser(strings.NewReader(body)))
+		if err != nil {
+			t.Fatalf("newChatEventStream() error = %v", err)
+		}
+		defer stream.Close()
+
+		event, err := stream.Next()
+		if err != nil || event.Done || !strings.Contains(string(event.Data), `"[DONE]"`) {
+			t.Fatalf("content event = %#v, error = %v", event, err)
+		}
+		done, err := stream.Next()
+		if err != nil || !done.Done {
+			t.Fatalf("done event = %#v, error = %v", done, err)
+		}
+	})
 }
 
 func TestCompatibleAdapterStreamCancellation(t *testing.T) {
@@ -219,4 +278,17 @@ func streamTestAdapterAndInput(t *testing.T, baseURL string) (*compatibleChatAda
 		t.Fatalf("ParseChatRequest() error = %v", err)
 	}
 	return adapter, ChatInput{RequestID: "stream-test-id", Request: request}
+}
+
+type endlessStreamBody struct{}
+
+func (endlessStreamBody) Read(buffer []byte) (int, error) {
+	for index := range buffer {
+		buffer[index] = 'x'
+	}
+	return len(buffer), nil
+}
+
+func (endlessStreamBody) Close() error {
+	return nil
 }

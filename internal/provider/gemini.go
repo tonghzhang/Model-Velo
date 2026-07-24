@@ -153,6 +153,8 @@ func decodeGeminiResponse(body []byte, model string, requestID string) ([]byte, 
 			PromptTokens     *int `json:"promptTokenCount"`
 			CompletionTokens *int `json:"candidatesTokenCount"`
 			TotalTokens      *int `json:"totalTokenCount"`
+			CachedTokens     *int `json:"cachedContentTokenCount"`
+			ThoughtTokens    *int `json:"thoughtsTokenCount"`
 		} `json:"usageMetadata"`
 	}
 	if err := json.Unmarshal(body, &response); err != nil || len(response.Candidates) == 0 {
@@ -189,6 +191,8 @@ func decodeGeminiResponse(body []byte, model string, requestID string) ([]byte, 
 	var usage *completionUsage
 	if response.Usage != nil {
 		usage = newCompletionUsage(response.Usage.PromptTokens, response.Usage.CompletionTokens, response.Usage.TotalTokens)
+		usage.setInputDetails(nil, nil, response.Usage.CachedTokens, nil)
+		usage.setOutputDetails(nil, response.Usage.ThoughtTokens)
 	}
 	return encodeCompletion(response.ResponseID, requestID, model, text.String(), finishReason, usage)
 }

@@ -1,6 +1,6 @@
 # Model-Velo
 
-Model-Velo 是一个用 Go 和 Gin 编写的 OpenAI-compatible LLM 网关。目前已经进入阶段 4：非流式与 SSE Chat Completions、PostgreSQL 鉴权、Redis 租户限流、Exact Response Cache、有序 Route Plan 和多 Provider 可靠性运行时已经接入请求链。
+Model-Velo 是一个用 Go 和 Gin 编写的 OpenAI-compatible LLM 网关。目前已经进入阶段 5：非流式与 SSE Chat Completions、PostgreSQL 鉴权、Redis 租户限流、Exact Response Cache、有序 Route Plan、多 Provider 可靠性运行时，以及异步 Usage 数据链路已经接入。
 
 ## 当前已经实现
 
@@ -15,7 +15,7 @@ Model-Velo 是一个用 Go 和 Gin 编写的 OpenAI-compatible LLM 网关。目�
 - 使用 `httptest.Server` 的本地测试，不调用真实付费 API；
 - 固定版本的 PostgreSQL、Redis Compose 配置；
 - 基于 GORM 的 PostgreSQL 连接、启动 Ping、连接池配置和退出关闭；
-- 启动时通过 GORM `AutoMigrate` 同步租户、API Key 和模型授权三张表；
+- 启动时通过 GORM `AutoMigrate` 同步租户、API Key、模型授权和 Usage Event 四张表；
 - Model-Velo API Key 随机生成、摘要查找、HMAC 校验、过期判断、禁用和吊销；
 - `model-velo-admin` 本地管理命令，可初始化租户、模型授权和首个 API Key；
 - Gin Bearer 认证中间件、请求身份 Context 和租户模型授权检查；
@@ -36,10 +36,21 @@ Model-Velo 是一个用 Go 和 Gin 编写的 OpenAI-compatible LLM 网关。目�
 - 非流式文本与 VLM `text`/`image_url` 内容：兼容协议原样透传，原生协议转换并归一化响应；
 - 流式预提交可靠性链：每次按 Breaker→Queue→Key→Adapter 建流并验证首事件，候选内支持有限 Retry，耗尽后按 Route Plan 有序 Fallback；最终 PreparedStream 持有成功流资源和完整安全 Trail，直到显式结束。
 - OpenAI-compatible 客户端 SSE：有效首事件后才提交 Header，逐事件同步 Write/Flush，正常转发 `[DONE]`，客户端断开会取消上游并释放 Queue。
+- Usage Event schema v2：记录 request、tenant、API Key ID、请求与实际模型、缓存、可靠性计数、详细 token、usage 来源、finish reason、TTFT、稳定终态和 UTC 延迟；原始 usage 子对象最多保留 64 KiB，不记录 Key Secret、提示词或完整上游响应；
+- OpenAI-compatible 流请求默认合并 `stream_options.include_usage=true`；Provider 返回的缓存读写、音频、图像、推理和预测 token 会进入统一明细；
+- 版本化价目表按 Provider、模型和事件时间生成不可变成本快照；Provider 明确上报的 USD 成本优先，缓存命中成本为已知零，无法定价时成本保持 `NULL` 而不是伪造零；
+- API 使用环境隔离的 Redis Stream 执行有界超时 `XADD`，投递失败不会反向改写客户端响应；
+- 独立 `model-velo-usage-worker` 使用 consumer group、`XREADGROUP`、`XAUTOCLAIM`、dead-letter 和 Context-aware 退避；
+- PostgreSQL `usage_events.event_id` 主键与 `ON CONFLICT DO NOTHING` 提供幂等最终防线，数据库成功后才在 Redis 事务中执行 `XACK + XDEL`；
+- 认证后的租户可查询 Usage 明细、汇总和时间序列；Worker 自动执行分批保留期清理，管理命令支持历史成本重算。
 
-Usage 数据链路尚未实现。SSE 请求强制上游 `stream=true`，校验状态码与 `text/event-stream`，有界解析 `data:`/心跳/多行事件并识别 `[DONE]`。首事件前的 5xx、非 SSE、超时、EOF、坏 Chunk 和取消会沿用可靠性分类，可 Retry/Fallback，并在下一次尝试前释放资源；预提交总预算不会成为成功长流的上游 deadline。首事件提交后禁止切换 Provider，后续失败只安全记录并结束当前流。上游 heartbeat 注释当前不向客户端透传；每次只同步处理一个最大 2 MiB 的事件，不创建无界 Chunk 队列。流式 Server 写超时的长期连接调整仍待完成。
+Usage 链路采用 **at-least-once + 数据库幂等**，不宣称 exactly-once。API 只生成和投递一个稳定 `event_id`；Worker 只有在 PostgreSQL 写入成功后才 ACK。数据库成功但 Redis 事务响应丢失时，消息要么仍在 pending 并在重投时命中唯一事件 ID，要么已完成 ACK/删除且数据库行已经存在；Worker 消失前未 ACK 的事件由 `XAUTOCLAIM` 恢复，坏版本/坏载荷达到阈值后进入有长度上限的 dead-letter Stream。主 Stream 不按长度裁剪未处理消息，正常处理后立即删除，因此它保存的是当前积压而不是永久归档。Redis 在 `XADD` 前不可用时事件仍可能丢失，这是在线响应不被 Usage 故障无限阻塞的明确取舍。
+
+SSE 请求强制上游 `stream=true`，校验状态码与 `text/event-stream`，有界解析 `data:`/心跳/多行事件并识别 `[DONE]`。首事件前的 5xx、非 SSE、超时、EOF、坏 Chunk 和取消会沿用可靠性分类，可 Retry/Fallback，并在下一次尝试前释放资源；预提交总预算不会成为成功长流的上游 deadline。首事件提交后禁止切换 Provider，后续失败只安全记录并结束当前流。上游 heartbeat 注释当前不向客户端透传，但会重置事件空闲计时器；每次只同步处理一个最大 2 MiB 的事件，不创建无界 Chunk 队列。首事件验证成功后会清除当前 SSE 响应继承的 Server 总写截止时间，每个客户端帧仍有独立 15 秒 Write/Flush 截止时间，后续事件静默上限复用该 Provider 的 `attempt_timeout`。
 
 阶段 3 的生产功能、合并故障矩阵、全量测试、vet 和独立性复查已经完成；Breaker、Queue、Key 并发用例也已通过普通执行，但 race detector 仍被本机 Go/race 工具链阻止，因此不能宣称 race 已通过。详细证据见 `STAGE3_GATE.md`。
+
+阶段 5 的 Usage v2 生产链和真实 Redis/PostgreSQL 集成门禁已经通过；当前 PATH 没有 GCC，`go test -race` 在 `runtime/cgo` 编译前失败，因此阶段 5 race 与最终门禁仍保留，不能宣称 race 已通过。详细证据见 `STAGE5_GATE.md`。
 
 当前请求会按 Route Plan 顺序执行候选；每个候选内部在策略允许时进行有限 Retry，耗尽后只有具备 Fallback 信号的失败才进入下一候选。合法请求所需的能力不被当前 Provider 支持时会直接尝试下一候选，不消耗 Retry，也不计入 Breaker；所有候选都不支持时返回 `400 unsupported_provider_capability`。`POST /v1/chat/completions` 必须携带有效的 Model-Velo API Key，请求模型必须存在于该租户的模型授权表，并依次通过租户限流和 Route Plan；缓存未命中后，每次 Provider 调用都会重新取得目标 Provider 的 Breaker Permit、Queue 槽位和可用 Provider Key。`GET /healthz` 保持公开。
 
@@ -62,6 +73,18 @@ OpenAI、Mistral、DeepSeek、xAI、Zhipu、Groq、NVIDIA 和 Together 均由各
 工具调用和 `developer`/`tool` 角色仅在采用 OpenAI Chat 报文、且模型显式声明 `tools` 的候选上原样透传；当前原生转换器不会伪造工具调用支持。音频、视频和不同厂商的私有扩展仍不保证。Anthropic Adapter 支持 URL/base64 图片；Gemini、Ollama 和 Bedrock 当前要求 `data:*;base64` 图片；OpenAI/Azure/Mistral/xAI 等 Chat 协议按模型声明处理 `image_url`。Adapter 已知无法表达某种输入时会报告能力不匹配并触发 Fallback；上游模型自身的实际模态能力仍由厂商响应决定。
 
 成功时，兼容协议响应在通过 2xx、Content-Type、大小、错误信封和非空 Chat `choices[].message` 检查后原样返回；原生协议响应会转换为非流式 OpenAI Chat Completion。原生响应缺少 Usage 时省略 `usage`，不会伪造全零计费数据；出现当前无法表示的非文本输出时明确失败并按策略 Fallback。
+
+## Usage 查询与成本
+
+以下接口位于认证后的 `/v1` 路由组，并同时强制 tenant ID 与当前 API Key ID，普通模型 Key 不能读取同租户其他 Key 的账单或审计数据：
+
+- `GET /v1/usage/events`：游标分页明细，支持 `start`、`end`、`model`、`provider`、`api_key_id`、`request_id`、`status`、`cache_status`、`stream`、`limit` 和 `include_raw`；
+- `GET /v1/usage/summary`：请求、成功/失败、缓存、token、已知/未知成本、延迟、TTFT 和重试/Fallback 汇总，`group_by` 支持 `model`、`provider`、`status`、`cache`、`api_key`；
+- `GET /v1/usage/series`：按 `hour`、`day`、`week`、`month` 或 `year` 返回时间序列，并接受 IANA timezone。
+
+`api_key_id` 省略时自动使用当前 Key，显式值也只能等于当前 Key；项目尚未定义管理员 Scope，因此不会默认开放租户级跨 Key 查询。默认查询最近 30 天，单次范围最多 366 天，明细每页最多 200 条，分组最多返回 1000 组并显式标记截断。所有响应带 `Cache-Control: no-store`。成本以整数 nanoUSD 存储与聚合，接口同时返回精确十进制 USD 字符串；未知价格、缺失 usage 或无法覆盖早期失败 attempt 时会保留 caveat。
+
+历史 schema v1 没有 API Key ID，Worker 仍能可靠消费和存储，但它不能被安全归属到某一把 Key，因此不会出现在普通 Key 的 HTTP 查询中；可通过 PostgreSQL 管理通道或带 tenant 条件的 `reprice-usage` 处理。系统不会为了补齐归属而猜测或把 v1 数据暴露给整个租户。
 
 ## 配置
 
@@ -98,6 +121,21 @@ OpenAI、Mistral、DeepSeek、xAI、Zhipu、Groq、NVIDIA 和 Together 均由各
 | `MODEL_VELO_RATE_LIMIT_FAILURE_POLICY` | 否 | `fail-closed` | Redis 运行时失败时，`fail-closed` 返回 503；`fail-open` 标记绕过并继续 Provider。 |
 | `MODEL_VELO_CACHE_TTL` | 否 | `5m` | Exact Cache 保存时间，范围 `1s`–`24h`；`0` 或 `off` 禁用缓存。 |
 | `MODEL_VELO_CACHE_ROUTE_VERSION` | 否 | `routes-v1` | 1–64 位路由语义版本；切换上游或模型映射时必须修改，使旧缓存自然失效。 |
+| `MODEL_VELO_USAGE_EMIT_TIMEOUT` | 否 | `200ms` | API 在请求结束后投递 Usage Event 的独立短超时。 |
+| `MODEL_VELO_USAGE_GROUP` | 否 | `model-velo-usage-workers` | Usage Worker consumer group。 |
+| `MODEL_VELO_USAGE_CONSUMER` | 否 | `<hostname>-<pid>` | 当前 Worker consumer 名；同组并发进程应不同。 |
+| `MODEL_VELO_USAGE_BATCH_SIZE` | 否 | `50` | 每次读取或认领的最大消息数。 |
+| `MODEL_VELO_USAGE_READ_BLOCK` | 否 | `2s` | 空 Stream 上 `XREADGROUP` 的阻塞时间。 |
+| `MODEL_VELO_USAGE_CLAIM_IDLE` | 否 | `30s` | pending 消息允许被其他 Worker 认领前的空闲时间。 |
+| `MODEL_VELO_USAGE_MAX_DELIVERIES` | 否 | `5` | 坏版本/坏载荷进入 dead-letter 前的最大投递次数。 |
+| `MODEL_VELO_USAGE_RETRY_BACKOFF` | 否 | `500ms` | Redis 读取/认领失败后的 Context-aware 退避。 |
+| `MODEL_VELO_USAGE_WORKER_TIMEOUT` | 否 | `10s` | 单批写库与关闭收尾共享的最大处理时间。 |
+| `MODEL_VELO_USAGE_DEAD_LETTER_MAX_LEN` | 否 | `100000` | dead-letter Stream 的近似长度上限；旧 `MODEL_VELO_USAGE_STREAM_MAX_LEN` 仍兼容，但不能与新变量同时设置。 |
+| `MODEL_VELO_USAGE_ENFORCE_STREAM` | 否 | `true` | 对 OpenAI-compatible 流请求强制合并 `stream_options.include_usage=true`；仅在确认自定义上游不兼容时关闭。 |
+| `MODEL_VELO_USAGE_RETENTION_DAYS` | 否 | `90` | PostgreSQL Usage 保留天数，范围 0–3650；`0` 禁用自动清理。 |
+| `MODEL_VELO_USAGE_MAINTENANCE_INTERVAL` | 否 | `1h` | Worker 执行保留期清理的间隔。 |
+| `MODEL_VELO_USAGE_MAINTENANCE_BATCH_SIZE` | 否 | `1000` | 单次删除批量，Worker 会在维护超时内持续分批清理。 |
+| `MODEL_VELO_USAGE_PRICING_JSON` | 否 | `[]` | 版本化 USD/百万 token 价目表；支持生效时间、缓存、音频、图像和推理 token 专属费率，最大 256 KiB。 |
 | `MODEL_VELO_ROUTING_JSON` | API 必填 | 无 | 显式定义任意数量的 Provider、厂商预设、模型能力、Provider 级运行参数、精确/默认路由和有序候选；只配置一个 Provider 时也不能省略。 |
 | `MODEL_VELO_BREAKER_FAILURE_THRESHOLD` | 否 | `5` | 连续可计数失败达到此值后 Open，范围 1–1000。 |
 | `MODEL_VELO_BREAKER_OPEN_DURATION` | 否 | `30s` | Open 冷却时间，范围 `1s`–`10m`。 |
@@ -113,7 +151,13 @@ OpenAI、Mistral、DeepSeek、xAI、Zhipu、Groq、NVIDIA 和 Together 均由各
 | `MODEL_VELO_REQUEST_TIMEOUT` | 否 | `45s` | Cache miss 后 Retry 与全部 Fallback 候选共享的执行预算，范围 `1s`–`5m`。 |
 | `MODEL_VELO_ATTEMPT_TIMEOUT` | 否 | `20s` | 非流式单次调用或流式建连+首事件等待期限，至少 `100ms` 且不得超过 Provider 执行总预算。 |
 
-上游 `http.Client` 不再维护第三套总超时。非流式调用服从 Attempt Context 和父级请求预算；流式调用在首事件前同时受 Attempt Timeout 与父 Context 约束，首事件验证通过后不再沿用短 Attempt deadline，只保留父 Context 取消。流式空闲保护和 Server 写超时调整尚未完成。非流式 HTTP Server 的写超时由请求预算加 15 秒前置处理/收尾余量派生，避免静态 Server 超时先于可靠性层截断响应。
+价目使用十进制字符串，避免浮点配置误差；同一个 Provider/模型的生效时间窗口不能重叠。`provider` 或 `model` 可用 `*` 作为启动时已知的回退价格：
+
+```powershell
+$env:MODEL_VELO_USAGE_PRICING_JSON = '[{"provider":"openai-main","model":"gpt-4o-mini","version":"openai-2026-07","effective_from":"2026-07-01T00:00:00Z","input_usd_per_million":"0.15","output_usd_per_million":"0.60","cached_read_usd_per_million":"0.075"}]'
+```
+
+上游 `http.Client` 不再维护第三套总超时。非流式调用服从 Attempt Context 和父级请求预算；流式调用在首事件前同时受 Attempt Timeout 与父 Context 约束，首事件验证通过后不再沿用短 Attempt deadline，但后续两个有效事件之间仍复用当前 Provider 的 Attempt Timeout 作为静默上限，上游 heartbeat 会重置计时器。非流式 HTTP Server 的写超时由请求预算加 15 秒前置处理/收尾余量派生；流式 Handler 只在首事件验证后清除该总写截止时间，并为每个客户端帧设置独立 15 秒写截止时间，避免长流被总时长截断或慢客户端无限阻塞。
 
 ### Provider 厂商预设
 
@@ -269,7 +313,7 @@ model-velo:response-cache:v1:<environment>:tenant:<tenant_sha256>:model:<model_s
 
 Key 不包含原始 API Key、tenant ID、模型名或提示词。规范化会递归排序 JSON 对象字段，并保留数组顺序、数字文本以及“字段缺失/显式给值”的区别；因此消息、工具和生成参数顺序不会被错误改写。包含重复对象字段的 JSON 直接绕过缓存，避免不同解析规则造成碰撞。
 
-命中返回 Redis 中的完整合法 JSON；未命中只在首候选返回完整成功 JSON 后回填。Fallback 成功、上游错误、响应读取失败、客户端取消和显式绕过均不写缓存，避免临时降级结果覆盖正常路由语义。Redis 读写错误只记录 request ID 和安全错误，不记录 tenant、模型、Key 或提示词，并继续 Provider；响应通过 `X-Model-Velo-Cache: HIT|MISS|BYPASS` 表达本次状态，内部也保留同一状态供后续 Usage 使用。
+命中返回 Redis 中的完整合法 JSON；未命中只在首候选返回完整成功 JSON 后回填。Fallback 成功、上游错误、响应读取失败、客户端取消和显式绕过均不写缓存，避免临时降级结果覆盖正常路由语义。Redis 读写错误只记录 request ID 和安全错误，不记录 tenant、模型、Key 或提示词，并继续 Provider；响应通过 `X-Model-Velo-Cache: HIT|MISS|BYPASS` 表达本次状态，最终 Usage Event 也记录同一状态。
 
 `MODEL_VELO_CACHE_ROUTE_VERSION` 只属于缓存命名空间，并以摘要进入缓存 Key。更换上游、模型映射或候选顺序时必须递增它，避免新路由命中旧响应。2026-07-18 真实 Redis 8.8.0 综合用例已验证跨请求命中、TTL、租户/参数隔离、错误不缓存和关闭 Client 后的故障降级；测试使用无持久卷的一次性容器并已自动清理。
 
@@ -390,6 +434,7 @@ Authorization: Bearer mvl_<locator>_<secret>
 8. 命中直接返回；未命中或缓存故障时，在统一总预算内按候选顺序执行 Attempt；
 9. 每个候选重新选择对应 Adapter、Breaker、Queue 和 Key，在候选内有限 Retry；允许 Fallback 的最终失败才进入下一候选；
 10. 首个完整成功 JSON 回填缓存并返回客户端；普通 400、取消或候选耗尽返回结构化错误。
+11. 请求终态由 Collector finalize 一次，并在独立短超时内投递 Usage Event；流式请求在 `[DONE]`、取消或提交后中断时分别记录终态。
 
 未知 Key、错误 secret、禁用、吊销、过期和禁用租户对客户端统一返回 `401 invalid_api_key`，避免暴露具体凭证状态。到期时刻本身已经算过期，创建 Key 时也只接受严格晚于当前时刻的 UTC 时间。缺少模型授权返回 `403 model_not_allowed`。认证数据库故障返回 `503 authentication_unavailable`，不会退化成匿名请求。
 
@@ -409,6 +454,25 @@ $env:MODEL_VELO_REDIS_ADDR = "localhost:6379"
 $env:MODEL_VELO_REDIS_PASSWORD = "replace-with-local-redis-password"
 $env:MODEL_VELO_RATE_LIMIT_FAILURE_POLICY = "fail-closed"
 go run ./cmd/model-velo
+```
+
+Usage Worker 与 API 使用相同的 PostgreSQL、Redis 和 `MODEL_VELO_ENVIRONMENT`，但作为独立进程运行：
+
+```powershell
+go run ./cmd/model-velo-usage-worker
+```
+
+Worker 启动会幂等创建 consumer group。数据库写入失败不 ACK；收到退出信号后停止新读取，并给当前批次最多 `MODEL_VELO_USAGE_WORKER_TIMEOUT` 完成。生产环境应为每个并发 Worker 设置不同的 `MODEL_VELO_USAGE_CONSUMER`，或使用默认的主机名与 PID。
+
+价目新增或修正后，可显式重算缺少成本的历史记录。命令要求确认、限制时间范围和单批数量，不会把无法定价的记录写成零；输出非空 `next_cursor` 时，把它传给下一批即可越过当前批次中仍无法定价的行：
+
+```powershell
+go run ./cmd/model-velo-admin reprice-usage `
+  --start 2026-07-01T00:00:00Z `
+  --end 2026-08-01T00:00:00Z `
+  --missing-only=true `
+  --limit 1000 `
+  --confirm
 ```
 
 请求示例：

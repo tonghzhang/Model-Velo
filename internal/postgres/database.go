@@ -71,6 +71,7 @@ func (database *Database) SyncSchema(ctx context.Context) error {
 		&Tenant{},
 		&APIKey{},
 		&TenantModelGrant{},
+		&UsageEvent{},
 	); err != nil {
 		return fmt.Errorf("sync PostgreSQL schema: %w", err)
 	}

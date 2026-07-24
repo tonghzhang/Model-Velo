@@ -192,4 +192,4 @@ Model-Velo 是一个使用 **Go、Gin、GORM、Redis、PostgreSQL** 实现的 Op
 
 ## 9. 当前边界
 
-用户已于 2026-07-23 明确允许进入阶段 4。阶段 3 的生产链与非 race 门禁已经完成，Breaker、Queue 和 Key 的 3 个 race 证据项仍因本机 Go/race 工具链阻塞而保留。阶段 4 已完成兼容上游 `StreamingAdapter`、有界 SSE 解析、首事件缓冲、候选内有限 Retry、候选间有序 Fallback，以及公开 `stream=true` 的 Header/Flush、`[DONE]`、提交后禁止切换 Provider 和客户端取消传播。流式 Handler 绕过 Exact Cache，并以同步写入保持有界背压。下一步处理长流 Server 超时与 SSE 格式攻击矩阵，再进行可执行的阶段 4 门禁；未经用户明确确认不得进入阶段 5 或实现 Usage Worker。
+用户已于 2026-07-24 明确要求把阶段 5 Usage 补到生产工具级别。阶段 4 的生产边界与非 race 门禁已经完成，race 仍因当前 PATH 没有 GCC 而在 `runtime/cgo` 编译前失败；运行已准备的便携 MinGW-w64 GCC 需要用户单独明确授权。阶段 5 已完成兼容 v1 的 Usage Event v2、详细/流式 token、usage 来源、TTFT、版本化成本快照、租户/API Key 隔离查询、历史重算、保留期、Redis Stream Emitter、独立 Usage Worker、consumer group、PostgreSQL `event_id` 幂等写入、落库后 XACK+XDEL、XAUTOCLAIM、毒消息 dead-letter 和有界关闭，并在隔离 Redis/PostgreSQL 上通过 schema、成本、查询、重算、保留期、重复投递与恢复测试。Usage 明确采用 at-least-once，不宣称 exactly-once；未知价格保持 NULL。当前只剩 race 与阶段 5 最终门禁；未经用户明确确认不得进入阶段 6。

@@ -307,6 +307,8 @@ func newStage3Harness(
 			queues,
 			keys,
 			retry,
+			&recordingUsageEmitter{},
+			emptyUsageReader{},
 		),
 		breakers: breakers,
 		queues:   queues,

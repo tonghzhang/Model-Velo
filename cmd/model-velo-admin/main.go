@@ -13,6 +13,7 @@ import (
 	"model-velo/internal/apikey"
 	"model-velo/internal/config"
 	"model-velo/internal/postgres"
+	"model-velo/internal/usage"
 )
 
 func main() {
@@ -31,11 +32,6 @@ func run(ctx context.Context, arguments []string) error {
 	if err != nil {
 		return fmt.Errorf("configure PostgreSQL: %w", err)
 	}
-	security, err := config.LoadAPIKeySecurity()
-	if err != nil {
-		return fmt.Errorf("configure API key security: %w", err)
-	}
-
 	database, err := postgres.Open(ctx, postgresSettings)
 	if err != nil {
 		return fmt.Errorf("connect PostgreSQL: %w", err)
@@ -45,7 +41,14 @@ func run(ctx context.Context, arguments []string) error {
 	if err := database.SyncSchema(ctx); err != nil {
 		return err
 	}
+	if arguments[0] == "reprice-usage" {
+		return repriceUsage(ctx, database, arguments[1:])
+	}
 
+	security, err := config.LoadAPIKeySecurity()
+	if err != nil {
+		return fmt.Errorf("configure API key security: %w", err)
+	}
 	manager, err := apikey.NewManager(database.ORM(), security.Pepper)
 	if err != nil {
 		return err
@@ -63,6 +66,69 @@ func run(ctx context.Context, arguments []string) error {
 	default:
 		return usageError()
 	}
+}
+
+func repriceUsage(ctx context.Context, database *postgres.Database, arguments []string) error {
+	flags := flag.NewFlagSet("reprice-usage", flag.ContinueOnError)
+	startText := flags.String("start", time.Now().UTC().Add(-30*24*time.Hour).Format(time.RFC3339), "inclusive RFC3339 start")
+	endText := flags.String("end", time.Now().UTC().Format(time.RFC3339), "exclusive RFC3339 end")
+	tenantID := flags.String("tenant-id", "", "optional tenant UUID")
+	providerID := flags.String("provider", "", "optional provider ID")
+	model := flags.String("model", "", "optional gateway model")
+	missingOnly := flags.Bool("missing-only", true, "only fill records without known cost")
+	limit := flags.Int("limit", 1000, "maximum records to process")
+	cursor := flags.String("cursor", "", "opaque cursor returned by a previous batch")
+	confirm := flags.Bool("confirm", false, "confirm stored cost updates")
+	if err := flags.Parse(arguments); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return usageError()
+	}
+	if !*confirm {
+		return errors.New("reprice-usage requires --confirm")
+	}
+	start, err := time.Parse(time.RFC3339, strings.TrimSpace(*startText))
+	if err != nil {
+		return errors.New("reprice-usage start must be RFC3339")
+	}
+	end, err := time.Parse(time.RFC3339, strings.TrimSpace(*endText))
+	if err != nil {
+		return errors.New("reprice-usage end must be RFC3339")
+	}
+	settings, err := config.LoadUsage()
+	if err != nil {
+		return fmt.Errorf("configure usage: %w", err)
+	}
+	pricing, err := usage.NewPricingCatalog(settings.Pricing)
+	if err != nil {
+		return fmt.Errorf("configure usage pricing: %w", err)
+	}
+	store, err := usage.NewStore(database.ORM(), pricing)
+	if err != nil {
+		return err
+	}
+	result, err := store.Reprice(ctx, usage.RepriceParams{
+		TenantID:    *tenantID,
+		Start:       start,
+		End:         end,
+		ProviderID:  *providerID,
+		Model:       *model,
+		MissingOnly: *missingOnly,
+		Limit:       *limit,
+		Cursor:      *cursor,
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Printf(
+		"matched=%d\npriced=%d\nunknown=%d\nnext_cursor=%s\n",
+		result.Matched,
+		result.Priced,
+		result.Unknown,
+		result.NextCursor,
+	)
+	return nil
 }
 
 func bootstrapTenant(ctx context.Context, manager *apikey.Manager, arguments []string) error {
@@ -182,6 +248,6 @@ func printIssuedKey(issued apikey.IssuedKey) {
 
 func usageError() error {
 	return errors.New(
-		"usage: model-velo-admin <bootstrap-tenant|create-key|revoke-key|disable-key> [flags]",
+		"usage: model-velo-admin <bootstrap-tenant|create-key|revoke-key|disable-key|reprice-usage> [flags]",
 	)
 }

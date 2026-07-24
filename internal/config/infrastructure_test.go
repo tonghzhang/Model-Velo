@@ -44,6 +44,71 @@ func TestLoadInfrastructureDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadUsage(t *testing.T) {
+	t.Setenv(environmentEnv, "test")
+	t.Setenv(usageDeadLetterMaxLenEnv, "")
+	t.Setenv(legacyUsageMaxLenEnv, "")
+	t.Setenv(usageEmitTimeoutEnv, "")
+	t.Setenv(usageGroupEnv, "test-group")
+	t.Setenv(usageConsumerEnv, "test-consumer")
+	t.Setenv(usageBatchSizeEnv, "")
+	t.Setenv(usageReadBlockEnv, "")
+	t.Setenv(usageClaimIdleEnv, "")
+	t.Setenv(usageMaxDeliveriesEnv, "")
+	t.Setenv(usageRetryBackoffEnv, "")
+	t.Setenv(usageWorkerTimeoutEnv, "")
+	t.Setenv(usageEnforceStreamEnv, "")
+	t.Setenv(usageRetentionDaysEnv, "")
+	t.Setenv(usageMaintenanceEnv, "")
+	t.Setenv(usageMaintenanceBatchEnv, "")
+	t.Setenv(usagePricingJSONEnv, "")
+
+	got, err := LoadUsage()
+	if err != nil {
+		t.Fatalf("LoadUsage() error = %v", err)
+	}
+	if got.StreamKey != "model-velo:usage:v1:test" ||
+		got.DeadLetterKey != "model-velo:usage:v1:test:dead-letter" {
+		t.Fatalf("usage stream keys = %q / %q", got.StreamKey, got.DeadLetterKey)
+	}
+	if got.DeadLetterMaxLen != defaultDeadLetterMaxLen ||
+		got.BatchSize != defaultUsageBatchSize ||
+		got.MaxDeliveries != defaultUsageDeliveries {
+		t.Fatalf("usage counts = %#v", got)
+	}
+	if got.EmitTimeout != defaultUsageEmitTimeout ||
+		got.ReadBlock != defaultUsageReadBlock ||
+		got.ClaimIdle != defaultUsageClaimIdle ||
+		got.RetryBackoff != defaultUsageRetryBackoff ||
+		got.WorkerTimeout != defaultUsageWorkerTimeout ||
+		got.MaintenanceInterval != defaultMaintenance {
+		t.Fatalf("usage durations = %#v", got)
+	}
+	if !got.EnforceStreamUsage ||
+		got.RetentionDays != defaultUsageRetention ||
+		got.MaintenanceBatch != defaultMaintenanceBatch ||
+		len(got.Pricing) != 0 {
+		t.Fatalf("usage production defaults = %#v", got)
+	}
+
+	t.Setenv(usagePricingJSONEnv, `[{"provider":"openai","model":"gpt-test","version":"2026-07","input_usd_per_million":"1.25","output_usd_per_million":"5"}]`)
+	configured, err := LoadUsage()
+	if err != nil {
+		t.Fatalf("LoadUsage(pricing) error = %v", err)
+	}
+	if len(configured.Pricing) != 1 ||
+		configured.Pricing[0].Version != "2026-07" ||
+		configured.Pricing[0].InputUSDPerMillion != "1.25" {
+		t.Fatalf("usage pricing = %#v", configured.Pricing)
+	}
+
+	t.Setenv(usageDeadLetterMaxLenEnv, "200")
+	t.Setenv(legacyUsageMaxLenEnv, "100")
+	if _, err := LoadUsage(); err == nil {
+		t.Fatal("LoadUsage() accepted current and legacy dead-letter limits together")
+	}
+}
+
 func TestLoadInfrastructureConfigured(t *testing.T) {
 	setRequiredInfrastructureEnv(t)
 	t.Setenv(postgresMaxOpenConnsEnv, "24")

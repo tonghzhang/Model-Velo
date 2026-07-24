@@ -7,10 +7,11 @@ import (
 
 // AdapterConfig 是构造单个 Provider Adapter 所需的静态配置。
 type AdapterConfig struct {
-	ProviderID string
-	Protocol   string
-	BaseURL    string
-	HTTP       HTTPConfig
+	ProviderID         string
+	Protocol           string
+	BaseURL            string
+	HTTP               HTTPConfig
+	DisableStreamUsage bool
 }
 
 // NewAdapter 根据协议选择真实的 wire format 实现。
@@ -51,7 +52,12 @@ func NewAdapter(config AdapterConfig) (Adapter, error) {
 		ProtocolGroq,
 		ProtocolNVIDIA,
 		ProtocolTogether:
-		return newCompatibleChatAdapter(protocol, config.BaseURL, httpConfig)
+		return newCompatibleChatAdapterWithUsage(
+			protocol,
+			config.BaseURL,
+			httpConfig,
+			!config.DisableStreamUsage,
+		)
 	default:
 		return nil, fmt.Errorf("unsupported provider protocol %q", protocol)
 	}

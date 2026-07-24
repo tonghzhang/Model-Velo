@@ -25,12 +25,14 @@ func TestAdapterContracts(t *testing.T) {
 		wantHeader        string
 		wantHeaderValue   string
 		wantBodyFragments []string
+		wantResponseParts []string
 	}{
 		{
 			name: "anthropic", protocol: ProtocolAnthropic, model: "claude-test", requestBody: visionRequest,
-			responseBody: `{"id":"msg_1","model":"claude-test","stop_reason":"end_turn","content":[{"type":"text","text":"hello"}],"usage":{"input_tokens":2,"output_tokens":1}}`,
+			responseBody: `{"id":"msg_1","model":"claude-test","stop_reason":"end_turn","content":[{"type":"text","text":"hello"}],"usage":{"input_tokens":2,"output_tokens":1,"cache_read_input_tokens":3,"cache_creation_input_tokens":4}}`,
 			wantPath:     "/v1/messages", wantHeader: "x-api-key", wantHeaderValue: "test-key",
 			wantBodyFragments: []string{`"model":"claude-test"`, `"type":"image"`, `"type":"base64"`},
+			wantResponseParts: []string{`"prompt_tokens":9`, `"total_tokens":10`, `"cached_read_tokens":3`, `"cached_write_tokens":4`},
 		},
 		{
 			name: "gemini", protocol: ProtocolGemini, basePath: "/v1beta", model: "gemini-test", requestBody: visionRequest,
@@ -64,9 +66,10 @@ func TestAdapterContracts(t *testing.T) {
 		},
 		{
 			name: "bedrock", protocol: ProtocolBedrock, model: "us.test-model:0", requestBody: visionRequest,
-			responseBody: `{"output":{"message":{"role":"assistant","content":[{"text":"hello"}]}},"stopReason":"end_turn","usage":{"inputTokens":2,"outputTokens":1,"totalTokens":3}}`,
+			responseBody: `{"output":{"message":{"role":"assistant","content":[{"text":"hello"}]}},"stopReason":"end_turn","usage":{"inputTokens":2,"outputTokens":1,"totalTokens":3,"cacheReadInputTokens":3,"cacheWriteInputTokens":4}}`,
 			wantPath:     "/model/us.test-model:0/converse", wantHeader: "Authorization", wantHeaderValue: "Bearer test-key",
 			wantBodyFragments: []string{`"image":{"format":"png"`, `"bytes":"aGk="`},
+			wantResponseParts: []string{`"prompt_tokens":9`, `"total_tokens":10`, `"cached_read_tokens":3`, `"cached_write_tokens":4`},
 		},
 		{
 			name: "cloudflare", protocol: ProtocolCloudflare, basePath: "/client/v4/accounts/account", model: "@cf/meta/test-model", requestBody: textRequest,
@@ -170,6 +173,11 @@ func TestAdapterContracts(t *testing.T) {
 			}
 			if !strings.Contains(string(response), `"content":"hello"`) {
 				t.Fatalf("Complete() response = %s; want normalized chat completion", response)
+			}
+			for _, fragment := range test.wantResponseParts {
+				if !strings.Contains(string(response), fragment) {
+					t.Errorf("response body %s does not contain %s", response, fragment)
+				}
 			}
 		})
 	}

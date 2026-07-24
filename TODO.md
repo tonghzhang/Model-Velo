@@ -30,10 +30,10 @@
 | S1 最小非流式网关 | 48/50 | 进行中 | 功能检查通过且用户已授权进入 S2；race 仍被本机缺少 GCC 阻止，可解释提交尚未形成 |
 | S2 PostgreSQL、鉴权、Redis 限流与缓存 | 58/60 | 进行中 | 生产功能与真实依赖门禁已完成；用户已允许带着 race 环境缺口进入 S3，缺口仍保留 |
 | S3 路由与可靠性 | 86/90 | 进行中 | 生产链与非 race 门禁已完成；用户已允许带着 3 个 race 环境证据缺口进入 S4，缺口继续保留 |
-| S4 SSE | 31/35 | 进行中 | 客户端 SSE 主链、首事件前 Retry/Fallback、提交后边界与取消已完成；Server 超时、攻击矩阵、race 和阶段门禁待收口 |
-| S5 Usage 数据链路 | 0/45 | 未开始 | Redis Stream、Worker、PostgreSQL 幂等落库尚未实现 |
+| S4 SSE | 33/35 | 进行中 | 生产边界、长流写超时、事件空闲保护与攻击矩阵已完成；race 和阶段门禁待收口 |
+| S5 Usage 数据链路 | 50/52 | 进行中 | Usage v2 生产链和真实依赖集成已完成；race 与最终门禁受本机缺少 GCC 阻塞 |
 | S6 工程化与求职展示 | 0/75 | 未开始 | 可观测性、CI、benchmark、故障报告和展示材料尚未实现 |
-| **合计** | **233/370** | **63.0%** | 百分比只表示任务数量，不表示风险或工期完成度 |
+| **合计** | **278/370** | **75.1%** | 百分比只表示任务数量，不表示风险或工期完成度 |
 
 ## 3. S0：项目治理、仓库基线与独立性约束
 
@@ -349,7 +349,7 @@
 - [x] `S4-025` **记录提交后失败语义** — 实施：非取消的提交后失败只记录 request ID、Provider 和稳定 Category，不追加 JSON 错误；完成证据：断流响应保持已提交的 200 和部分 SSE 数据。
 - [x] `S4-026` **传播客户端断开** — 实施：客户端 Context 直接控制成功上游流，断开会中止 Next、关闭 Body 并 Finish 为取消；完成证据：真实 HTTP 客户端取消后上游 Context Done，Queue 回到零。
 - [x] `S4-027` **处理慢客户端背压** — 实施：每次最多持有一个已限制大小的事件，直接同步 Write/Flush，不创建 Chunk channel 或无界缓冲；完成证据：下一次 Next 只会在当前事件写完后发生。
-- [ ] `S4-028` **调整流式 Server 超时策略** — 实施：避免非流式 WriteTimeout 错误截断长 SSE，同时保留首 Chunk/空闲保护；完成证据：长流测试超过原 WriteTimeout 仍按设计运行。
+- [x] `S4-028` **调整流式 Server 超时策略** — 实施：首事件验证成功后清除当前 SSE 响应继承的 Server 总写截止时间，每帧 Write/Flush 使用独立 15 秒截止时间并在成功后清除；后续事件静默上限复用当前 Provider 的 `attempt_timeout`，上游心跳会重置该计时器；完成证据：真实 HTTP 测试在第二个事件晚于 40ms Server WriteTimeout 时仍完整收到 `[DONE]`，无后续事件时按 upstream timeout 释放 Queue。
 
 ### 7.4 SSE 测试与门禁
 
@@ -357,71 +357,78 @@
 - [x] `S4-030` **建立首 Chunk 前 fallback 测试** — 实施：primary 首事件为坏 JSON、secondary 返回正常流；完成证据：客户端响应只包含 secondary 首事件和 `[DONE]`。
 - [x] `S4-031` **建立提交后失败测试** — 实施：primary 首 Chunk 成功后发送坏 Chunk；完成证据：HTTP 保持 200、只保留首事件、不追加 JSON 错误且 secondary 调用为零。
 - [x] `S4-032` **建立客户端取消测试** — 实施：真实客户端读取首事件后取消 Context；完成证据：上游 Context 及时 Done，Queue active/waiting 回到零，取消不计 Breaker。
-- [ ] `S4-033` **建立 SSE 大小与格式攻击测试** — 实施：超长行、无限无换行、坏 UTF-8/JSON 和伪 `[DONE]`；完成证据：资源有界且无 panic。
-- [ ] `S4-034` **运行 SSE race/泄漏/故障测试** — 实施：并发流、取消、fallback 和 Shutdown；完成证据：race 通过且 goroutine/连接回到基线。
-- [ ] `S4-035` **完成阶段 4 门禁并等待用户确认** — 实施：同步 SSE 时序、演示预提交 fallback 与提交后失败，完成独立性检查；完成证据：文档只声明已验证能力，用户允许进入 S5。
+- [x] `S4-033` **建立 SSE 大小与格式攻击测试** — 实施：覆盖超长行、持续无换行输入、跨行超大事件、坏 UTF-8/JSON、伪 `[DONE]` 和 JSON 内容中的 `[DONE]`；完成证据：读取在 1 MiB 单行或 2 MiB 单事件边界停止，错误稳定且无 panic。
+- [ ] `S4-034` **运行 SSE race/泄漏/故障测试** — 当前：8 路并发流、取消、fallback、Shutdown、空闲超时和资源归还已通过普通执行并连续 10 次稳定；`go test -race` 使用系统 Go 1.26.0 时在测试前因缺失 `runtime/race` 失败。已准备签名有效的便携 MinGW-w64，但执行第三方 GCC 需要用户单独明确授权，因此 race 仍未完成。
+- [ ] `S4-035` **完成阶段 4 门禁并等待用户确认** — 当前：用户已经允许进入 S5，gofmt、全量测试、vet、故障矩阵、密钥扫描和独立性自动/人工复查已完成；仅 race 仍被系统 Go 缺失 `runtime/race` 阻止，详细证据见 `STAGE4_GATE.md`。
 
 ## 8. S5：Usage Event、Redis Stream 与 PostgreSQL 幂等 Worker
 
 ### 8.1 Usage 事件契约与请求生命周期
 
-- [ ] `S5-001` **确认阶段 5 目标与可靠性语义** — 实施：实现 at-least-once Usage 链路，明确不宣称 exactly-once；完成证据：用户明确允许进入 S5。
-- [ ] `S5-002` **定义 Usage Event schema 版本** — 实施：给事件结构增加版本，便于 Worker 兼容演进；完成证据：未知版本有明确处理。
-- [ ] `S5-003` **定义唯一事件 ID** — 实施：每个请求最终事件使用稳定、碰撞概率可忽略的 ID；完成证据：重投同一事件保持同 ID。
-- [ ] `S5-004` **记录 request ID 与 tenant ID** — 实施：沿请求 Context 获取，不从 Header/Key 重新推断；完成证据：事件可关联请求且不包含 API Key。
-- [ ] `S5-005` **记录请求模型和实际路由** — 实施：分别保存 requested model 与实际 Provider/model；完成证据：fallback 后数据反映最终成功/失败候选。
-- [ ] `S5-006` **记录缓存与可靠性元数据** — 实施：表达 cache hit、attempt/retry/fallback 数量；完成证据：缓存命中不伪造 Provider 调用。
-- [ ] `S5-007` **记录 Token Usage** — 实施：保存 input/output/total token，并定义上游缺失时的 unknown 语义；完成证据：不把未知写成零后误导统计。
-- [ ] `S5-008` **定义终态枚举** — 实施：至少覆盖 success、cache_hit、failed、cancelled、stream_completed、stream_interrupted；完成证据：非法状态不能静默写入。
-- [ ] `S5-009` **记录错误类别而非敏感文案** — 实施：保存稳定 error category/code；完成证据：不写 Provider Key、提示词或任意上游 Body。
-- [ ] `S5-010` **记录开始、结束和延迟** — 实施：统一 UTC 时间与 duration 单位；完成证据：结束不早于开始，测试使用 fake clock。
-- [ ] `S5-011` **验证并序列化 Usage Event** — 实施：检查必填字段、长度和数值边界后生成稳定载荷；完成证据：坏事件在 API 内部被识别。
-- [ ] `S5-012` **建立请求生命周期 Collector** — 实施：请求开始时创建、各组件补充元数据、终态只 finalize 一次；完成证据：不是在各 Handler 随意拼事件。
-- [ ] `S5-013` **生成非流式成功事件** — 实施：包含真实 Usage 和路由结果；完成证据：端到端测试断言字段。
-- [ ] `S5-014` **生成缓存命中事件** — 实施：标记 cache_hit 且 Provider attempt 为零；完成证据：统计能区分缓存节省。
-- [ ] `S5-015` **生成最终失败事件** — 实施：记录最终安全错误类别与尝试统计；完成证据：中间 Retry 不生成多个终态事件。
-- [ ] `S5-016` **生成客户端取消事件** — 实施：区分排队、上游和流式阶段的取消；完成证据：不归因 Provider 故障。
-- [ ] `S5-017` **生成流式完成/中断事件** — 实施：`[DONE]` 与提交后断开使用不同状态；完成证据：已输出部分 Chunk 的失败可追踪。
-- [ ] `S5-018` **保证每个请求至多一次 finalize** — 实施：处理 panic、重复 defer 和并发结束路径；完成证据：race 测试中不产生不同 ID 的重复终态。
+- [x] `S5-001` **确认阶段 5 目标与可靠性语义** — 实施：实现 at-least-once Usage 链路，明确不宣称 exactly-once；完成证据：用户明确允许进入 S5。
+- [x] `S5-002` **定义 Usage Event schema 版本** — 实施：给事件结构增加版本，便于 Worker 兼容演进；完成证据：未知版本有明确处理。
+- [x] `S5-003` **定义唯一事件 ID** — 实施：每个请求最终事件使用稳定、碰撞概率可忽略的 ID；完成证据：重投同一事件保持同 ID。
+- [x] `S5-004` **记录 request ID、tenant ID 与 API Key ID** — 实施：沿认证 Context 获取稳定 ID，不保存或重新解析 Key Secret；完成证据：事件可按租户和 Key 聚合且不泄漏凭证。
+- [x] `S5-005` **记录请求模型和实际路由** — 实施：分别保存 requested model 与实际 Provider/model；完成证据：fallback 后数据反映最终成功/失败候选。
+- [x] `S5-006` **记录缓存与可靠性元数据** — 实施：表达 cache hit、attempt/retry/fallback 数量；完成证据：缓存命中不伪造 Provider 调用。
+- [x] `S5-007` **记录 Token Usage** — 实施：保存 input/output/total token，并定义上游缺失时的 unknown 语义；完成证据：不把未知写成零后误导统计。
+- [x] `S5-008` **定义终态枚举** — 实施：至少覆盖 success、cache_hit、failed、cancelled、stream_completed、stream_interrupted；完成证据：非法状态不能静默写入。
+- [x] `S5-009` **记录错误类别而非敏感文案** — 实施：保存稳定 error category/code；完成证据：不写 Provider Key、提示词或任意上游 Body。
+- [x] `S5-010` **记录开始、结束和延迟** — 实施：统一 UTC 时间与 duration 单位；完成证据：结束不早于开始，测试使用 fake clock。
+- [x] `S5-011` **验证并序列化 Usage Event** — 实施：检查必填字段、长度和数值边界后生成稳定载荷；完成证据：坏事件在 API 内部被识别。
+- [x] `S5-012` **建立请求生命周期 Collector** — 实施：请求开始时创建、各组件补充元数据、终态只 finalize 一次；完成证据：不是在各 Handler 随意拼事件。
+- [x] `S5-013` **生成非流式成功事件** — 实施：包含真实 Usage 和路由结果；完成证据：端到端测试断言字段。
+- [x] `S5-014` **生成缓存命中事件** — 实施：标记 cache_hit 且 Provider attempt 为零；完成证据：统计能区分缓存节省。
+- [x] `S5-015` **生成最终失败事件** — 实施：记录最终安全错误类别与尝试统计；完成证据：中间 Retry 不生成多个终态事件。
+- [x] `S5-016` **生成客户端取消事件** — 实施：区分排队、上游和流式阶段的取消；完成证据：不归因 Provider 故障。
+- [x] `S5-017` **生成流式完成/中断事件** — 实施：`[DONE]` 与提交后断开使用不同状态；完成证据：已输出部分 Chunk 的失败可追踪。
+- [ ] `S5-018` **保证每个请求至多一次 finalize** — 当前：Collector 使用互斥状态保证并发 finalize 只成功一次，普通并发测试通过；`go test -race` 在 `runtime/cgo` 编译前因 PATH 没有 GCC 失败，因此 race 证据仍保留。
 
 ### 8.2 Redis Stream Emitter
 
-- [ ] `S5-019` **在第二种 Emitter 出现时定义接口** — 实施：生产 Redis Emitter 与测试 fake 共用最小 `Emit(ctx,event)` 能力；完成证据：接口不包含 Worker/SQL 方法。
-- [ ] `S5-020` **定义 Stream 名称与环境隔离** — 实施：配置 stream key 和命名空间；完成证据：不同环境不会消费彼此事件。
-- [ ] `S5-021` **实现 Redis XADD** — 实施：把事件作为版本化载荷或明确字段写入；完成证据：成功返回 Redis entry ID。
-- [ ] `S5-022` **设置 Stream 保留策略** — 实施：明确 MAXLEN/近似 trimming 与数据保留取舍；完成证据：配置不会无限增长且不误称持久归档。
-- [ ] `S5-023` **定义 Emitter 失败策略** — 实施：Redis 不可用时不阻塞在线请求无限等待，明确日志/指标和丢失风险；完成证据：故障测试符合文档。
-- [ ] `S5-024` **限制 Emit 超时** — 实施：取请求剩余预算或独立短超时，避免 Usage 拖慢响应；完成证据：Redis 卡顿不会越过上限。
-- [ ] `S5-025` **建立 Emitter 单元与 Redis 集成测试** — 实施：覆盖成功、序列化失败、Redis 错误、超时和 trimming；完成证据：真实 Stream 内容可被解码。
+- [x] `S5-019` **在第二种 Emitter 出现时定义接口** — 实施：生产 Redis Emitter 与测试 fake 共用最小 `Emit(ctx,event)` 能力；完成证据：接口不包含 Worker/SQL 方法。
+- [x] `S5-020` **定义 Stream 名称与环境隔离** — 实施：配置 stream key 和命名空间；完成证据：不同环境不会消费彼此事件。
+- [x] `S5-021` **实现 Redis XADD** — 实施：把事件作为版本化载荷或明确字段写入；完成证据：成功返回 Redis entry ID。
+- [x] `S5-022` **设置 Stream 保留策略** — 实施：主流不按长度裁掉 pending，数据库成功后事务执行 XACK+XDEL；dead-letter 独立限制长度；完成证据：正常流只保留积压，故障期间不因阈值静默丢未处理事件。
+- [x] `S5-023` **定义 Emitter 失败策略** — 实施：Redis 不可用时不阻塞在线请求无限等待，明确日志/指标和丢失风险；完成证据：故障测试符合文档。
+- [x] `S5-024` **限制 Emit 超时** — 实施：取请求剩余预算或独立短超时，避免 Usage 拖慢响应；完成证据：Redis 卡顿不会越过上限。
+- [x] `S5-025` **建立 Emitter 单元与 Redis 集成测试** — 实施：覆盖成功、序列化失败、Redis 错误、独立超时和消费后清理；完成证据：真实 Stream 内容可解码且落库后从主流删除。
 
 ### 8.3 PostgreSQL Usage Schema
 
-- [ ] `S5-026` **创建 Usage GORM 模型** — 实施：保存事件字段、原始 Redis entry ID/版本和处理时间；完成证据：类型、非空和状态约束明确。
-- [ ] `S5-027` **为 event ID 建立唯一约束** — 实施：数据库作为幂等最终防线；完成证据：重复事件不能生成第二行。
-- [ ] `S5-028` **建立查询索引** — 实施：围绕 tenant+时间、request ID、provider/model 和状态建立必要索引；完成证据：不为未证明查询创建大量索引。
-- [ ] `S5-029` **编写 Usage Schema 同步测试** — 实施：在空库和已有 schema 上重复同步，并验证唯一约束和状态约束；完成证据：独立数据库可重复执行。
+- [x] `S5-026` **创建 Usage GORM 模型** — 实施：保存事件字段、原始 Redis entry ID/版本和处理时间；完成证据：类型、非空和状态约束明确。
+- [x] `S5-027` **为 event ID 建立唯一约束** — 实施：数据库作为幂等最终防线；完成证据：重复事件不能生成第二行。
+- [x] `S5-028` **建立查询索引** — 实施：围绕 tenant+时间、request ID、provider/model 和状态建立必要索引；完成证据：不为未证明查询创建大量索引。
+- [x] `S5-029` **编写 Usage Schema 同步测试** — 实施：在空库和已有 schema 上重复同步，并验证唯一约束和状态约束；完成证据：独立数据库可重复执行。
 
 ### 8.4 独立 Usage Worker
 
-- [ ] `S5-030` **创建 `model-velo-usage-worker` 入口** — 实施：与 API 分进程运行但共享稳定事件类型；完成证据：Worker 不启动 HTTP 模型调用链。
-- [ ] `S5-031` **加载 Worker 配置** — 实施：读取 Redis/PostgreSQL、group、consumer、batch、block、claim 和重试参数；完成证据：非法组合启动失败。
-- [ ] `S5-032` **幂等创建 Consumer Group** — 实施：处理 group 已存在和 stream 尚不存在；完成证据：重复启动不报致命错误。
-- [ ] `S5-033` **实现 XREADGROUP 批量阻塞读取** — 实施：限制 batch 和 block 时间并响应 Context；完成证据：空 Stream 不忙轮询。
-- [ ] `S5-034` **解码并校验 Stream 事件** — 实施：检查 schema 版本和必填字段；完成证据：坏消息不会进入正常 INSERT。
-- [ ] `S5-035` **实现 PostgreSQL 幂等写入** — 实施：按 event ID INSERT/UPSERT，重复投递视为已处理；完成证据：相同事件多次消费只有一行。
-- [ ] `S5-036` **保证事务成功后才 XACK** — 实施：数据库写失败保留 pending；完成证据：故障注入验证不提前 ack。
-- [ ] `S5-037` **处理数据库成功但 ACK 失败窗口** — 实施：重投依靠唯一 event ID 幂等；完成证据：不会重复计费/统计行。
-- [ ] `S5-038` **实现 pending 扫描与 XAUTOCLAIM** — 实施：认领超过 idle 阈值的其他 consumer 消息；完成证据：Worker 崩溃后事件可恢复。
-- [ ] `S5-039` **实现 Worker 有界重试退避** — 实施：数据库/Redis 暂时失败时 Context-aware 退避；完成证据：不忙循环且能关闭。
-- [ ] `S5-040` **处理毒消息** — 实施：记录投递次数，超过阈值转入明确 dead-letter/隔离路径再 ACK；完成证据：单坏消息不会永久阻塞批次。
-- [ ] `S5-041` **实现 Worker 优雅关闭** — 实施：停止读取、等待当前批次有界完成、关闭连接；完成证据：终止时不丢已提交未 ACK 的可恢复消息。
-- [ ] `S5-042` **增加 Worker 安全日志和指标** — 实施：记录读取、写入、重复、失败、pending、claim、dead-letter；完成证据：标签有界且不含事件敏感载荷。
+- [x] `S5-030` **创建 `model-velo-usage-worker` 入口** — 实施：与 API 分进程运行但共享稳定事件类型；完成证据：Worker 不启动 HTTP 模型调用链。
+- [x] `S5-031` **加载 Worker 配置** — 实施：读取 Redis/PostgreSQL、group、consumer、batch、block、claim 和重试参数；完成证据：非法组合启动失败。
+- [x] `S5-032` **幂等创建 Consumer Group** — 实施：处理 group 已存在和 stream 尚不存在；完成证据：重复启动不报致命错误。
+- [x] `S5-033` **实现 XREADGROUP 批量阻塞读取** — 实施：限制 batch 和 block 时间并响应 Context；完成证据：空 Stream 不忙轮询。
+- [x] `S5-034` **解码并校验 Stream 事件** — 实施：检查 schema 版本和必填字段；完成证据：坏消息不会进入正常 INSERT。
+- [x] `S5-035` **实现 PostgreSQL 幂等写入** — 实施：按 event ID INSERT/UPSERT，重复投递视为已处理；完成证据：相同事件多次消费只有一行。
+- [x] `S5-036` **保证事务成功后才 XACK** — 实施：数据库写失败保留 pending；完成证据：故障注入验证不提前 ack。
+- [x] `S5-037` **处理数据库成功但 ACK 失败窗口** — 实施：重投依靠唯一 event ID 幂等；完成证据：不会重复计费/统计行。
+- [x] `S5-038` **实现 pending 扫描与 XAUTOCLAIM** — 实施：认领超过 idle 阈值的其他 consumer 消息；完成证据：Worker 崩溃后事件可恢复。
+- [x] `S5-039` **实现 Worker 有界重试退避** — 实施：数据库/Redis 暂时失败时 Context-aware 退避；完成证据：不忙循环且能关闭。
+- [x] `S5-040` **处理毒消息** — 实施：记录投递次数，超过阈值转入明确 dead-letter/隔离路径再 ACK；完成证据：单坏消息不会永久阻塞批次。
+- [x] `S5-041` **实现 Worker 优雅关闭** — 实施：停止读取、等待当前批次有界完成、关闭连接；完成证据：终止时不丢已提交未 ACK 的可恢复消息。
+- [x] `S5-042` **增加 Worker 安全日志和指标** — 实施：记录读取、写入、重复、失败、pending、claim、dead-letter；完成证据：标签有界且不含事件敏感载荷。
 
 ### 8.5 Usage 故障验证与门禁
 
-- [ ] `S5-043` **建立 API→Stream→Worker→PostgreSQL 端到端测试** — 实施：覆盖成功、缓存、最终失败、取消和流式状态；完成证据：数据库行与请求生命周期一致。
-- [ ] `S5-044` **建立崩溃窗口和重复投递测试** — 实施：模拟写库前崩溃、写库后 ACK 前崩溃、consumer 消失和毒消息；完成证据：at-least-once 与幂等行为可重复证明。
-- [ ] `S5-045` **完成阶段 5 门禁并等待用户确认** — 实施：运行 Redis/PostgreSQL 集成、Worker race、故障测试，更新数据链路和独立性报告；完成证据：不宣称 exactly-once，用户允许进入 S6。
+- [x] `S5-043` **建立 API→Stream→Worker→PostgreSQL 端到端测试** — 实施：覆盖成功、缓存、最终失败、取消和流式状态；完成证据：API 生命周期事件与真实 Redis→Worker→PostgreSQL 链路使用同一 schema，并分别通过合并端到端测试。
+- [x] `S5-044` **建立崩溃窗口和重复投递测试** — 实施：模拟写库前崩溃、写库后 ACK 前崩溃、consumer 消失和毒消息；完成证据：真实依赖测试证明重复 event ID 只有一行、pending 可认领、毒消息可隔离。
+- [ ] `S5-045` **完成阶段 5 门禁并等待用户确认** — 当前：Usage v2 真实 Redis/PostgreSQL 集成、故障测试、全量测试、vet、文档和独立性复查已完成；Worker race 在 `runtime/cgo` 编译前被 PATH 缺少 GCC 阻止，且尚未获得进入 S6 的用户确认。
+- [x] `S5-046` **升级 Usage schema v2 并兼容 v1** — 实施：增加 API Key ID、usage 来源、详细 token、finish reason、TTFT 和有界 raw usage；完成证据：v1 事件仍可解码，未来未知版本仍被隔离。
+- [x] `S5-047` **补齐流式 Usage 采集** — 实施：兼容流默认请求 `include_usage`，逐事件采集首 token 与末尾 usage-only Chunk；完成证据：HTTP 与 Collector 合并测试通过。
+- [x] `S5-048` **实现成本快照和未知成本语义** — 实施：版本化生效窗口、整数 nanoUSD、Provider 报价优先、缓存零成本、重试 caveat；完成证据：找不到价格时数据库保持 NULL，不能用零伪装。
+- [x] `S5-049` **实现隔离的 Usage 查询** — 实施：明细游标、汇总分组、时间序列、当前 tenant/API Key 强制过滤、查询上限和 no-store；完成证据：HTTP 拒绝跨 Key 查询，真实 PostgreSQL 跨租户隔离通过。
+- [x] `S5-050` **实现保留期与历史重算** — 实施：Worker 有界分批清理，Admin 显式确认重算；完成证据：真实 PostgreSQL 删除与缺失成本重算通过。
+- [x] `S5-051` **补齐多 Provider Usage 明细** — 实施：Anthropic、Gemini、Bedrock 和 OpenAI-compatible 映射可获得的缓存、推理、音频/图像 token；完成证据：统一事件与成本计算不依赖厂商私有表结构。
+- [x] `S5-052` **执行 Usage v2 真实依赖门禁** — 实施：隔离 PostgreSQL 17.10 与 Redis 8.8.0 容器；完成证据：schema、详细成本、查询隔离、重算、保留期、幂等、pending 恢复、dead-letter 和 XACK+XDEL 全链通过。
 
 ## 9. S6：可观测性、CI、Benchmark、故障测试与求职展示
 

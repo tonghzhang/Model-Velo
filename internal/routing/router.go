@@ -155,6 +155,18 @@ func (r *Router) Plan(requestedModel string, required []provider.Capability) (Pl
 	}, nil
 }
 
+func (r *Router) Models() []string {
+	if r == nil {
+		return nil
+	}
+	models := make([]string, 0, len(r.exact))
+	for model := range r.exact {
+		models = append(models, model)
+	}
+	sort.Strings(models)
+	return models
+}
+
 func validateProviders(configured []Provider) (map[string]routeProvider, error) {
 	if len(configured) == 0 {
 		return nil, errors.New("routing config must contain at least one provider")
@@ -315,7 +327,13 @@ func normalizeCapabilitySet(
 	for _, capability := range configured {
 		capability = provider.Capability(strings.ToLower(strings.TrimSpace(string(capability))))
 		switch capability {
-		case provider.CapabilityText, provider.CapabilityImage, provider.CapabilityTools:
+		case provider.CapabilityText,
+			provider.CapabilityImage,
+			provider.CapabilityAudio,
+			provider.CapabilityFile,
+			provider.CapabilityTools,
+			provider.CapabilityStructured,
+			provider.CapabilityEmbedding:
 			if !provider.ProtocolSupportsCapability(protocol, capability) {
 				return nil, fmt.Errorf("protocol %q cannot carry capability %q", protocol, capability)
 			}
@@ -327,8 +345,10 @@ func normalizeCapabilitySet(
 			return nil, fmt.Errorf("unsupported capability %q", capability)
 		}
 	}
-	if _, ok := set[provider.CapabilityText]; !ok {
-		return nil, errors.New("chat capabilities must include text")
+	if _, text := set[provider.CapabilityText]; !text {
+		if _, embedding := set[provider.CapabilityEmbedding]; !embedding {
+			return nil, errors.New("model capabilities must include text or embedding")
+		}
 	}
 	return set, nil
 }

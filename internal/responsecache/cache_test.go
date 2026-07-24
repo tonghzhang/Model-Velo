@@ -1,6 +1,7 @@
 package responsecache
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
@@ -40,6 +41,31 @@ func TestCacheKeyCanonicalizationAndIsolation(t *testing.T) {
 	differentRoute, _, _ := otherRoute.key("tenant-a", "demo", firstBody)
 	if first == differentRoute {
 		t.Fatal("different route version reused a cache key")
+	}
+}
+
+func TestCacheKeyUsesRequestPinnedRouteVersion(t *testing.T) {
+	cache := &Cache{environment: "test", routeVersion: "bootstrap"}
+	body := []byte(`{"model":"demo","messages":[]}`)
+
+	bootstrap, _, err := cache.key("tenant-a", "demo", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinned, _, err := cache.keyForRouteVersion(
+		routeVersionFromContext(
+			WithRouteVersion(context.Background(), "managed-runtime-v2"),
+			cache.routeVersion,
+		),
+		"tenant-a",
+		"demo",
+		body,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bootstrap == pinned {
+		t.Fatal("managed runtime reused the bootstrap cache namespace")
 	}
 }
 

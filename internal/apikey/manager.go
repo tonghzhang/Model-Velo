@@ -61,27 +61,27 @@ type Manager struct {
 
 // BootstrapTenantInput 表示“创建一个新租户”需要提供的参数。
 type BootstrapTenantInput struct {
-	Slug        string
-	DisplayName string
-	KeyLabel    string
-	Models      []string
-	ExpiresAt   *time.Time
+	Slug        string     `json:"slug"`
+	DisplayName string     `json:"display_name"`
+	KeyLabel    string     `json:"key_label"`
+	Models      []string   `json:"models"`
+	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
 }
 
 // CreateKeyInput 表示给已有租户创建 API Key 时需要的参数。
 type CreateKeyInput struct {
-	TenantID  string
-	Label     string
-	ExpiresAt *time.Time
+	TenantID  string     `json:"tenant_id"`
+	Label     string     `json:"label"`
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 }
 
 // IssuedKey 表示创建 API Key 成功后返回给调用者的数据。
 type IssuedKey struct {
-	ID        string
-	TenantID  string
-	Prefix    string
-	Plaintext string
-	ExpiresAt *time.Time
+	ID        string     `json:"id"`
+	TenantID  string     `json:"tenant_id"`
+	Prefix    string     `json:"key_prefix"`
+	Plaintext string     `json:"api_key"`
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 }
 
 // Identity 表示 API Key 认证成功后得到的身份信息。
@@ -135,6 +135,7 @@ func (manager *Manager) BootstrapTenant(ctx context.Context, input BootstrapTena
 			Slug:        normalized.Slug,
 			DisplayName: normalized.DisplayName,
 			Status:      postgres.TenantActive,
+			Version:     1,
 		}
 		if err := transaction.Create(&tenant).Error; err != nil {
 			if errors.Is(err, gorm.ErrDuplicatedKey) {
@@ -221,6 +222,9 @@ func (manager *Manager) Authenticate(ctx context.Context, plaintext string) (Ide
 	if !verifyToken(token, key.KeyHash, key.HashVersion, manager.pepper) {
 		return Identity{}, ErrInvalidCredential
 	}
+	if key.Status == postgres.APIKeyRevoked {
+		return Identity{}, ErrKeyRevoked
+	}
 	if key.Status != postgres.APIKeyActive {
 		return Identity{}, ErrKeyInactive
 	}
@@ -229,6 +233,13 @@ func (manager *Manager) Authenticate(ctx context.Context, plaintext string) (Ide
 	}
 	if expirationReached(key.ExpiresAt, manager.now().UTC()) {
 		return Identity{}, ErrKeyExpired
+	}
+	now := manager.now().UTC()
+	if key.LastUsedAt == nil || now.Sub(*key.LastUsedAt) >= 5*time.Minute {
+		_ = manager.database.WithContext(ctx).
+			Model(&postgres.APIKey{}).
+			Where("id = ?", key.ID).
+			Update("last_used_at", now).Error
 	}
 
 	return Identity{
@@ -248,7 +259,10 @@ func (manager *Manager) AuthorizeModel(ctx context.Context, tenantID, model stri
 	var count int64
 	err := manager.database.WithContext(ctx).
 		Model(&postgres.TenantModelGrant{}).
-		Where("tenant_id = ? AND gateway_model = ?", tenantID, model).
+		Where(
+			"tenant_id = ? AND gateway_model IN ?",
+			tenantID, []string{model, "*"},
+		).
 		Count(&count).Error
 	if err != nil {
 		if ctx.Err() != nil {
@@ -260,6 +274,28 @@ func (manager *Manager) AuthorizeModel(ctx context.Context, tenantID, model stri
 		return ErrModelNotAllowed
 	}
 	return nil
+}
+
+func (manager *Manager) AuthorizedModels(
+	ctx context.Context,
+	tenantID string,
+) ([]string, error) {
+	tenantID = strings.TrimSpace(tenantID)
+	if tenantID == "" {
+		return nil, ErrModelNotAllowed
+	}
+	var models []string
+	if err := manager.database.WithContext(ctx).
+		Model(&postgres.TenantModelGrant{}).
+		Where("tenant_id = ?", tenantID).
+		Order("gateway_model ASC").
+		Pluck("gateway_model", &models).Error; err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, errors.New("read tenant model grants")
+	}
+	return models, nil
 }
 
 func (manager *Manager) Revoke(ctx context.Context, keyID string) error {

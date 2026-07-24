@@ -37,6 +37,9 @@ func TestPreparedStreamHoldsResourcesUntilFinish(t *testing.T) {
 	if snapshot, _ := queues.Snapshot("upstream"); snapshot.Active != 1 || snapshot.Waiting != 0 {
 		t.Fatalf("queue while stream is prepared = %#v", snapshot)
 	}
+	if attempt, ok := prepared.FinalAttempt(); ok {
+		t.Fatalf("FinalAttempt() before stream end = %#v", attempt)
+	}
 
 	done, err := prepared.Next()
 	if err != nil || !done.Done {
@@ -44,6 +47,10 @@ func TestPreparedStreamHoldsResourcesUntilFinish(t *testing.T) {
 	}
 	if !prepared.Finish(nil) || prepared.Finish(nil) {
 		t.Fatal("Finish() did not release exactly once")
+	}
+	attempt, ok := prepared.FinalAttempt()
+	if !ok || attempt.Category != "" || attempt.Duration < prepared.Trail[len(prepared.Trail)-1].Duration {
+		t.Fatalf("FinalAttempt() after success = %#v, %t", attempt, ok)
 	}
 	if snapshot, _ := queues.Snapshot("upstream"); snapshot.Active != 0 || snapshot.Waiting != 0 {
 		t.Fatalf("queue after Finish() = %#v", snapshot)
@@ -81,6 +88,10 @@ func TestPreparedStreamTimesOutBetweenEvents(t *testing.T) {
 	failure = prepared.FinishError(context.Background(), err)
 	if failure == nil || failure.Category != CategoryTimeout || failure.Timeout != TimeoutUpstream {
 		t.Fatalf("FinishError() = %#v", failure)
+	}
+	attempt, ok := prepared.FinalAttempt()
+	if !ok || attempt.Category != CategoryTimeout {
+		t.Fatalf("FinalAttempt() after interruption = %#v, %t", attempt, ok)
 	}
 	assertStreamAttemptReleased(t, queues, breakers, 1)
 

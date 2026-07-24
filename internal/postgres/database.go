@@ -5,10 +5,14 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 	"sync"
+	"time"
 
 	gormpostgres "gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	gormlogger "gorm.io/gorm/logger"
 
 	"model-velo/internal/config"
 )
@@ -32,6 +36,13 @@ func Open(ctx context.Context, settings config.Postgres) (*Database, error) {
 		&gorm.Config{
 			DisableAutomaticPing: true,
 			TranslateError:       true,
+			Logger: gormlogger.New(databaseLogWriter{}, gormlogger.Config{
+				SlowThreshold:             time.Second,
+				LogLevel:                  gormlogger.Warn,
+				IgnoreRecordNotFoundError: true,
+				ParameterizedQueries:      true,
+				Colorful:                  false,
+			}),
 		},
 	)
 	if err != nil {
@@ -59,6 +70,15 @@ func Open(ctx context.Context, settings config.Postgres) (*Database, error) {
 	}, nil
 }
 
+type databaseLogWriter struct{}
+
+func (databaseLogWriter) Printf(format string, values ...any) {
+	detail := strings.TrimSpace(fmt.Sprintf(format, values...))
+	if detail != "" {
+		slog.Warn("database operation", "detail", detail)
+	}
+}
+
 func configurePool(database *sql.DB, settings config.Postgres) {
 	database.SetMaxOpenConns(settings.MaxOpenConns)
 	database.SetMaxIdleConns(settings.MaxIdleConns)
@@ -72,6 +92,15 @@ func (database *Database) SyncSchema(ctx context.Context) error {
 		&APIKey{},
 		&TenantModelGrant{},
 		&UsageEvent{},
+		&UsageOutbox{},
+		&AdminPrincipal{},
+		&AdminRoleGrant{},
+		&RuntimeConfigVersion{},
+		&ManagedPricing{},
+		&AuditLog{},
+		&TenantQuotaPolicy{},
+		&QuotaWindow{},
+		&QuotaReservation{},
 	); err != nil {
 		return fmt.Errorf("sync PostgreSQL schema: %w", err)
 	}
@@ -81,6 +110,13 @@ func (database *Database) SyncSchema(ctx context.Context) error {
 
 func (database *Database) ORM() *gorm.DB {
 	return database.orm
+}
+
+func (database *Database) SQL() *sql.DB {
+	if database == nil {
+		return nil
+	}
+	return database.sql
 }
 
 func (database *Database) Close() error {

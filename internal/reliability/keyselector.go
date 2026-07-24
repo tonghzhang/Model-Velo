@@ -266,6 +266,42 @@ func (registry *ProviderKeyRegistry) Snapshots() []ProviderKeySnapshot {
 	return snapshots
 }
 
+// ReuseProvider keeps key rotation, cooldown, and disabled state when the
+// configured key IDs and secrets are unchanged.
+func (registry *ProviderKeyRegistry) ReuseProvider(
+	providerID string,
+	previous *ProviderKeyRegistry,
+) bool {
+	providerID = strings.TrimSpace(providerID)
+	if registry == nil || previous == nil {
+		return false
+	}
+	current := registry.selectors[providerID]
+	existing := previous.selectors[providerID]
+	if current == nil || existing == nil || !sameProviderKeys(current, existing) {
+		return false
+	}
+	registry.selectors[providerID] = existing
+	return true
+}
+
+func sameProviderKeys(first, second *providerKeySelector) bool {
+	first.mu.RLock()
+	defer first.mu.RUnlock()
+	second.mu.RLock()
+	defer second.mu.RUnlock()
+	if len(first.keys) != len(second.keys) {
+		return false
+	}
+	for index := range first.keys {
+		if first.keys[index].id != second.keys[index].id ||
+			first.keys[index].secret != second.keys[index].secret {
+			return false
+		}
+	}
+	return true
+}
+
 func (registry *ProviderKeyRegistry) String() string {
 	if registry == nil {
 		return "provider-key-registry<nil>"

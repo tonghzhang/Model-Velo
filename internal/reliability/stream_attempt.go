@@ -8,6 +8,8 @@ import (
 	"sync/atomic" // 保证流只被结束一次。
 	"time"        // 记录耗时并控制首事件超时。
 
+	"go.opentelemetry.io/otel/trace"
+
 	"model-velo/internal/provider" // Provider 流接口和事件类型。
 )
 
@@ -30,8 +32,16 @@ type PreparedStream struct { // 已成功建立并读取到首事件的流。
 	key      *ProviderKeySelection     // 当前选中的 Provider Key。
 	cancel   context.CancelFunc        // 用于取消上游流 Context。
 	idleTime time.Duration             // 后续两个有效事件之间允许的最长静默时间。
+	started  time.Time                 // 最终成功 Attempt 实际调用上游的开始时间。
+	span     trace.Span                // 覆盖首事件到流终态的 Provider Attempt Span。
 	finished atomic.Bool               // 标记流是否已经结束并释放资源。
 	done     bool                      // 标记是否已经收到 [DONE]。
+	terminal atomic.Pointer[streamTerminal]
+}
+
+type streamTerminal struct {
+	failure  *Failure
+	duration time.Duration
 }
 
 func (stream *PreparedStream) Next() (provider.ChatStreamEvent, error) { // 读取首事件之后的下一个上游事件。
@@ -101,7 +111,12 @@ func (stream *PreparedStream) Finish(failure *Failure) bool { // 结束流并统
 	stream.key.Complete(failure)    // 将最终结果反馈给 Provider Key。
 	stream.permit.Complete(failure) // 将最终结果反馈给熔断器。
 	stream.lease.Release()          // 释放 Provider 并发槽位。
-	return true                     // 表示本次成功结束流。
+	finishAttemptSpan(stream.span, failure, true)
+	stream.terminal.Store(&streamTerminal{
+		failure:  failure,
+		duration: time.Since(stream.started),
+	})
+	return true // 表示本次成功结束流。
 }
 
 // FinishError 将提交后的上游读取错误归入既有可靠性分类并结束当前流。
@@ -149,6 +164,25 @@ func (stream *PreparedStream) currentAttempt() int { // 获取当前流对应的
 		return stream.Trail[len(stream.Trail)-1].Attempt // 返回最后一条记录的尝试编号。
 	}
 	return stream.Attempts // 没有 Trail 时使用累计尝试数。
+}
+
+// FinalAttempt returns the successful preparation attempt with its real stream
+// terminal result. It is available only after Finish or Abort.
+func (stream *PreparedStream) FinalAttempt() (AttemptRecord, bool) {
+	if stream == nil || len(stream.Trail) == 0 {
+		return AttemptRecord{}, false
+	}
+	terminal := stream.terminal.Load()
+	if terminal == nil {
+		return AttemptRecord{}, false
+	}
+	record := stream.Trail[len(stream.Trail)-1]
+	record.Category = failureCategory(terminal.failure)
+	record.StatusCode = failureStatus(terminal.failure)
+	if !stream.started.IsZero() {
+		record.Duration = terminal.duration
+	}
+	return record, true
 }
 
 // PrepareStream 在单个候选内执行有限 Retry，并在不提交客户端响应的前提下
@@ -255,7 +289,16 @@ func (executor *AttemptExecutor) prepareStream( // 在单个候选 Provider 内�
 		} else if outcome.KeyID != "" { // 当前错误不要求换 Key。
 			preferredKeyID = outcome.KeyID // 下次优先继续使用当前 Key。
 		}
-		if !retry.Wait(ctx, retry.Backoff(failure, result.attempts)) { // 按退避时间等待下一次尝试。
+		backoff := retry.Backoff(failure, result.attempts) // 计算本轮退避时间。
+		addRetryEvent(                                     // 在当前请求 Span 上记录流式重试。
+			ctx,
+			candidate.ProviderID,
+			candidate.Priority,
+			result.attempts,
+			failure,
+			backoff,
+		)
+		if !retry.Wait(ctx, backoff) { // 按退避时间等待下一次尝试。
 			if err := ctx.Err(); err != nil { // Context 已取消或超时。
 				failure = FromProvider(ctx, candidate.ProviderID, candidate.Priority, result.attempts, err) // 转换为统一 Failure。
 			}
@@ -281,8 +324,15 @@ func (executor *AttemptExecutor) prepareStreamOnce( // 执行一次完整的建�
 	preferredKeyID string, // 优先使用的 Key ID。
 	excludedKeyIDs map[string]struct{}, // 禁止选择的 Key 集合。
 	retry *RetryPolicy, // 当前 Provider 重试策略。
-) streamAttemptOutcome {
-	candidate := input.Candidate                                   // 取出当前候选 Provider。
+) (outcome streamAttemptOutcome) {
+	candidate := input.Candidate // 取出当前候选 Provider。
+	traceContext, attemptSpan := startAttemptSpan(ctx, input, attempt, true)
+	spanHandedOff := false
+	defer func() {
+		if !spanHandedOff {
+			finishAttemptSpan(attemptSpan, outcome.Failure, outcome.Attempted)
+		}
+	}()
 	adapter, ok := executor.adapters.Adapter(candidate.ProviderID) // 查找当前 Provider Adapter。
 	if !ok {                                                       // Adapter 未注册。
 		return streamAttemptOutcome{Failure: &Failure{
@@ -317,8 +367,12 @@ func (executor *AttemptExecutor) prepareStreamOnce( // 执行一次完整的建�
 		}
 	}()
 
-	lease, failure := executor.queues.Acquire(ctx, candidate.ProviderID) // 获取当前 Provider 的并发槽位。
-	if failure != nil {                                                  // 排队或获取槽位失败。
+	lease, failure := traceQueueAcquire( // 获取当前 Provider 的并发槽位并记录等待 Span。
+		traceContext,
+		executor.queues,
+		candidate.ProviderID,
+	)
+	if failure != nil { // 排队或获取槽位失败。
 		failure.Candidate = candidate.Priority        // 补充候选优先级。
 		failure.Attempt = attempt                     // 补充尝试编号。
 		permit.Complete(failure)                      // 将失败反馈给熔断器。
@@ -348,12 +402,14 @@ func (executor *AttemptExecutor) prepareStreamOnce( // 执行一次完整的建�
 	apiKey := ""            // 默认不传 API Key。
 	if selectedKey != nil { // 已选择 Provider Key。
 		apiKey = selectedKey.Secret() // 取得真正的 Key Secret。
+		setAttemptKeyID(attemptSpan, selectedKey.KeyID())
 	}
 
-	startedAt := time.Now()                                    // 记录建流开始时间。
+	startedAt := time.Now() // 记录建流开始时间。
+	streamContext := trace.ContextWithSpan(streamParent, attemptSpan)
 	upstream, firstEvent, cancel, err := openFirstStreamEvent( // 打开上游流并读取首个有效事件。
-		ctx,              // 控制等待和总预算。
-		streamParent,     // 成功后流继续使用的父 Context。
+		traceContext,     // 控制等待和总预算并传播 Attempt Span。
+		streamContext,    // 成功后沿用客户端生命周期和 Attempt Span。
 		streamingAdapter, // 当前 Provider 的流式 Adapter。
 		provider.ChatInput{
 			RequestID:     input.RequestID, // 网关请求 ID。
@@ -385,6 +441,7 @@ func (executor *AttemptExecutor) prepareStreamOnce( // 执行一次完整的建�
 	}
 
 	handedOff = true // 将流、熔断许可、队列槽位和 Key 交给 PreparedStream。
+	spanHandedOff = true
 	return streamAttemptOutcome{
 		Stream: &PreparedStream{
 			FirstEvent:    firstEvent,              // 保存提前读取的首事件。
@@ -398,6 +455,8 @@ func (executor *AttemptExecutor) prepareStreamOnce( // 执行一次完整的建�
 			key:           selectedKey,             // 保存 Provider Key 选择。
 			cancel:        cancel,                  // 保存上游流取消函数。
 			idleTime:      retry.AttemptTimeout(),  // 复用 Provider 单次超时作为事件静默上限。
+			started:       startedAt,               // 保存真实上游 Attempt 开始时间。
+			span:          attemptSpan,             // 在流终态结束 Attempt Span。
 		},
 		KeyID:     keyID,    // 返回本轮 Key ID。
 		Attempted: true,     // 已成功调用上游并读取首事件。

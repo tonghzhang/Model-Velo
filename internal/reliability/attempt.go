@@ -429,10 +429,16 @@ func (executor *AttemptExecutor) Execute(
 		// 然后等待下一次重试。
 		//
 		// Wait 返回 false 表示等待被 ctx 取消或截止时间结束。
-		if !retry.Wait(
+		backoff := retry.Backoff(failure, result.Attempts)
+		addRetryEvent(
 			ctx,
-			retry.Backoff(failure, result.Attempts),
-		) {
+			input.Candidate.ProviderID,
+			input.Candidate.Priority,
+			result.Attempts,
+			failure,
+			backoff,
+		)
+		if !retry.Wait(ctx, backoff) {
 			// 如果 ctx 确实存在取消或超时错误，
 			// 将它转换成统一 Failure。
 			if err := ctx.Err(); err != nil {
@@ -530,10 +536,14 @@ func (executor *AttemptExecutor) executeOnce(
 
 	// retry 是当前 Provider 的重试策略。
 	retry *RetryPolicy,
-) attemptOutcome {
+) (outcome attemptOutcome) {
 	// 取出当前路由候选信息，
 	// 避免后面反复写 input.Candidate。
 	candidate := input.Candidate
+	traceContext, attemptSpan := startAttemptSpan(ctx, input, attempt, false)
+	defer func() {
+		finishAttemptSpan(attemptSpan, outcome.Failure, outcome.Attempted)
+	}()
 
 	// 根据 Provider ID 查找对应 Adapter。
 	adapter, ok := executor.adapters.Adapter(
@@ -591,8 +601,9 @@ func (executor *AttemptExecutor) executeOnce(
 	//
 	// 如果并发已满，可能等待；
 	// 等待队列也满或等待超时时，会返回 Failure。
-	lease, failure := executor.queues.Acquire(
-		ctx,
+	lease, failure := traceQueueAcquire(
+		traceContext,
+		executor.queues,
 		candidate.ProviderID,
 	)
 
@@ -658,7 +669,7 @@ func (executor *AttemptExecutor) executeOnce(
 	// 它通常会叠加 AttemptTimeout，
 	// 防止单次上游调用占满整个总请求时间。
 	attemptContext, cancelAttempt :=
-		retry.AttemptContext(ctx)
+		retry.AttemptContext(traceContext)
 
 	// 函数结束时释放本次尝试 Context 的资源。
 	defer cancelAttempt()
@@ -687,6 +698,7 @@ func (executor *AttemptExecutor) executeOnce(
 	// 读取它的 Secret。
 	if selectedKey != nil {
 		apiKey = selectedKey.Secret()
+		setAttemptKeyID(attemptSpan, selectedKey.KeyID())
 	}
 
 	// 记录真正调用上游前的开始时间。

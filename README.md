@@ -1,11 +1,13 @@
 # Model-Velo
 
-Model-Velo 是一个用 Go 和 Gin 编写的 OpenAI-compatible LLM 网关。目前已经进入阶段 5：非流式与 SSE Chat Completions、PostgreSQL 鉴权、Redis 租户限流、Exact Response Cache、有序 Route Plan、多 Provider 可靠性运行时，以及异步 Usage 数据链路已经接入。
+Model-Velo 是一个用 Go 和 Gin 编写的多协议 LLM 网关。当前已实现 Chat Completions、Responses、Embeddings、Anthropic Messages 入站协议，多 Provider 原生转换与可靠性运行时，持久化 Usage/计费、在线控制平面、额度预算，以及阶段 6 的可观测性和工程门禁。
 
 ## 当前已经实现
 
 - `GET /healthz` 健康检查；
+- `GET /readyz` PostgreSQL/Redis 就绪检查，以及可选 Bearer 保护的 `GET /metrics`；
 - `POST /v1/chat/completions` 非流式请求校验和转发；
+- `POST /v1/responses`、`POST /v1/embeddings`、`POST /v1/messages` 和 `GET /v1/models`；
 - 16 个内置厂商 Adapter：厂商身份与构造入口彼此独立；公开采用 OpenAI Chat 报文的厂商只复用协议编解码和 HTTP 边界；
 - 一个厂商可配置多个 Provider 实例，每个实例可声明多个文本或视觉模型；
 - request ID 生成、校验、响应回传和上游传播；
@@ -15,7 +17,7 @@ Model-Velo 是一个用 Go 和 Gin 编写的 OpenAI-compatible LLM 网关。目�
 - 使用 `httptest.Server` 的本地测试，不调用真实付费 API；
 - 固定版本的 PostgreSQL、Redis Compose 配置；
 - 基于 GORM 的 PostgreSQL 连接、启动 Ping、连接池配置和退出关闭；
-- 启动时通过 GORM `AutoMigrate` 同步租户、API Key、模型授权和 Usage Event 四张表；
+- 启动时通过 GORM `AutoMigrate` 同步租户/API Key、Usage/outbox、控制面/审计和额度账本；
 - Model-Velo API Key 随机生成、摘要查找、HMAC 校验、过期判断、禁用和吊销；
 - `model-velo-admin` 本地管理命令，可初始化租户、模型授权和首个 API Key；
 - Gin Bearer 认证中间件、请求身份 Context 和租户模型授权检查；
@@ -23,7 +25,7 @@ Model-Velo 是一个用 Go 和 Gin 编写的 OpenAI-compatible LLM 网关。目�
 - 基于 Redis Lua 的租户+模型固定窗口限流，以及可配置的 fail-open/fail-closed 运行时故障策略；
 - 租户隔离的 Redis Exact Response Cache，支持规范化请求哈希、TTL、显式绕过和缓存故障降级；
 - 精确模型/默认模型路由、有序候选去重、primary 选择和上游模型映射；
-- 按模型声明 `text`、`image`、`tools` 能力，规划时先过滤协议或模型无法承载的候选；
+- 按模型声明 `text`、`image`、`audio`、`file`、`tools`、`structured` 能力，规划时先过滤协议或模型无法承载的候选；
 - Provider Circuit Breaker 三态、指定故障计数、Open 快速拒绝和 HalfOpen 有界探测；
 - 按 Provider 隔离的进程内有界 Queue，限制运行数和等待数，并传播请求取消；
 - Provider 多 Key 安全身份与并发轮换：401 永久禁用错误 Key，403 只在当前请求内换 Key，429 按 `Retry-After` 临时冷却；
@@ -33,20 +35,23 @@ Model-Velo 是一个用 Go 和 Gin 编写的 OpenAI-compatible LLM 网关。目�
 - 有序 Fallback Orchestrator：成功立即停止，普通 400/取消停止，模型不可用等策略允许的失败进入下一候选；Fallback 成功响应不写 Exact Cache；
 - Provider 执行总预算、单次调用超时和 Context-aware 退避取消；
 - 每个 Provider 可独立覆盖 Breaker、Queue、Retry、Attempt Timeout 与 HTTP 连接池；
-- 非流式文本与 VLM `text`/`image_url` 内容：兼容协议原样透传，原生协议转换并归一化响应；
+- Chat 文本、图片、音频、文件、Function Tool 与结构化输出：兼容协议保留原报文，原生协议只转换能够明确表达的字段并归一化响应；
 - 流式预提交可靠性链：每次按 Breaker→Queue→Key→Adapter 建流并验证首事件，候选内支持有限 Retry，耗尽后按 Route Plan 有序 Fallback；最终 PreparedStream 持有成功流资源和完整安全 Trail，直到显式结束。
 - OpenAI-compatible 客户端 SSE：有效首事件后才提交 Header，逐事件同步 Write/Flush，正常转发 `[DONE]`，客户端断开会取消上游并释放 Queue。
 - Usage Event schema v2：记录 request、tenant、API Key ID、请求与实际模型、缓存、可靠性计数、详细 token、usage 来源、finish reason、TTFT、稳定终态和 UTC 延迟；原始 usage 子对象最多保留 64 KiB，不记录 Key Secret、提示词或完整上游响应；
 - OpenAI-compatible 流请求默认合并 `stream_options.include_usage=true`；Provider 返回的缓存读写、音频、图像、推理和预测 token 会进入统一明细；
 - 版本化价目表按 Provider、模型和事件时间生成不可变成本快照；Provider 明确上报的 USD 成本优先，缓存命中成本为已知零，无法定价时成本保持 `NULL` 而不是伪造零；
-- API 使用环境隔离的 Redis Stream 执行有界超时 `XADD`，投递失败不会反向改写客户端响应；
+- API 在 Provider 前同步写 PostgreSQL pending 生命周期，终态先固化到 outbox，再以有界超时执行 Redis `XADD`；即时投递失败不会改写已经生成的模型响应；
 - 独立 `model-velo-usage-worker` 使用 consumer group、`XREADGROUP`、`XAUTOCLAIM`、dead-letter 和 Context-aware 退避；
 - PostgreSQL `usage_events.event_id` 主键与 `ON CONFLICT DO NOTHING` 提供幂等最终防线，数据库成功后才在 Redis 事务中执行 `XACK + XDEL`；
 - 认证后的租户可查询 Usage 明细、汇总和时间序列；Worker 自动执行分批保留期清理，管理命令支持历史成本重算。
+- 独立管理员身份、owner/operator/billing/auditor RBAC、脱敏审计日志，以及 Provider/路由/Provider Key/价格、租户、业务 API Key 和额度策略的在线管理；
+- PostgreSQL 强一致额度账本：分钟/小时/日/月请求、Token、USD 预算，支持 deny/allow/alert 超额策略、请求前预留、真实 Usage 结算和中断恢复；
+- JSON 结构化日志、Prometheus、OpenTelemetry、非 root 容器、GitHub Actions race/集成门禁与可复现 benchmark。
 
-Usage 链路采用 **at-least-once + 数据库幂等**，不宣称 exactly-once。API 只生成和投递一个稳定 `event_id`；Worker 只有在 PostgreSQL 写入成功后才 ACK。数据库成功但 Redis 事务响应丢失时，消息要么仍在 pending 并在重投时命中唯一事件 ID，要么已完成 ACK/删除且数据库行已经存在；Worker 消失前未 ACK 的事件由 `XAUTOCLAIM` 恢复，坏版本/坏载荷达到阈值后进入有长度上限的 dead-letter Stream。主 Stream 不按长度裁剪未处理消息，正常处理后立即删除，因此它保存的是当前积压而不是永久归档。Redis 在 `XADD` 前不可用时事件仍可能丢失，这是在线响应不被 Usage 故障无限阻塞的明确取舍。
+Usage 链路采用 **PostgreSQL outbox + Redis Stream at-least-once + 数据库幂等**，不宣称 exactly-once。API 在调用 Provider 前先写 pending 生命周期，结束时把完整 Event 固化为 ready；Redis 不可用不会丢失已固化事件，Worker 会从 outbox 重投。已标记 published 但尚未被 Usage 入库事务删除的记录也会周期性重发，覆盖 Redis 消息在消费前丢失或清理的窗口。数据库成功但 Redis ACK 响应丢失时，重投会命中 `usage_events.event_id` 唯一键。Worker 消失前未 ACK 的事件由 `XAUTOCLAIM` 恢复，坏版本/坏载荷达到阈值后进入有长度上限的 dead-letter Stream。进程在最终 Usage 形成前退出时，超时 pending 会转成明确的中断事件并保留“Usage 未知” caveat，而不是伪造 Token。
 
-SSE 请求强制上游 `stream=true`，校验状态码与 `text/event-stream`，有界解析 `data:`/心跳/多行事件并识别 `[DONE]`。首事件前的 5xx、非 SSE、超时、EOF、坏 Chunk 和取消会沿用可靠性分类，可 Retry/Fallback，并在下一次尝试前释放资源；预提交总预算不会成为成功长流的上游 deadline。首事件提交后禁止切换 Provider，后续失败只安全记录并结束当前流。上游 heartbeat 注释当前不向客户端透传，但会重置事件空闲计时器；每次只同步处理一个最大 2 MiB 的事件，不创建无界 Chunk 队列。首事件验证成功后会清除当前 SSE 响应继承的 Server 总写截止时间，每个客户端帧仍有独立 15 秒 Write/Flush 截止时间，后续事件静默上限复用该 Provider 的 `attempt_timeout`。
+客户端始终收到 OpenAI SSE。Adapter 会按上游协议校验并转换 OpenAI-compatible SSE、Anthropic/Gemini/DashScope/Cohere SSE、Ollama NDJSON 或 Bedrock AWS EventStream；单行最大 1 MiB、单事件最大 2 MiB，Bedrock 二进制帧也在解码前限长。首事件前的 5xx、错误媒体类型、超时、EOF、坏 Chunk 和取消会沿用可靠性分类，可 Retry/Fallback，并在下一次尝试前释放资源；预提交总预算不会成为成功长流的上游 deadline。首事件提交后禁止切换 Provider，后续失败只安全记录并结束当前流。上游 heartbeat 当前不向客户端透传，但会重置事件空闲计时器；转换链使用同步背压，不创建无界 Chunk 队列。首事件验证成功后会清除当前 SSE 响应继承的 Server 总写截止时间，每个客户端帧仍有独立 15 秒 Write/Flush 截止时间，后续事件静默上限复用该 Provider 的 `attempt_timeout`。
 
 阶段 3 的生产功能、合并故障矩阵、全量测试、vet 和独立性复查已经完成；Breaker、Queue、Key 并发用例也已通过普通执行，但 race detector 仍被本机 Go/race 工具链阻止，因此不能宣称 race 已通过。详细证据见 `STAGE3_GATE.md`。
 
@@ -62,15 +67,32 @@ SSE 请求强制上游 `stream=true`，校验状态码与 `text/event-stream`，
 |---|---|
 | `model` | 必填且不能是空白字符串；用于授权和 Route Plan，可通过 `upstream_model` 映射成厂商模型名。 |
 | `messages` | 必填且至少包含一条消息。 |
-| `messages[].role` | 接受 `system`、`developer`、`user`、`assistant`、`tool`；`developer`/`tool` 会要求目标模型声明 `tools` 能力。 |
-| `messages[].content` | 接受非空字符串或非空内容块数组。当前跨协议保证 `text` 与 `image_url`；其他内容块只在目标 OpenAI-compatible 上游自行支持时原样透传。 |
+| `messages[].role` | 接受 `system`、`developer`、`user`、`assistant`、`tool`；`tool`、assistant `tool_calls` 和 Tool 定义会要求目标模型声明 `tools`。 |
+| `messages[].content` | 接受非空字符串或非空内容块数组；已建模 `text`/`input_text`、`image_url`、`input_audio` 和 `file`。未知块不会穿过原生转换器。 |
+| `messages[].tool_calls` / `tool_call_id` | 校验 Function 名称、唯一调用 ID、JSON object 参数和历史引用；原生 Adapter 映射 Tool Use/Result，响应统一返回 OpenAI `tool_calls`。 |
+| `tools` / `tool_choice` / `parallel_tool_calls` | 支持 Function Tool；厂商没有等价控制项时明确返回能力错误，不会删除字段继续请求。 |
+| `response_format` | 支持 `text`、`json_object`、`json_schema`；需要模型声明 `structured`。DashScope 原生接口只接受 `json_object`，Cohere 不允许与 `tools` 组合。 |
+| 生成参数 | 建模并校验 token 上限、`temperature`、`top_p`、`stop`、`seed`、penalty、`n`、logprobs 与 `reasoning_effort`；原生协议仅映射等价字段，其余明确拒绝。 |
 | `stream` | 省略或为 `false` 时返回完整 JSON；`true` 时绕过 Exact Cache，并以 `text/event-stream` 逐事件返回兼容 Chunk 与 `[DONE]`。 |
 
-OpenAI、Mistral、DeepSeek、xAI、Zhipu、Groq、NVIDIA 和 Together 均由各自的厂商 Adapter 装配端点与能力边界；由于这些厂商当前公开的 Chat API 使用 OpenAI Chat 报文，它们复用同一套 wire codec 和 HTTP 安全边界，并保留客户端原始 JSON，只在路由配置要求时改写 `model`。这与把所有厂商注册成同一个 OpenAI Adapter 不同。Anthropic、Gemini、DashScope、Cohere、Ollama、Bedrock 和 Cloudflare 等原生协议只转换当前明确支持的公共字段：消息、`max_tokens`/`max_completion_tokens`、`temperature`、`top_p` 和 `stop`；未知厂商扩展不会被伪装成已支持。
+OpenAI、Mistral、DeepSeek、xAI、Zhipu、Groq、NVIDIA、Together 和 Cloudflare 均由各自的厂商装配入口设置端点与能力边界；它们公开采用 OpenAI Chat 报文，因此复用同一套 wire codec 和 HTTP 安全边界，只在路由配置要求时改写 `model`。Anthropic、Gemini、DashScope、Cohere、Ollama 和 Bedrock 使用各自原生消息、Tool、结构化输出、Usage 和流式事件格式。
 
 请求 JSON 只解析一次。兼容协议会保留未知顶层字段和消息字段；原生协议在转换前检查这些字段，无法无损表达时返回能力不匹配并尝试下一候选，不会静默丢字段。
 
-工具调用和 `developer`/`tool` 角色仅在采用 OpenAI Chat 报文、且模型显式声明 `tools` 的候选上原样透传；当前原生转换器不会伪造工具调用支持。音频、视频和不同厂商的私有扩展仍不保证。Anthropic Adapter 支持 URL/base64 图片；Gemini、Ollama 和 Bedrock 当前要求 `data:*;base64` 图片；OpenAI/Azure/Mistral/xAI 等 Chat 协议按模型声明处理 `image_url`。Adapter 已知无法表达某种输入时会报告能力不匹配并触发 Fallback；上游模型自身的实际模态能力仍由厂商响应决定。
+各协议在当前 Adapter 中可表达的上限如下；模型还必须在 `model_capabilities` 中显式声明对应能力：
+
+| 协议 | image | audio | file | tools | structured | stream |
+|---|---:|---:|---:|---:|---:|---:|
+| OpenAI / Azure / custom OpenAI-compatible | 是 | 是 | 是 | 是 | 是 | 是 |
+| Anthropic Messages | 是 | 否 | 是 | 是 | 是 | 是 |
+| Gemini generateContent | 是 | 是 | 是（内嵌数据） | 是 | 是 | 是 |
+| DashScope Generation | 否 | 否 | 否 | 是 | 仅 `json_object` | 是 |
+| Cohere v2 Chat | 是 | 否 | 否 | 是 | 是 | 是 |
+| Ollama Chat | 是 | 否 | 否 | 是 | 是 | 是 |
+| Bedrock Converse | 是 | 否 | 是（内嵌数据） | 是 | 是 | 是 |
+| Cloudflare Workers AI Chat | 是 | 是 | 是 | 是 | 是 | 是 |
+
+这张表描述线协议转换能力，不承诺每个厂商模型都具备该能力。Anthropic 与 Cohere 可把远程图片 URL 交给上游；Gemini、Ollama 和 Bedrock 的当前转换器要求图片为 Base64 data URL。显式 `detail=low/high` 只在能保留该语义的 Cohere/OpenAI wire 上发送，其他原生协议会拒绝而不是忽略。Gemini、Bedrock 的 OpenAI `file_id` 没有安全等价物，当前只接受内嵌 `file_data`；Anthropic 同时接受 Files API `file_id` 和内嵌文件，使用 `file_id` 时 Adapter 会自动发送 Files API Beta Header。视频和厂商私有内容块不在 Chat 契约内。
 
 成功时，兼容协议响应在通过 2xx、Content-Type、大小、错误信封和非空 Chat `choices[].message` 检查后原样返回；原生协议响应会转换为非流式 OpenAI Chat Completion。原生响应缺少 Usage 时省略 `usage`，不会伪造全零计费数据；出现当前无法表示的非文本输出时明确失败并按策略 Fallback。
 
@@ -85,6 +107,17 @@ OpenAI、Mistral、DeepSeek、xAI、Zhipu、Groq、NVIDIA 和 Together 均由各
 `api_key_id` 省略时自动使用当前 Key，显式值也只能等于当前 Key；项目尚未定义管理员 Scope，因此不会默认开放租户级跨 Key 查询。默认查询最近 30 天，单次范围最多 366 天，明细每页最多 200 条，分组最多返回 1000 组并显式标记截断。所有响应带 `Cache-Control: no-store`。成本以整数 nanoUSD 存储与聚合，接口同时返回精确十进制 USD 字符串；未知价格、缺失 usage 或无法覆盖早期失败 attempt 时会保留 caveat。
 
 历史 schema v1 没有 API Key ID，Worker 仍能可靠消费和存储，但它不能被安全归属到某一把 Key，因此不会出现在普通 Key 的 HTTP 查询中；可通过 PostgreSQL 管理通道或带 tenant 条件的 `reprice-usage` 处理。系统不会为了补齐归属而猜测或把 v1 数据暴露给整个租户。
+
+## 管理 API
+
+`/admin/v1` 只接受独立的 `mv_admin_...` Bearer Key，所有响应都带 `Cache-Control: no-store`。运行时、价格、管理员、租户/API Key 与额度变更和审计写入处于同一数据库事务；创建返回的管理员 Key 或业务 API Key 明文只出现一次。
+
+- `GET/PUT /admin/v1/runtime`：版本化 Provider、路由、上游 Key 与可靠性参数；写入必须携带 `If-Match`；
+- `GET/PUT /admin/v1/pricing`：版本化价目；
+- `GET /admin/v1/principals`、`POST /admin/v1/principals`、`PATCH /admin/v1/principals/:id`：管理员与角色；
+- `GET/POST/PUT /admin/v1/quotas`、`GET /admin/v1/quota-windows`：额度策略和当前已结算/预留窗口；
+- `GET/POST /admin/v1/tenants`、`PUT /admin/v1/tenants/:id`、`GET/POST /admin/v1/tenants/:id/keys`、`PATCH /admin/v1/api-keys/:id`：租户、模型授权及业务 Key 生命周期；
+- `GET /admin/v1/audit`：只读游标分页审计。
 
 ## 配置
 
@@ -105,6 +138,9 @@ OpenAI、Mistral、DeepSeek、xAI、Zhipu、Groq、NVIDIA 和 Together 均由各
 | `MODEL_VELO_POSTGRES_MAX_CONN_LIFETIME` | 否 | `30m` | 单个 PostgreSQL 连接的最长寿命。 |
 | `MODEL_VELO_POSTGRES_MAX_CONN_IDLE_TIME` | 否 | `5m` | PostgreSQL 连接的最大空闲时间。 |
 | `MODEL_VELO_API_KEY_PEPPER` | API 与管理命令必填 | 无 | 至少 32 字节的服务端秘密，用于 HMAC 校验 Model-Velo API Key；更换后已有 Key 将全部失效。 |
+| `MODEL_VELO_ADMIN_KEY_PEPPER` | API 与管理员初始化必填 | 无 | 与业务 Key 分离的至少 32 字节秘密。 |
+| `MODEL_VELO_CONTROL_MASTER_KEY` | API 必填 | 无 | Base64 编码的 32 字节 AES-256-GCM 密钥，用于加密托管 Provider Key。 |
+| `MODEL_VELO_CONTROL_REFRESH_INTERVAL` | 否 | `5s` | 多 API 实例同步活动运行时与价格版本的间隔。 |
 | `MODEL_VELO_REDIS_ADDR` | API 必填 | 无 | Redis `host:port` 地址。 |
 | `MODEL_VELO_REDIS_PASSWORD` | API 与 Compose 必填 | 无 | Redis 密码，错误信息和日志不得包含该值。 |
 | `MODEL_VELO_REDIS_DB` | 否 | `0` | Go 应用使用的非负 Redis logical DB。 |
@@ -120,7 +156,7 @@ OpenAI、Mistral、DeepSeek、xAI、Zhipu、Groq、NVIDIA 和 Together 均由各
 | `MODEL_VELO_RATE_LIMIT_WINDOW` | 否 | `1m` | 固定窗口时长，范围 `1s`–`24h`；窗口从该 Key 的首个请求开始。 |
 | `MODEL_VELO_RATE_LIMIT_FAILURE_POLICY` | 否 | `fail-closed` | Redis 运行时失败时，`fail-closed` 返回 503；`fail-open` 标记绕过并继续 Provider。 |
 | `MODEL_VELO_CACHE_TTL` | 否 | `5m` | Exact Cache 保存时间，范围 `1s`–`24h`；`0` 或 `off` 禁用缓存。 |
-| `MODEL_VELO_CACHE_ROUTE_VERSION` | 否 | `routes-v1` | 1–64 位路由语义版本；切换上游或模型映射时必须修改，使旧缓存自然失效。 |
+| `MODEL_VELO_CACHE_ROUTE_VERSION` | 否 | `routes-v1` | 环境变量启动路由的缓存命名空间；托管运行时切换会自动使用版本化命名空间。 |
 | `MODEL_VELO_USAGE_EMIT_TIMEOUT` | 否 | `200ms` | API 在请求结束后投递 Usage Event 的独立短超时。 |
 | `MODEL_VELO_USAGE_GROUP` | 否 | `model-velo-usage-workers` | Usage Worker consumer group。 |
 | `MODEL_VELO_USAGE_CONSUMER` | 否 | `<hostname>-<pid>` | 当前 Worker consumer 名；同组并发进程应不同。 |
@@ -136,6 +172,20 @@ OpenAI、Mistral、DeepSeek、xAI、Zhipu、Groq、NVIDIA 和 Together 均由各
 | `MODEL_VELO_USAGE_MAINTENANCE_INTERVAL` | 否 | `1h` | Worker 执行保留期清理的间隔。 |
 | `MODEL_VELO_USAGE_MAINTENANCE_BATCH_SIZE` | 否 | `1000` | 单次删除批量，Worker 会在维护超时内持续分批清理。 |
 | `MODEL_VELO_USAGE_PRICING_JSON` | 否 | `[]` | 版本化 USD/百万 token 价目表；支持生效时间、缓存、音频、图像和推理 token 专属费率，最大 256 KiB。 |
+| `MODEL_VELO_USAGE_PRICING_REFRESH_INTERVAL` | 否 | `30s` | 独立 Worker 刷新托管价格目录的间隔。 |
+| `MODEL_VELO_USAGE_PENDING_TIMEOUT` | 否 | `15m` | 把未完成 outbox 生命周期恢复成中断事件前的保守等待时间，范围 5m–24h。 |
+| `MODEL_VELO_QUOTA_RESERVATION_TTL` | 否 | `15m` | 崩溃后活动额度预留转为保守估算结算的时间。 |
+| `MODEL_VELO_QUOTA_REAP_INTERVAL` | 否 | `1m` | 扫描过期额度预留的间隔。 |
+| `MODEL_VELO_QUOTA_DEFAULT_MAX_OUTPUT_TOKENS` | 否 | `4096` | 请求未给输出上限时用于 Token/成本预留的默认值。 |
+| `MODEL_VELO_LOG_FORMAT` | 否 | `json` | `json` 或本地开发用 `text`。 |
+| `MODEL_VELO_LOG_LEVEL` | 否 | `info` | `debug`、`info`、`warn` 或 `error`。 |
+| `MODEL_VELO_SERVICE_NAME` | 否 | `model-velo` | 日志与 OpenTelemetry service name。 |
+| `MODEL_VELO_METRICS_TOKEN` | 否 | 无 | 设置后 API 与 Worker `/metrics` 要求至少 32 字节的 Bearer Token。 |
+| `MODEL_VELO_WORKER_METRICS_ADDR` | 否 | `:9091` | Usage Worker 的 `/healthz`、`/readyz`、`/metrics` 监听地址。 |
+| `MODEL_VELO_OTEL_EXPORTER_OTLP_ENDPOINT` | 否 | 无 | OTLP/HTTP Trace Collector 绝对 URL；空值禁用导出。 |
+| `MODEL_VELO_OTEL_EXPORTER_OTLP_INSECURE` | 否 | `false` | 是否允许明文 OTLP/HTTP；`http` URL 也会启用。 |
+| `MODEL_VELO_OTEL_SAMPLE_RATIO` | 否 | `0.1` | Parent-based Trace 采样比例，范围 0–1。 |
+| `MODEL_VELO_READINESS_TIMEOUT` | 否 | `1s` | 单次依赖就绪检查的总期限。 |
 | `MODEL_VELO_ROUTING_JSON` | API 必填 | 无 | 显式定义任意数量的 Provider、厂商预设、模型能力、Provider 级运行参数、精确/默认路由和有序候选；只配置一个 Provider 时也不能省略。 |
 | `MODEL_VELO_BREAKER_FAILURE_THRESHOLD` | 否 | `5` | 连续可计数失败达到此值后 Open，范围 1–1000。 |
 | `MODEL_VELO_BREAKER_OPEN_DURATION` | 否 | `30s` | Open 冷却时间，范围 `1s`–`10m`。 |
@@ -157,7 +207,7 @@ OpenAI、Mistral、DeepSeek、xAI、Zhipu、Groq、NVIDIA 和 Together 均由各
 $env:MODEL_VELO_USAGE_PRICING_JSON = '[{"provider":"openai-main","model":"gpt-4o-mini","version":"openai-2026-07","effective_from":"2026-07-01T00:00:00Z","input_usd_per_million":"0.15","output_usd_per_million":"0.60","cached_read_usd_per_million":"0.075"}]'
 ```
 
-上游 `http.Client` 不再维护第三套总超时。非流式调用服从 Attempt Context 和父级请求预算；流式调用在首事件前同时受 Attempt Timeout 与父 Context 约束，首事件验证通过后不再沿用短 Attempt deadline，但后续两个有效事件之间仍复用当前 Provider 的 Attempt Timeout 作为静默上限，上游 heartbeat 会重置计时器。非流式 HTTP Server 的写超时由请求预算加 15 秒前置处理/收尾余量派生；流式 Handler 只在首事件验证后清除该总写截止时间，并为每个客户端帧设置独立 15 秒写截止时间，避免长流被总时长截断或慢客户端无限阻塞。
+上游 `http.Client` 不再维护第三套总超时。非流式调用服从 Attempt Context 和父级请求预算；流式调用在首事件前同时受 Attempt Timeout 与父 Context 约束，首事件验证通过后不再沿用短 Attempt deadline，但后续两个有效事件之间仍复用当前 Provider 的 Attempt Timeout 作为静默上限，上游 heartbeat 会重置计时器。HTTP Server 写超时固定覆盖托管运行时允许的最长 5 分钟请求预算并额外保留 15 秒收尾时间；每个非流式请求仍由自身快照中的较短总预算取消。流式 Handler 在首事件验证后清除总写截止时间，并为每个客户端帧设置独立 15 秒写截止时间。
 
 ### Provider 厂商预设
 
@@ -182,7 +232,7 @@ $env:MODEL_VELO_USAGE_PRICING_JSON = '[{"provider":"openai-main","model":"gpt-4o
 | `nvidia` | `nvidia` | `https://integrate.api.nvidia.com/v1` |
 | `together` | `together` | `https://api.together.ai/v1` |
 
-当前 Azure Adapter 使用 v1 Endpoint 的 `api-key` 鉴权；Bedrock Adapter 使用 Bedrock Runtime Converse 与 Bearer API Key，尚未接 IAM Role/SigV4；Cloudflare Adapter 面向 Workers AI 中接受 `messages` 的 chat 模型。配置其他鉴权方式或模型专属输入 schema 时会明确报不支持，不会静默伪装成兼容成功。
+当前 Azure Adapter 使用 v1 Endpoint 的 `api-key` 鉴权；Bedrock Adapter 使用 Bedrock Runtime Converse 与 Bearer API Key，尚未接 IAM Role/SigV4；Cloudflare Adapter 使用 Workers AI 官方 `/ai/v1/chat/completions`。配置其他鉴权方式或模型专属输入 schema 时会明确报不支持，不会静默伪装成兼容成功。
 
 Mistral、DeepSeek、xAI、Zhipu、Groq、NVIDIA 和 Together 都有独立的 Adapter 类型与文件，后续厂商专属字段、错误解析或能力规则只进入对应 Adapter。它们没有复制七份相同的请求发送代码：官方相同的 Bearer 鉴权、OpenAI Chat JSON 和响应校验由 `compatible.go` 复用。DeepSeek Adapter 使用其 API Base 下的 `/chat/completions`，不会套用自定义兼容端点默认补 `/v1` 的规则。
 
@@ -190,7 +240,7 @@ Mistral、DeepSeek、xAI、Zhipu、Groq、NVIDIA 和 Together 都有独立的 Ad
 
 `MODEL_VELO_ROUTING_JSON` 没有隐式默认值。缺失或只有空白时进程会在连接 PostgreSQL、Redis 和监听端口前启动失败；即使只接一个自定义兼容上游，也必须显式写出 Provider 和 Route。配置中的 `model: "*"` 是默认路由；`upstream_model` 留空表示透传客户端模型，设置值则执行模型别名映射。`candidates` 的数组顺序就是稳定优先级；Router 先按请求所需能力过滤候选，首个实际执行的候选失败且错误策略允许 Fallback 时，Orchestrator 才会执行下一候选。
 
-`model_capabilities` 按上游模型声明 `text`、`image`、`tools`；未声明的模型安全地默认为 `text`。能力不能超过当前 Adapter 协议真正能承载的范围，否则启动失败。Provider 的可选 `runtime` 可分别覆盖 `breaker`、`queue`、`retry` 和 `http`：请求总预算仍是全链路唯一值，Provider 只覆盖单次 `attempt_timeout`；HTTP 每 Host 连接数默认跟随该 Provider 的 `queue.max_in_flight`，避免 Queue 放行后又在默认连接池里形成第二条隐形队列。
+`model_capabilities` 按上游模型声明 `text`、`image`、`audio`、`file`、`tools`、`structured`；未声明的模型安全地默认为 `text`。能力不能超过当前 Adapter 协议真正能承载的范围，否则启动失败。Provider 的可选 `runtime` 可分别覆盖 `breaker`、`queue`、`retry` 和 `http`：请求总预算仍是全链路唯一值，Provider 只覆盖单次 `attempt_timeout`；HTTP 每 Host 连接数默认跟随该 Provider 的 `queue.max_in_flight`，避免 Queue 放行后又在默认连接池里形成第二条隐形队列。
 
 `runtime` 支持的字段是：`breaker.failure_threshold/open_duration/half_open_max_probes`、`queue.max_in_flight/max_waiting/wait_timeout`、`retry.max_attempts/initial_backoff/max_backoff/backoff_multiplier/jitter_ratio/attempt_timeout`，以及 `http.max_idle_connections/max_idle_connections_per_host/max_connections_per_host`。未写的字段继承上表环境变量默认值，所有组合都在启动时校验。
 
@@ -496,6 +546,44 @@ Invoke-RestMethod `
   -Headers $headers `
   -Body $body
 ```
+
+同一接口也可直接使用 OpenAI Python SDK；`base_url` 必须指向网关的 `/v1`，Key 使用创建时仅返回一次的 Model-Velo 业务 Key：
+
+```python
+import os
+from openai import OpenAI
+
+client = OpenAI(
+    api_key=os.environ["MODEL_VELO_CLIENT_KEY"],
+    base_url="http://localhost:8080/v1",
+)
+
+completion = client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=[{"role": "user", "content": "hello"}],
+)
+print(completion.choices[0].message.content)
+
+stream = client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=[{"role": "user", "content": "stream hello"}],
+    stream=True,
+)
+for chunk in stream:
+    if chunk.choices and chunk.choices[0].delta.content:
+        print(chunk.choices[0].delta.content, end="", flush=True)
+```
+
+Bash/curl 的最小重放请求：
+
+```bash
+curl --fail-with-body http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer ${MODEL_VELO_CLIENT_KEY}" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hello"}]}'
+```
+
+聊天、Responses 与 Anthropic Messages 请求体上限为 16 MiB，Embeddings 为 8 MiB；这允许常见内嵌多模态输入，同时仍在 JSON 解码前限制内存占用。更大的媒体应使用厂商支持的 URL/File ID，而不是继续扩大 Base64 请求。
 
 不要使用示例地址调用真实服务，也不要把真实 Key 写入 `.env.example`、测试、日志或 Git。
 

@@ -1,20 +1,21 @@
-# Local credentials and environment overrides
+# Local secrets and runtime configuration.
 .env
 .env.*
 !.env.example
 
-# Go build and test output
+# Go build and test artifacts.
+/bin/
+/dist/
 *.exe
 *.test
 *.out
-coverage/
-dist/
+coverage.*
+*.bench
 
-# Local runtime data and logs
+# Local logs, databases, and editor state.
 *.log
-tmp/
-
-# IDE and operating-system files
+*.db
+*.sqlite
 .idea/
 .vscode/
 .DS_Store

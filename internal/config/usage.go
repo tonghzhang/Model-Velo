@@ -29,6 +29,8 @@ const (
 	usageMaintenanceEnv      = "MODEL_VELO_USAGE_MAINTENANCE_INTERVAL"
 	usageMaintenanceBatchEnv = "MODEL_VELO_USAGE_MAINTENANCE_BATCH_SIZE"
 	usagePricingJSONEnv      = "MODEL_VELO_USAGE_PRICING_JSON"
+	usagePricingRefreshEnv   = "MODEL_VELO_USAGE_PRICING_REFRESH_INTERVAL"
+	usagePendingTimeoutEnv   = "MODEL_VELO_USAGE_PENDING_TIMEOUT"
 	defaultDeadLetterMaxLen  = 100_000
 	defaultUsageBatchSize    = 50
 	defaultUsageDeliveries   = 5
@@ -44,6 +46,8 @@ const (
 	defaultUsageRetryBackoff  = 500 * time.Millisecond
 	defaultUsageWorkerTimeout = 10 * time.Second
 	defaultMaintenance        = time.Hour
+	defaultPricingRefresh     = 30 * time.Second
+	defaultPendingTimeout     = 15 * time.Minute
 )
 
 type UsagePrice struct {
@@ -80,6 +84,8 @@ type Usage struct {
 	MaintenanceInterval time.Duration
 	MaintenanceBatch    int
 	Pricing             []UsagePrice
+	PricingRefresh      time.Duration
+	PendingTimeout      time.Duration
 }
 
 func LoadUsage() (Usage, error) {
@@ -158,6 +164,23 @@ func LoadUsage() (Usage, error) {
 	if err != nil {
 		return Usage{}, err
 	}
+	pricingRefresh, err := loadPositiveDuration(
+		usagePricingRefreshEnv, defaultPricingRefresh,
+	)
+	if err != nil {
+		return Usage{}, err
+	}
+	pendingTimeout, err := loadPositiveDuration(
+		usagePendingTimeoutEnv, defaultPendingTimeout,
+	)
+	if err != nil {
+		return Usage{}, err
+	}
+	if pendingTimeout < 5*time.Minute || pendingTimeout > 24*time.Hour {
+		return Usage{}, fmt.Errorf(
+			"%s must be between 5m and 24h", usagePendingTimeoutEnv,
+		)
+	}
 
 	group := strings.TrimSpace(os.Getenv(usageGroupEnv))
 	if group == "" {
@@ -198,6 +221,8 @@ func LoadUsage() (Usage, error) {
 		MaintenanceInterval: maintenanceInterval,
 		MaintenanceBatch:    maintenanceBatch,
 		Pricing:             pricing,
+		PricingRefresh:      pricingRefresh,
+		PendingTimeout:      pendingTimeout,
 	}, nil
 }
 

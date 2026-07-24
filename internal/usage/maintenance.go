@@ -137,8 +137,9 @@ func (store *Store) Reprice(ctx context.Context, params RepriceParams) (RepriceR
 		result.NextCursor = encodeListCursor(rows[len(rows)-1])
 	}
 	err := store.database.WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
+		pricing := store.pricing.Load()
 		for _, row := range rows {
-			cost := store.pricing.Quote(eventFromRow(row))
+			cost := pricing.Quote(eventFromRow(row))
 			if cost.Snapshot == nil {
 				result.Unknown++
 				if err := transaction.Model(&postgres.UsageEvent{}).

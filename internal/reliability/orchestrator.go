@@ -91,6 +91,13 @@ func (orchestrator *Orchestrator) Execute(ctx context.Context, input ExecutionIn
 		if !SignalsFor(failure).Fallback || index == len(input.Plan.Candidates)-1 { // 错误不允许回退或已是最后一个候选。
 			return ExecutionResult{}, failure // 直接返回当前失败。
 		}
+		addFallbackEvent( // 在当前请求 Span 上记录跨 Provider 切换。
+			executionContext,
+			candidate.ProviderID,
+			input.Plan.Candidates[index+1].ProviderID,
+			fallbacks+1,
+			failure,
+		)
 		fallbacks++ // 准备切换到下一个候选 Provider。
 	}
 
@@ -165,6 +172,13 @@ func (orchestrator *Orchestrator) OpenStream(
 		if !SignalsFor(failure).Fallback || index == len(input.Plan.Candidates)-1 { // 错误不允许回退或已无后续候选。
 			return nil, failure // 返回当前建流失败。
 		}
+		addFallbackEvent( // 在当前请求 Span 上记录首事件前的 Provider 切换。
+			executionContext,
+			candidate.ProviderID,
+			input.Plan.Candidates[index+1].ProviderID,
+			fallbacks+1,
+			failure,
+		)
 		fallbacks++ // 准备切换到下一个 Provider 建流。
 	}
 

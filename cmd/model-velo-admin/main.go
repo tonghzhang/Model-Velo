@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"model-velo/internal/adminauth"
 	"model-velo/internal/apikey"
 	"model-velo/internal/config"
 	"model-velo/internal/postgres"
@@ -44,6 +45,9 @@ func run(ctx context.Context, arguments []string) error {
 	if arguments[0] == "reprice-usage" {
 		return repriceUsage(ctx, database, arguments[1:])
 	}
+	if arguments[0] == "bootstrap-admin" {
+		return bootstrapAdmin(ctx, database, arguments[1:])
+	}
 
 	security, err := config.LoadAPIKeySecurity()
 	if err != nil {
@@ -66,6 +70,38 @@ func run(ctx context.Context, arguments []string) error {
 	default:
 		return usageError()
 	}
+}
+
+func bootstrapAdmin(
+	ctx context.Context,
+	database *postgres.Database,
+	arguments []string,
+) error {
+	flags := flag.NewFlagSet("bootstrap-admin", flag.ContinueOnError)
+	name := flags.String("name", "root", "unique admin principal name")
+	if err := flags.Parse(arguments); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return usageError()
+	}
+	pepper, err := config.LoadAdminKeySecurity()
+	if err != nil {
+		return err
+	}
+	manager, err := adminauth.NewManager(database.ORM(), pepper)
+	if err != nil {
+		return err
+	}
+	issued, err := manager.Bootstrap(ctx, *name)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("admin_principal_id=%s\n", issued.PrincipalID)
+	fmt.Printf("admin_key_prefix=%s\n", issued.KeyPrefix)
+	fmt.Println("admin_key=" + issued.Plaintext)
+	fmt.Println("warning=store this key now; Model-Velo cannot recover it later")
+	return nil
 }
 
 func repriceUsage(ctx context.Context, database *postgres.Database, arguments []string) error {
@@ -248,6 +284,6 @@ func printIssuedKey(issued apikey.IssuedKey) {
 
 func usageError() error {
 	return errors.New(
-		"usage: model-velo-admin <bootstrap-tenant|create-key|revoke-key|disable-key|reprice-usage> [flags]",
+		"usage: model-velo-admin <bootstrap-admin|bootstrap-tenant|create-key|revoke-key|disable-key|reprice-usage> [flags]",
 	)
 }

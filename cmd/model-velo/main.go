@@ -1,10 +1,11 @@
 package main // 程序启动入口包。
 
 import (
-	"context"   // 传递启动取消、请求结束和关闭超时信号。
-	"errors"    // 创建、判断和合并错误。
-	"fmt"       // 包装带上下文的错误信息。
-	"log"       // 输出启动日志和致命错误。
+	"context" // 传递启动取消、请求结束和关闭超时信号。
+	"errors"  // 创建、判断和合并错误。
+	"fmt"     // 包装带上下文的错误信息。
+	"log"     // 输出启动日志和致命错误。
+	"log/slog"
 	"net"       // 创建 TCP 监听器。
 	"net/http"  // 创建和运行 HTTP 服务器。
 	"os"        // 读取环境变量和系统中断信号。
@@ -13,11 +14,19 @@ import (
 	"syscall"   // 提供 SIGTERM 系统信号。
 	"time"      // 配置超时和持续时间。
 
-	"model-velo/internal/apikey"           // 创建网关 API Key 认证与授权服务。
-	"model-velo/internal/config"           // 加载数据库、Redis、路由等配置。
-	"model-velo/internal/httpapi"          // 创建 Gin HTTP 路由。
-	"model-velo/internal/postgres"         // 连接 PostgreSQL 并同步表结构。
-	"model-velo/internal/provider"         // 创建各 Provider 的 Adapter。
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+
+	"model-velo/internal/adminauth"
+	"model-velo/internal/apikey" // 创建网关 API Key 认证与授权服务。
+	"model-velo/internal/config" // 加载数据库、Redis、路由等配置。
+	"model-velo/internal/controlplane"
+	"model-velo/internal/gateway"
+	"model-velo/internal/health"
+	"model-velo/internal/httpapi" // 创建 Gin HTTP 路由。
+	"model-velo/internal/observability"
+	"model-velo/internal/postgres" // 连接 PostgreSQL 并同步表结构。
+	"model-velo/internal/provider" // 创建各 Provider 的 Adapter。
+	"model-velo/internal/quota"
 	"model-velo/internal/ratelimit"        // 创建租户限流器。
 	redisstore "model-velo/internal/redis" // 连接 Redis，别名避免与其他 redis 名称冲突。
 	"model-velo/internal/reliability"      // 创建熔断、队列、Key 和重试组件。
@@ -32,6 +41,7 @@ const (
 	defaultHTTPAddress     = ":8080"                       // 默认监听所有网卡的 8080 端口。
 	defaultShutdownTimeout = 10 * time.Second              // 默认最多等待 10 秒完成关闭。
 	responseWriteGrace     = 15 * time.Second              // 在请求总超时后额外预留响应写出时间。
+	maximumRuntimeTimeout  = 5 * time.Minute               // 热更新允许的最大请求总超时。
 )
 
 func main() { // Go 程序的唯一入口。
@@ -48,6 +58,21 @@ func run() error { // 装配基础设施、启动 HTTP 服务并等待关闭。
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM) // 收到 Ctrl+C 或 SIGTERM 时取消 ctx。
 	defer stop()                                                                           // run 结束时释放系统信号监听资源。
+	logger := observability.NewLogger(startup.observability)
+	slog.SetDefault(logger)
+	log.SetFlags(0)
+	log.SetOutput(observability.LogWriter(logger, "legacy"))
+	shutdownTracing, err := observability.ConfigureTracing(ctx, startup.observability)
+	if err != nil {
+		return fmt.Errorf("configure tracing: %w", err)
+	}
+	defer func() {
+		shutdownContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTracing(shutdownContext); err != nil {
+			logger.Error("trace shutdown failed", "error", err)
+		}
+	}()
 
 	database, err := postgres.Open(ctx, startup.infrastructure.Postgres) // 使用配置连接 PostgreSQL。
 	if err != nil {                                                      // 数据库连接失败。
@@ -70,7 +95,7 @@ func run() error { // 装配基础设施、启动 HTTP 服务并等待关闭。
 	}
 	defer redisClient.Close()              // run 结束时关闭 Redis 客户端。
 	if !redisClient.AvailableAtStartup() { // 启动时 Redis Ping 未成功。
-		log.Printf("Redis startup Ping failed; continuing because startup policy is optional") // 记录警告但按可选策略继续启动。
+		slog.Warn("Redis startup ping failed; continuing with configured degradation policy")
 	}
 	limiter, err := ratelimit.New(redisClient.Native(), startup.rateLimit) // 基于原生 Redis 客户端创建限流器。
 	if err != nil {                                                        // 限流器配置无效。
@@ -85,13 +110,21 @@ func run() error { // 装配基础设施、启动 HTTP 服务并等待关闭。
 	if err != nil { // 响应缓存配置无效。
 		return fmt.Errorf("configure response cache: %w", err) // 返回缓存组件配置错误。
 	}
-	usageEmitter, err := usage.NewRedisEmitter(
+	redisUsageEmitter, err := usage.NewRedisEmitter(
 		redisClient.Native(),
 		startup.usage.StreamKey,
 		startup.usage.EmitTimeout,
 	)
 	if err != nil {
 		return fmt.Errorf("configure usage emitter: %w", err)
+	}
+	usageEmitter, err := usage.NewDurableEmitter(
+		database.ORM(),
+		redisUsageEmitter,
+		startup.usage.EmitTimeout,
+	)
+	if err != nil {
+		return fmt.Errorf("configure durable usage emitter: %w", err)
 	}
 	usagePricing, err := usage.NewPricingCatalog(startup.usage.Pricing)
 	if err != nil {
@@ -101,9 +134,80 @@ func run() error { // 装配基础设施、启动 HTTP 服务并等待关闭。
 	if err != nil {
 		return fmt.Errorf("configure usage store: %w", err)
 	}
+	runtimeSnapshot, err := gateway.NewSnapshot(
+		startup.adapters,
+		startup.routing,
+		startup.breakers,
+		startup.queues,
+		startup.providerKeys,
+		startup.retry,
+	)
+	if err != nil {
+		return fmt.Errorf("configure gateway runtime: %w", err)
+	}
+	runtimeSnapshot.CacheNamespace = startup.responseCache.RouteVersion
+	runtimeManager, err := gateway.NewManager(runtimeSnapshot)
+	if err != nil {
+		return fmt.Errorf("initialize gateway runtime: %w", err)
+	}
+	adminManager, err := adminauth.NewManager(
+		database.ORM(), startup.controlPlane.AdminPepper,
+	)
+	if err != nil {
+		return fmt.Errorf("configure admin authentication: %w", err)
+	}
+	controlService, err := controlplane.NewService(
+		database.ORM(),
+		runtimeManager,
+		usageStore,
+		controlplane.Builder{
+			Defaults:           startup.providerDefaults,
+			EnforceStreamUsage: startup.usage.EnforceStreamUsage,
+		},
+		startup.controlPlane.MasterKey,
+	)
+	if err != nil {
+		return fmt.Errorf("configure control plane: %w", err)
+	}
+	if err := controlService.Load(ctx); err != nil {
+		return fmt.Errorf("load managed configuration: %w", err)
+	}
+	go controlService.Watch(ctx, startup.controlPlane.RefreshInterval)
+	quotaManager, err := quota.NewManager(database.ORM(), usageStore, startup.quota)
+	if err != nil {
+		return fmt.Errorf("configure quota manager: %w", err)
+	}
+	go quotaManager.RunReaper(ctx)
 
-	server, err := newHTTPServer(access, limiter, cache, startup.routing, startup.adapters, startup.breakers, startup.queues, startup.providerKeys, startup.retry, usageEmitter, usageStore) // 将所有服务装配成 HTTP Server。
-	if err != nil {                                                                                                                                                                          // HTTP Server 配置失败。
+	metrics := observability.NewMetrics()
+	if err := metrics.RegisterRuntime(runtimeManager); err != nil {
+		return fmt.Errorf("register runtime metrics: %w", err)
+	}
+	readiness := health.NewChecker(
+		database.SQL(),
+		redisClient.Native(),
+		startup.observability.ReadinessTimeout,
+	)
+	server, err := newHTTPServer(
+		access,
+		limiter,
+		cache,
+		startup.routing,
+		startup.adapters,
+		startup.breakers,
+		startup.queues,
+		startup.providerKeys,
+		startup.retry,
+		usageEmitter,
+		usageStore,
+		httpapi.WithReadiness(readiness),
+		httpapi.WithMetrics(metrics, startup.observability.MetricsToken),
+		httpapi.WithRequestLogger(logger),
+		httpapi.WithRuntimeSource(runtimeManager),
+		httpapi.WithAdminAPI(adminManager, controlService, access),
+		httpapi.WithQuota(quotaManager),
+	) // 将所有服务装配成 HTTP Server。
+	if err != nil { // HTTP Server 配置失败。
 		return fmt.Errorf("configure HTTP server: %w", err) // 返回 HTTP 装配错误。
 	}
 
@@ -115,18 +219,22 @@ func run() error { // 装配基础设施、启动 HTTP 服务并等待关闭。
 }
 
 type startupConfig struct { // 保存启动后续步骤需要的全部配置和已创建组件。
-	infrastructure  config.Infrastructure // PostgreSQL、Redis 等基础设施配置。
-	apiKeySecurity  config.APIKeySecurity // API Key 哈希 Pepper 等安全配置。
-	rateLimit       config.RateLimit      // 租户限流配置。
-	responseCache   config.ResponseCache  // 响应缓存配置。
-	usage           config.Usage
-	routing         *routing.Router                  // 已创建的模型路由器。
-	adapters        *provider.AdapterRegistry        // 已创建的 Provider Adapter 注册表。
-	breakers        *reliability.BreakerRegistry     // 已创建的 Provider 熔断器注册表。
-	queues          *reliability.QueueRegistry       // 已创建的 Provider 并发队列注册表。
-	providerKeys    *reliability.ProviderKeyRegistry // 已创建的上游 API Key 注册表，无需 Key 时可为 nil。
-	retry           *reliability.RetryRegistry       // 已创建的 Provider 重试策略注册表。
-	shutdownTimeout time.Duration                    // HTTP Server 优雅关闭最大等待时间。
+	infrastructure   config.Infrastructure // PostgreSQL、Redis 等基础设施配置。
+	apiKeySecurity   config.APIKeySecurity // API Key 哈希 Pepper 等安全配置。
+	rateLimit        config.RateLimit      // 租户限流配置。
+	responseCache    config.ResponseCache  // 响应缓存配置。
+	usage            config.Usage
+	observability    config.Observability
+	controlPlane     config.ControlPlane
+	quota            config.Quota
+	providerDefaults config.ProviderDefaults
+	routing          *routing.Router                  // 已创建的模型路由器。
+	adapters         *provider.AdapterRegistry        // 已创建的 Provider Adapter 注册表。
+	breakers         *reliability.BreakerRegistry     // 已创建的 Provider 熔断器注册表。
+	queues           *reliability.QueueRegistry       // 已创建的 Provider 并发队列注册表。
+	providerKeys     *reliability.ProviderKeyRegistry // 已创建的上游 API Key 注册表，无需 Key 时可为 nil。
+	retry            *reliability.RetryRegistry       // 已创建的 Provider 重试策略注册表。
+	shutdownTimeout  time.Duration                    // HTTP Server 优雅关闭最大等待时间。
 }
 
 func loadStartupConfig() (startupConfig, error) { // 加载所有启动配置并创建 Provider 运行组件。
@@ -151,6 +259,18 @@ func loadStartupConfig() (startupConfig, error) { // 加载所有启动配置并
 	if err != nil {
 		return startupConfig{}, err
 	}
+	observabilityConfig, err := config.LoadObservability()
+	if err != nil {
+		return startupConfig{}, err
+	}
+	controlPlaneConfig, err := config.LoadControlPlane()
+	if err != nil {
+		return startupConfig{}, err
+	}
+	quotaConfig, err := config.LoadQuota()
+	if err != nil {
+		return startupConfig{}, err
+	}
 	breakerConfig, err := config.LoadCircuitBreaker() // 读取所有 Provider 默认熔断配置。
 	if err != nil {                                   // 熔断配置不合法。
 		return startupConfig{}, err
@@ -163,13 +283,14 @@ func loadStartupConfig() (startupConfig, error) { // 加载所有启动配置并
 	if err != nil {                        // 重试配置不合法。
 		return startupConfig{}, err
 	}
-	routingConfig, err := config.LoadRouting(config.ProviderDefaults{ // 读取路由文件并把默认配置合并到各 Provider。
+	providerDefaults := config.ProviderDefaults{
 		Breaker: breakerConfig,                // Provider 未单独配置时使用的熔断规则。
 		Queue:   queueConfig,                  // Provider 未单独配置时使用的队列规则。
 		Retry:   retryConfig,                  // Provider 未单独配置时使用的重试规则。
 		HTTP:    provider.DefaultHTTPConfig(), // Provider 未单独配置时使用的 HTTP 参数。
-	})
-	if err != nil { // 路由或 Provider 配置不合法。
+	}
+	routingConfig, err := config.LoadRouting(providerDefaults) // 读取路由文件并把默认配置合并到各 Provider。
+	if err != nil {                                            // 路由或 Provider 配置不合法。
 		return startupConfig{}, err
 	}
 	routes, err := routing.New(routingConfig.Definition) // 根据路由定义创建运行时 Router。
@@ -230,18 +351,22 @@ func loadStartupConfig() (startupConfig, error) { // 加载所有启动配置并
 	}
 
 	return startupConfig{ // 返回启动后续阶段所需的完整配置和组件。
-		infrastructure:  infrastructure, // 保存基础设施配置。
-		apiKeySecurity:  apiKeySecurity, // 保存 API Key 安全配置。
-		rateLimit:       rateLimit,      // 保存限流配置。
-		responseCache:   responseCache,  // 保存缓存配置。
-		usage:           usageConfig,
-		routing:         routes,          // 保存运行时路由器。
-		adapters:        adapters,        // 保存 Adapter 注册表。
-		breakers:        breakers,        // 保存熔断器注册表。
-		queues:          queues,          // 保存队列注册表。
-		providerKeys:    providerKeys,    // 保存 Provider Key 注册表。
-		retry:           retry,           // 保存重试注册表。
-		shutdownTimeout: shutdownTimeout, // 保存优雅关闭超时。
+		infrastructure:   infrastructure, // 保存基础设施配置。
+		apiKeySecurity:   apiKeySecurity, // 保存 API Key 安全配置。
+		rateLimit:        rateLimit,      // 保存限流配置。
+		responseCache:    responseCache,  // 保存缓存配置。
+		usage:            usageConfig,
+		observability:    observabilityConfig,
+		controlPlane:     controlPlaneConfig,
+		quota:            quotaConfig,
+		providerDefaults: providerDefaults,
+		routing:          routes,          // 保存运行时路由器。
+		adapters:         adapters,        // 保存 Adapter 注册表。
+		breakers:         breakers,        // 保存熔断器注册表。
+		queues:           queues,          // 保存队列注册表。
+		providerKeys:     providerKeys,    // 保存 Provider Key 注册表。
+		retry:            retry,           // 保存重试注册表。
+		shutdownTimeout:  shutdownTimeout, // 保存优雅关闭超时。
 	}, nil
 }
 
@@ -257,6 +382,7 @@ func newHTTPServer( // 根据已创建的服务组装 net/http Server。
 	retry reliability.RetryPolicies, // Provider 重试策略接口。
 	usageEmitter usage.Emitter,
 	usageReader httpapi.UsageReader,
+	options ...httpapi.RouterOption,
 ) (*http.Server, error) {
 	if retry == nil { // WriteTimeout 和路由执行都依赖重试策略。
 		return nil, errors.New("retry policy is required") // 缺少重试策略时拒绝创建 Server。
@@ -266,13 +392,28 @@ func newHTTPServer( // 根据已创建的服务组装 net/http Server。
 		address = defaultHTTPAddress // 使用默认 :8080。
 	}
 
+	router := httpapi.NewRouter(
+		adapters,
+		access,
+		limiter,
+		cache,
+		routes,
+		breakers,
+		queues,
+		providerKeys,
+		retry,
+		usageEmitter,
+		usageReader,
+		options...,
+	)
+	handler := otelhttp.NewHandler(router, "model-velo.http")
 	return &http.Server{ // 创建标准库 HTTP Server。
-		Addr:              address,                                                                                                                       // 设置 TCP 监听地址。
-		Handler:           httpapi.NewRouter(adapters, access, limiter, cache, routes, breakers, queues, providerKeys, retry, usageEmitter, usageReader), // 创建 Gin 路由并作为 Server 的请求处理器。
-		ReadHeaderTimeout: 5 * time.Second,                                                                                                               // 最多等待 5 秒读取完整请求头。
-		ReadTimeout:       15 * time.Second,                                                                                                              // 最多等待 15 秒读取完整 HTTP 请求。
-		WriteTimeout:      retry.RequestTimeout() + responseWriteGrace,                                                                                   // 给上游请求总超时加上响应写出缓冲时间。
-		IdleTimeout:       60 * time.Second,                                                                                                              // 空闲长连接最多保留 60 秒。
+		Addr:              address,                                    // 设置 TCP 监听地址。
+		Handler:           handler,                                    // 创建 Gin 路由并作为 Server 的请求处理器。
+		ReadHeaderTimeout: 5 * time.Second,                            // 最多等待 5 秒读取完整请求头。
+		ReadTimeout:       15 * time.Second,                           // 最多等待 15 秒读取完整 HTTP 请求。
+		WriteTimeout:      maximumRuntimeTimeout + responseWriteGrace, // 覆盖热更新允许的最长非流式请求；请求自身仍由运行时总预算控制。
+		IdleTimeout:       60 * time.Second,                           // 空闲长连接最多保留 60 秒。
 	}, nil
 }
 

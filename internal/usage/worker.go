@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -19,6 +19,7 @@ const maximumDeadLetterPayload = 64 << 10
 type Worker struct {
 	client *goredis.Client
 	store  *Store
+	relay  *OutboxRelay
 	config config.Usage
 	stats  workerCounters
 }
@@ -31,6 +32,7 @@ type WorkerStats struct {
 	Failed       int64
 	DeadLettered int64
 	Cleaned      int64
+	Relayed      int64
 }
 
 type workerCounters struct {
@@ -41,6 +43,11 @@ type workerCounters struct {
 	failed       atomic.Int64
 	deadLettered atomic.Int64
 	cleaned      atomic.Int64
+	relayed      atomic.Int64
+}
+
+func (worker *Worker) SetOutboxRelay(relay *OutboxRelay) {
+	worker.relay = relay
 }
 
 func NewWorker(client *goredis.Client, store *Store, settings config.Usage) (*Worker, error) {
@@ -57,7 +64,8 @@ func NewWorker(client *goredis.Client, store *Store, settings config.Usage) (*Wo
 		return nil, errors.New("usage worker counts must be positive")
 	case settings.ReadBlock <= 0 || settings.ClaimIdle <= 0 ||
 		settings.RetryBackoff <= 0 || settings.WorkerTimeout <= 0 ||
-		settings.MaintenanceInterval <= 0:
+		settings.MaintenanceInterval <= 0 || settings.PricingRefresh <= 0 ||
+		settings.PendingTimeout < 5*time.Minute:
 		return nil, errors.New("usage worker durations must be positive")
 	case settings.RetentionDays < 0 || settings.RetentionDays > 3_650 ||
 		settings.MaintenanceBatch <= 0 || settings.MaintenanceBatch > 10_000:
@@ -73,6 +81,7 @@ func (worker *Worker) Run(ctx context.Context) error {
 
 	claimStart := "0-0"
 	nextMaintenance := time.Now()
+	nextPricingRefresh := time.Now()
 	for {
 		if ctx.Err() != nil {
 			return nil
@@ -81,12 +90,30 @@ func (worker *Worker) Run(ctx context.Context) error {
 			worker.maintain(ctx)
 			nextMaintenance = time.Now().Add(worker.config.MaintenanceInterval)
 		}
+		if !time.Now().Before(nextPricingRefresh) {
+			worker.refreshPricing(ctx)
+			nextPricingRefresh = time.Now().Add(worker.config.PricingRefresh)
+		}
+		if worker.relay != nil {
+			relayContext, cancelRelay := context.WithTimeout(
+				context.WithoutCancel(ctx),
+				worker.config.WorkerTimeout,
+			)
+			relayed, relayErr := worker.relay.Publish(relayContext)
+			cancelRelay()
+			if relayErr != nil {
+				worker.stats.failed.Add(1)
+				slog.Error("usage worker outbox relay failed", "error", relayErr)
+			} else {
+				worker.stats.relayed.Add(int64(relayed))
+			}
+		}
 		claimed, nextClaimStart, err := worker.claim(ctx, claimStart)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
-			log.Print("usage worker pending claim failed")
+			slog.Error("usage worker pending claim failed", "error", err)
 			if !waitForRetry(ctx, worker.config.RetryBackoff) {
 				return nil
 			}
@@ -110,7 +137,7 @@ func (worker *Worker) Run(ctx context.Context) error {
 			if errors.Is(err, goredis.Nil) {
 				continue
 			}
-			log.Print("usage worker stream read failed")
+			slog.Error("usage worker stream read failed", "error", err)
 			if !waitForRetry(ctx, worker.config.RetryBackoff) {
 				return nil
 			}
@@ -118,6 +145,18 @@ func (worker *Worker) Run(ctx context.Context) error {
 		}
 		worker.stats.read.Add(int64(len(messages)))
 		worker.processBatch(ctx, messages)
+	}
+}
+
+func (worker *Worker) refreshPricing(ctx context.Context) {
+	refreshContext, cancel := context.WithTimeout(
+		context.WithoutCancel(ctx),
+		worker.config.WorkerTimeout,
+	)
+	defer cancel()
+	if _, err := worker.store.ReloadManagedPricing(refreshContext); err != nil {
+		worker.stats.failed.Add(1)
+		slog.Error("usage worker pricing refresh failed", "error", err)
 	}
 }
 
@@ -130,6 +169,7 @@ func (worker *Worker) Stats() WorkerStats {
 		Failed:       worker.stats.failed.Load(),
 		DeadLettered: worker.stats.deadLettered.Load(),
 		Cleaned:      worker.stats.cleaned.Load(),
+		Relayed:      worker.stats.relayed.Load(),
 	}
 }
 
@@ -150,7 +190,7 @@ func (worker *Worker) maintain(ctx context.Context) {
 	)
 	if err != nil {
 		worker.stats.failed.Add(1)
-		log.Print("usage worker retention cleanup failed")
+		slog.Error("usage worker retention cleanup failed", "error", err)
 		return
 	}
 	worker.stats.cleaned.Add(deleted)
@@ -223,7 +263,11 @@ func (worker *Worker) processBatch(ctx context.Context, messages []goredis.XMess
 	for _, message := range messages {
 		if err := worker.processMessage(batchContext, message); err != nil {
 			worker.stats.failed.Add(1)
-			log.Printf("usage worker entry failed entry_id=%s", message.ID)
+			slog.Error(
+				"usage worker entry failed",
+				"entry_id", message.ID,
+				"error", err,
+			)
 		}
 		if batchContext.Err() != nil {
 			return

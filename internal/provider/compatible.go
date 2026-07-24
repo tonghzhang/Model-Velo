@@ -12,7 +12,6 @@ import (
 type compatibleChatAdapter struct {
 	endpoint           string
 	protocol           string
-	supportsImageInput bool
 	enforceStreamUsage bool
 	transport          *jsonTransport
 }
@@ -40,7 +39,6 @@ func newCompatibleChatAdapterWithUsage(
 	return &compatibleChatAdapter{
 		endpoint:           endpoint,
 		protocol:           protocol,
-		supportsImageInput: ProtocolSupportsCapability(protocol, CapabilityImage),
 		enforceStreamUsage: enforceStreamUsage,
 		transport:          newJSONTransport(httpConfig),
 	}, nil
@@ -113,15 +111,23 @@ func (adapter *compatibleChatAdapter) OpenStream(
 }
 
 func (adapter *compatibleChatAdapter) validateInput(input ChatInput) error {
-	if adapter.supportsImageInput {
-		return nil
-	}
-	usesImage, err := requestUsesImage(input)
+	request, err := decodeChatRequest(input)
 	if err != nil {
 		return err
 	}
-	if usesImage {
-		return fmt.Errorf("%w: %s image content", ErrUnsupportedCapability, adapter.protocol)
+	capabilities, err := request.RequiredCapabilities()
+	if err != nil {
+		return err
+	}
+	for _, capability := range capabilities {
+		if !ProtocolSupportsCapability(adapter.protocol, capability) {
+			return fmt.Errorf(
+				"%w: %s %s content",
+				ErrUnsupportedCapability,
+				adapter.protocol,
+				capability,
+			)
+		}
 	}
 	return nil
 }
@@ -149,43 +155,54 @@ func validateCompatibleChatResponse(body []byte) error {
 			return ErrInvalidResponse
 		}
 		var role string
-		if err := json.Unmarshal(message["role"], &role); err != nil || strings.TrimSpace(role) == "" {
+		if err := json.Unmarshal(message["role"], &role); err != nil || role != "assistant" {
 			return ErrInvalidResponse
 		}
-		if !hasResponseValue(message, "content", "tool_calls", "function_call", "refusal") {
+		if err := validateCompatibleMessagePayload(message); err != nil {
 			return ErrInvalidResponse
 		}
 	}
 	return nil
 }
 
-func hasResponseValue(message map[string]json.RawMessage, fields ...string) bool {
-	for _, field := range fields {
-		value := bytes.TrimSpace(message[field])
-		if len(value) > 0 && !bytes.Equal(value, []byte("null")) {
-			return true
+func validateCompatibleMessagePayload(message map[string]json.RawMessage) error {
+	hasPayload := false
+	if valuePresent(message["content"]) {
+		var content string
+		if err := json.Unmarshal(message["content"], &content); err != nil {
+			return ErrInvalidResponse
 		}
+		hasPayload = true
 	}
-	return false
-}
-
-func requestUsesImage(input ChatInput) (bool, error) {
-	request, err := decodeChatRequest(input)
-	if err != nil {
-		return false, err
-	}
-	for _, message := range request.Messages {
-		parts, err := decodeContent(message.Content)
-		if err != nil {
-			return false, err
+	if valuePresent(message["tool_calls"]) {
+		var calls []ChatToolCall
+		if err := json.Unmarshal(message["tool_calls"], &calls); err != nil ||
+			len(calls) == 0 ||
+			validateResponseToolCalls(calls) != nil {
+			return ErrInvalidResponse
 		}
-		for _, part := range parts {
-			if part.Type == "image_url" {
-				return true, nil
-			}
-		}
+		hasPayload = true
 	}
-	return false, nil
+	if valuePresent(message["function_call"]) {
+		var call ChatFunctionCall
+		if err := json.Unmarshal(message["function_call"], &call); err != nil ||
+			strings.TrimSpace(call.Name) == "" ||
+			validateJSONStringObject(call.Arguments) != nil {
+			return ErrInvalidResponse
+		}
+		hasPayload = true
+	}
+	if valuePresent(message["refusal"]) {
+		var refusal string
+		if err := json.Unmarshal(message["refusal"], &refusal); err != nil {
+			return ErrInvalidResponse
+		}
+		hasPayload = true
+	}
+	if !hasPayload {
+		return ErrInvalidResponse
+	}
+	return nil
 }
 
 // compatibleChatEndpoint 区分自定义兼容地址与厂商已带版本前缀的地址。

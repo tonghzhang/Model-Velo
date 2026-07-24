@@ -17,6 +17,8 @@ import (
 
 	"model-velo/internal/config"
 	dbstore "model-velo/internal/postgres"
+	quotastore "model-velo/internal/quota"
+	"model-velo/internal/usage"
 )
 
 const postgresTestDSNEnv = "MODEL_VELO_POSTGRES_TEST_DSN"
@@ -48,6 +50,40 @@ func TestPostgresAPIKeyLifecycle(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("BootstrapTenant() error = %v", err)
+	}
+
+	pricing, err := usage.NewPricingCatalog(nil)
+	if err != nil {
+		t.Fatalf("NewPricingCatalog() error = %v", err)
+	}
+	quotaManager, err := quotastore.NewManager(
+		database.ORM(),
+		pricing,
+		config.Quota{
+			ReservationTTL:         15 * time.Minute,
+			ReapInterval:           time.Minute,
+			DefaultMaxOutputTokens: 4096,
+		},
+	)
+	if err != nil {
+		t.Fatalf("quota.NewManager() error = %v", err)
+	}
+	requestLimit := int64(10)
+	quotaInput := quotastore.PolicyInput{
+		TenantID:     "00000000-0000-4000-8000-000000000000",
+		GatewayModel: "*", Period: dbstore.QuotaPeriodMonth,
+		RequestLimit:  &requestLimit,
+		OveragePolicy: dbstore.QuotaOverageDeny,
+		Enabled:       true,
+	}
+	const quotaActorID = "00000000-0000-4000-8000-000000000099"
+	_, err = quotaManager.CreatePolicy(ctx, quotaInput, quotaActorID)
+	requireErrorIs(t, err, quotastore.ErrTenantNotFound)
+	quotaInput.TenantID = issued.TenantID
+	if _, err := quotaManager.CreatePolicy(
+		ctx, quotaInput, quotaActorID,
+	); err != nil {
+		t.Fatalf("CreatePolicy(existing tenant) error = %v", err)
 	}
 	if issued.Plaintext == "" || issued.ID == "" || issued.TenantID == "" {
 		t.Fatal("BootstrapTenant() returned incomplete key metadata")
@@ -110,7 +146,7 @@ func TestPostgresAPIKeyLifecycle(t *testing.T) {
 		t.Fatalf("Revoke() error = %v", err)
 	}
 	_, err = manager.Authenticate(ctx, issued.Plaintext)
-	requireErrorIs(t, err, ErrKeyInactive)
+	requireErrorIs(t, err, ErrKeyRevoked)
 	requireErrorIs(t, manager.Revoke(ctx, issued.ID), ErrKeyRevoked)
 	requireErrorIs(t, manager.Disable(ctx, issued.ID), ErrKeyRevoked)
 
@@ -235,6 +271,15 @@ func assertPostgresSchema(t *testing.T, database *gorm.DB) {
 		&dbstore.APIKey{},
 		&dbstore.TenantModelGrant{},
 		&dbstore.UsageEvent{},
+		&dbstore.UsageOutbox{},
+		&dbstore.AdminPrincipal{},
+		&dbstore.AdminRoleGrant{},
+		&dbstore.RuntimeConfigVersion{},
+		&dbstore.ManagedPricing{},
+		&dbstore.AuditLog{},
+		&dbstore.TenantQuotaPolicy{},
+		&dbstore.QuotaWindow{},
+		&dbstore.QuotaReservation{},
 	} {
 		if !migrator.HasTable(model) {
 			t.Errorf("AutoMigrate did not create table for %T", model)
@@ -252,6 +297,12 @@ func assertPostgresSchema(t *testing.T, database *gorm.DB) {
 		{&dbstore.UsageEvent{}, "usage_events_request_idx"},
 		{&dbstore.UsageEvent{}, "usage_events_provider_started_idx"},
 		{&dbstore.UsageEvent{}, "usage_events_status_ended_idx"},
+		{&dbstore.UsageOutbox{}, "usage_outbox_state_published_idx"},
+		{&dbstore.AdminPrincipal{}, "admin_principals_digest_unique"},
+		{&dbstore.RuntimeConfigVersion{}, "runtime_config_versions_one_active"},
+		{&dbstore.AuditLog{}, "audit_logs_action_created_idx"},
+		{&dbstore.TenantQuotaPolicy{}, "quota_policies_match_idx"},
+		{&dbstore.QuotaReservation{}, "quota_reservations_state_expiry_idx"},
 	} {
 		if !migrator.HasIndex(index.model, index.name) {
 			t.Errorf("AutoMigrate did not create index %s", index.name)
@@ -265,6 +316,12 @@ func assertPostgresSchema(t *testing.T, database *gorm.DB) {
 		{&dbstore.APIKey{}, "api_keys_status_check"},
 		{&dbstore.APIKey{}, "Tenant"},
 		{&dbstore.TenantModelGrant{}, "Tenant"},
+		{&dbstore.UsageOutbox{}, "usage_outbox_state_check"},
+		{&dbstore.AdminPrincipal{}, "admin_principals_status_check"},
+		{&dbstore.TenantQuotaPolicy{}, "quota_policies_period_check"},
+		{&dbstore.TenantQuotaPolicy{}, "quota_policies_overage_check"},
+		{&dbstore.TenantQuotaPolicy{}, "Tenant"},
+		{&dbstore.QuotaReservation{}, "quota_reservations_state_check"},
 	} {
 		if !migrator.HasConstraint(constraint.model, constraint.name) {
 			t.Errorf("AutoMigrate did not create constraint %s for %T", constraint.name, constraint.model)

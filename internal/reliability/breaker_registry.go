@@ -109,3 +109,22 @@ func (registry *BreakerRegistry) Snapshots() []BreakerSnapshot {
 	}
 	return snapshots
 }
+
+// ReuseProvider replaces a newly built breaker with the previous mutable
+// instance when both snapshots have the same breaker configuration.
+func (registry *BreakerRegistry) ReuseProvider(
+	providerID string,
+	previous *BreakerRegistry,
+) bool {
+	providerID = strings.TrimSpace(providerID)
+	if registry == nil || previous == nil {
+		return false
+	}
+	current := registry.breakers[providerID]
+	existing := previous.breakers[providerID]
+	if current == nil || existing == nil || current.config != existing.config {
+		return false
+	}
+	registry.breakers[providerID] = existing
+	return true
+}

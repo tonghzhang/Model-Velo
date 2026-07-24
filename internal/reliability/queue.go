@@ -272,6 +272,25 @@ func (registry *QueueRegistry) Snapshots() []QueueSnapshot {
 	return snapshots
 }
 
+// ReuseProvider keeps in-flight leases and waiting requests coordinated across
+// runtime snapshots when the provider queue configuration is unchanged.
+func (registry *QueueRegistry) ReuseProvider(
+	providerID string,
+	previous *QueueRegistry,
+) bool {
+	providerID = strings.TrimSpace(providerID)
+	if registry == nil || previous == nil {
+		return false
+	}
+	current := registry.queues[providerID]
+	existing := previous.queues[providerID]
+	if current == nil || existing == nil || current.config != existing.config {
+		return false
+	}
+	registry.queues[providerID] = existing
+	return true
+}
+
 func stopQueueTimer(timer *time.Timer) {
 	if !timer.Stop() {
 		select {

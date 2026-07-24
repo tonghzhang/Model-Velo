@@ -5,6 +5,7 @@ import (
 
 	"github.com/gin-gonic/gin" // Gin Web 框架。
 
+	"model-velo/internal/gateway"
 	"model-velo/internal/provider"    // Provider Adapter 注册表。
 	"model-velo/internal/reliability" // 重试、熔断、队列和 Provider 回退。
 	"model-velo/internal/routing"     // 模型路由规则。
@@ -32,6 +33,7 @@ func NewRouter(
 	retry reliability.RetryPolicies, // 每个 Provider 的重试策略集合。
 	usageEmitter usage.Emitter,
 	usageReader UsageReader,
+	options ...RouterOption,
 ) *gin.Engine {
 	// Provider Adapter 注册表不能为空，否则无法调用上游。
 	if adapters == nil {
@@ -79,43 +81,47 @@ func NewRouter(
 		panic("httpapi: usage reader is nil")
 	}
 
-	// 创建单个 Provider 内部的请求执行器。
-	//
-	// attempts 负责：
-	// 熔断检查 → 排队 → 选择 Key → 调用 Adapter → Provider 内重试。
-	attempts, err := reliability.NewAttemptExecutor(
-		adapters,
-		breakers,
-		queues,
-		providerKeys,
-		retry,
-	)
-	if err != nil {
-		// 启动阶段依赖装配失败，直接终止程序。
-		panic("httpapi: create attempt executor: " + err.Error())
+	settings := routerSettings{}
+	for _, option := range options {
+		if option != nil {
+			option(&settings)
+		}
 	}
 
-	// 创建 Provider 候选调度器。
-	//
-	// orchestrator 负责遍历路由候选，
-	// 当前 Provider 失败后决定是否切换到下一个 Provider。
-	orchestrator, err := reliability.NewOrchestrator(attempts, retry)
-	if err != nil {
-		// 无法创建上游调度器时终止启动。
-		panic("httpapi: create fallback orchestrator: " + err.Error())
+	if settings.runtime == nil {
+		snapshot, err := gateway.NewSnapshot(
+			adapters, routes, breakers, queues, providerKeys, retry,
+		)
+		if err != nil {
+			panic("httpapi: create gateway runtime: " + err.Error())
+		}
+		manager, err := gateway.NewManager(snapshot)
+		if err != nil {
+			panic("httpapi: initialize gateway runtime: " + err.Error())
+		}
+		settings.runtime = manager
 	}
 
 	// 创建一个不自带默认中间件的 Gin Engine。
 	router := gin.New()
-
-	// 注册异常恢复中间件，防止单个请求 panic 导致整个进程退出。
-	router.Use(gin.Recovery())
+	if err := router.SetTrustedProxies(nil); err != nil {
+		panic("httpapi: disable implicit trusted proxies: " + err.Error())
+	}
 
 	// 为每个请求生成或读取 Request ID，并写入请求上下文。
 	router.Use(requestIDMiddleware())
+	router.Use(requestSummaryMiddleware(settings.requestLogger, settings.metrics))
+
+	// Recovery 放在请求汇总中间件内层，让 panic 被转换为 500 后仍能
+	// 正确结束 span、写日志并归零 in-flight gauge。
+	router.Use(safeRecoveryMiddleware(settings.requestLogger))
 
 	// 注册无需认证的健康检查接口。
 	router.GET("/healthz", health)
+	router.GET("/readyz", readinessHandler(settings.readiness))
+	if settings.metrics != nil {
+		router.GET("/metrics", metricsHandler(settings.metrics, settings.metricsToken))
+	}
 
 	// 创建以 /v1 为前缀的路由组。
 	protected := router.Group("/v1")
@@ -133,18 +139,69 @@ func NewRouter(
 
 		// 创建 chatHandler，并注入处理请求所需的服务。
 		chatHandler{
-			access:       access,       // 检查租户是否允许使用请求模型。
-			limiter:      limiter,      // 检查租户请求额度。
-			cache:        cache,        // 查询或写入响应缓存。
-			routes:       routes,       // 生成 Provider 候选计划。
-			orchestrator: orchestrator, // 执行重试、熔断和 Provider 回退。
+			access:       access,  // 检查租户是否允许使用请求模型。
+			limiter:      limiter, // 检查租户请求额度。
+			cache:        cache,   // 查询或写入响应缓存。
+			runtime:      settings.runtime,
 			usageEmitter: usageEmitter,
+			metrics:      settings.metrics,
+			logger:       settings.requestLogger,
+			quota:        settings.quota,
 		}.complete, // 将 complete 方法注册为聊天接口处理函数。
 	)
+	protected.POST(
+		"/responses",
+		chatHandler{
+			access:       access,
+			limiter:      limiter,
+			cache:        cache,
+			runtime:      settings.runtime,
+			usageEmitter: usageEmitter,
+			metrics:      settings.metrics,
+			logger:       settings.requestLogger,
+			quota:        settings.quota,
+		}.responses,
+	)
+	protected.POST(
+		"/messages",
+		chatHandler{
+			access:       access,
+			limiter:      limiter,
+			cache:        cache,
+			runtime:      settings.runtime,
+			usageEmitter: usageEmitter,
+			metrics:      settings.metrics,
+			logger:       settings.requestLogger,
+			quota:        settings.quota,
+		}.anthropicMessages,
+	)
+	protected.POST(
+		"/embeddings",
+		embeddingHandler{
+			access:       access,
+			limiter:      limiter,
+			cache:        cache,
+			runtime:      settings.runtime,
+			usageEmitter: usageEmitter,
+			metrics:      settings.metrics,
+			logger:       settings.requestLogger,
+			quota:        settings.quota,
+		}.create,
+	)
+	models := modelHandler{runtime: settings.runtime, access: access}
+	protected.GET("/models", models.list)
+	protected.GET("/models/:model", models.get)
 	usageQueries := usageQueryHandler{reader: usageReader}
 	protected.GET("/usage/events", usageQueries.list)
 	protected.GET("/usage/summary", usageQueries.summary)
 	protected.GET("/usage/series", usageQueries.series)
+
+	if settings.adminAuth != nil && settings.controlPlane != nil {
+		registerAdminRoutes(
+			router, settings.adminAuth, settings.controlPlane, settings.quota,
+			settings.tenantAdmin,
+		)
+	}
 
 	// 返回组装完成的 Gin 路由器，交给 http.Server 使用。
 	return router

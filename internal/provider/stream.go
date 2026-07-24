@@ -262,8 +262,77 @@ func validateCompatibleChatChunk(data []byte) error {
 		if !jsonObject(choice.Delta) {
 			return ErrInvalidStream
 		}
+		if err := validateCompatibleStreamDelta(choice.Delta); err != nil {
+			return err
+		}
 	}
 
+	return nil
+}
+
+func validateCompatibleStreamDelta(raw json.RawMessage) error {
+	var delta map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &delta); err != nil || delta == nil {
+		return ErrInvalidStream
+	}
+	if valuePresent(delta["role"]) {
+		var role string
+		if err := json.Unmarshal(delta["role"], &role); err != nil || role != "assistant" {
+			return ErrInvalidStream
+		}
+	}
+	for _, field := range []string{"content", "reasoning_content", "refusal"} {
+		if !valuePresent(delta[field]) {
+			continue
+		}
+		var value string
+		if err := json.Unmarshal(delta[field], &value); err != nil {
+			return ErrInvalidStream
+		}
+	}
+	if !valuePresent(delta["tool_calls"]) {
+		return nil
+	}
+	var calls []struct {
+		Index    *int            `json:"index"`
+		ID       json.RawMessage `json:"id"`
+		Type     json.RawMessage `json:"type"`
+		Function json.RawMessage `json:"function"`
+	}
+	if err := json.Unmarshal(delta["tool_calls"], &calls); err != nil || len(calls) == 0 {
+		return ErrInvalidStream
+	}
+	for _, call := range calls {
+		if call.Index == nil || *call.Index < 0 || !jsonObject(call.Function) {
+			return ErrInvalidStream
+		}
+		if valuePresent(call.ID) {
+			var id string
+			if err := json.Unmarshal(call.ID, &id); err != nil || id == "" {
+				return ErrInvalidStream
+			}
+		}
+		if valuePresent(call.Type) {
+			var callType string
+			if err := json.Unmarshal(call.Type, &callType); err != nil || callType != "function" {
+				return ErrInvalidStream
+			}
+		}
+		var function map[string]json.RawMessage
+		if err := json.Unmarshal(call.Function, &function); err != nil {
+			return ErrInvalidStream
+		}
+		for _, field := range []string{"name", "arguments"} {
+			if !valuePresent(function[field]) {
+				continue
+			}
+			var value string
+			if err := json.Unmarshal(function[field], &value); err != nil ||
+				(field == "name" && value == "") {
+				return ErrInvalidStream
+			}
+		}
+	}
 	return nil
 }
 

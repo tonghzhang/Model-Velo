@@ -46,6 +46,31 @@ func (adapter *azureOpenAIAdapter) Complete(
 	return responseBody, nil
 }
 
+func (adapter *azureOpenAIAdapter) OpenStream(
+	ctx context.Context,
+	input ChatInput,
+	apiKey string,
+) (*ChatEventStream, error) {
+	body, err := compatibleStreamRequestBody(input, true)
+	if err != nil {
+		return nil, err
+	}
+	headers := make(http.Header)
+	headers.Set("api-key", strings.TrimSpace(apiKey))
+	responseBody, err := adapter.transport.postStream(
+		ctx, adapter.endpoint, input.RequestID, body, headers,
+	)
+	if err != nil {
+		return nil, err
+	}
+	stream, err := newChatEventStream(responseBody)
+	if err != nil {
+		responseBody.Close()
+		return nil, err
+	}
+	return stream, nil
+}
+
 // azureChatEndpoint 兼容资源根地址、/openai/v1 前缀以及完整 Chat 端点。
 func azureChatEndpoint(rawBaseURL string) (string, error) {
 	parsed, err := parseBaseURL(rawBaseURL)

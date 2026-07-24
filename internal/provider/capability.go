@@ -6,10 +6,13 @@ import "strings"
 type Capability string
 
 const (
-	// 三种能力是当前路由层能够判定并筛选的最小集合。
-	CapabilityText  Capability = "text"
-	CapabilityImage Capability = "image"
-	CapabilityTools Capability = "tools"
+	CapabilityText       Capability = "text"
+	CapabilityImage      Capability = "image"
+	CapabilityAudio      Capability = "audio"
+	CapabilityFile       Capability = "file"
+	CapabilityTools      Capability = "tools"
+	CapabilityStructured Capability = "structured"
+	CapabilityEmbedding  Capability = "embedding"
 )
 
 // ProtocolSupportsCapability 判断某种上游协议能否无损承载指定能力。
@@ -25,6 +28,7 @@ func ProtocolSupportsCapability(protocol string, capability Capability) bool {
 			ProtocolOpenAI,
 			ProtocolAnthropic,
 			ProtocolGemini,
+			ProtocolCohere,
 			ProtocolAzureOpenAI,
 			ProtocolOllama,
 			ProtocolMistral,
@@ -33,23 +37,73 @@ func ProtocolSupportsCapability(protocol string, capability Capability) bool {
 			ProtocolGroq,
 			ProtocolNVIDIA,
 			ProtocolTogether,
-			ProtocolBedrock:
+			ProtocolBedrock,
+			ProtocolCloudflare:
+			return true
+		}
+	case CapabilityAudio:
+		switch protocol {
+		case ProtocolOpenAICompatible,
+			ProtocolOpenAI,
+			ProtocolAzureOpenAI,
+			ProtocolGemini,
+			ProtocolCloudflare:
+			return true
+		}
+	case CapabilityFile:
+		switch protocol {
+		case ProtocolOpenAICompatible,
+			ProtocolOpenAI,
+			ProtocolAzureOpenAI,
+			ProtocolAnthropic,
+			ProtocolGemini,
+			ProtocolBedrock,
+			ProtocolCloudflare:
 			return true
 		}
 	case CapabilityTools:
 		switch protocol {
 		case ProtocolOpenAICompatible,
 			ProtocolOpenAI,
+			ProtocolAnthropic,
+			ProtocolGemini,
 			ProtocolAzureOpenAI,
+			ProtocolDashScope,
+			ProtocolCohere,
+			ProtocolOllama,
 			ProtocolMistral,
 			ProtocolDeepSeek,
 			ProtocolXAI,
 			ProtocolZhipu,
 			ProtocolGroq,
 			ProtocolNVIDIA,
-			ProtocolTogether:
+			ProtocolTogether,
+			ProtocolBedrock,
+			ProtocolCloudflare:
+			return true
+		}
+	case CapabilityStructured:
+		return SupportedProtocol(protocol)
+	case CapabilityEmbedding:
+		switch protocol {
+		case ProtocolOpenAICompatible,
+			ProtocolOpenAI,
+			ProtocolAzureOpenAI,
+			ProtocolMistral,
+			ProtocolXAI,
+			ProtocolZhipu,
+			ProtocolGroq,
+			ProtocolNVIDIA,
+			ProtocolTogether,
+			ProtocolOllama,
+			ProtocolGemini:
 			return true
 		}
 	}
 	return false
+}
+
+// ProtocolSupportsStream 表示 Adapter 是否能把该协议的增量事件转换成 OpenAI SSE。
+func ProtocolSupportsStream(protocol string) bool {
+	return SupportedProtocol(strings.ToLower(strings.TrimSpace(protocol)))
 }

@@ -1,0 +1,68 @@
+name: ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: model_velo
+          POSTGRES_USER: model_velo
+          POSTGRES_PASSWORD: integration-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U model_velo -d model_velo"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+      redis:
+        image: redis:8-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      MODEL_VELO_POSTGRES_TEST_DSN: postgres://model_velo:integration-password@localhost:5432/model_velo?sslmode=disable
+      MODEL_VELO_REDIS_TEST_ADDR: localhost:6379
+      MODEL_VELO_REDIS_TEST_DB: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify modules
+        run: go mod verify
+      - name: Check formatting
+        shell: bash
+        run: |
+          files="$(gofmt -l .)"
+          test -z "$files" || { echo "$files"; exit 1; }
+      - name: Vet
+        run: go vet ./...
+      - name: Test with real PostgreSQL and Redis
+        run: go test ./...
+      - name: Race detector
+        run: go test -race ./...
+      - name: Build commands
+        run: go build ./cmd/...
+      - name: Benchmark smoke test
+        run: go test ./internal/httpapi -run '^$' -bench '^BenchmarkChatCompletions$' -benchtime=100x

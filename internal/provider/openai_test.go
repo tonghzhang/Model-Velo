@@ -127,7 +127,7 @@ func TestOpenAIAdapterPropagatesCancellation(t *testing.T) {
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
-	request := mustParseChatRequest(t, `{"model":"demo-model"}`)
+	request := mustParseChatRequest(t, `{"model":"demo-model","messages":[{"role":"user","content":"hello"}]}`)
 	result := make(chan error, 1)
 	go func() {
 		_, callErr := adapter.Complete(ctx, ChatInput{
@@ -168,6 +168,16 @@ func TestOpenAIAdapterRejectsInvalidResponse(t *testing.T) {
 	}{
 		{name: "wrong content type", contentType: "text/plain", body: `{"choices":[]}`},
 		{name: "invalid JSON", contentType: "application/json", body: `not-json`},
+		{
+			name:        "empty tool calls are not a response",
+			contentType: "application/json",
+			body:        `{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[]}}]}`,
+		},
+		{
+			name:        "malformed tool call",
+			contentType: "application/json",
+			body:        `{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"weather","arguments":"not-json"}}]}}]}`,
+		},
 	}
 
 	for _, test := range tests {
@@ -185,7 +195,7 @@ func TestOpenAIAdapterRejectsInvalidResponse(t *testing.T) {
 
 			_, err = adapter.Complete(context.Background(), ChatInput{
 				RequestID: "request-test-id",
-				Request:   mustParseChatRequest(t, `{"model":"demo-model"}`),
+				Request:   mustParseChatRequest(t, `{"model":"demo-model","messages":[{"role":"user","content":"hello"}]}`),
 			}, "provider-test-key")
 			if !errors.Is(err, ErrInvalidResponse) {
 				t.Fatalf("Complete() error = %v, want ErrInvalidResponse", err)
@@ -209,7 +219,7 @@ func TestOpenAIAdapterLimitsResponseBody(t *testing.T) {
 
 	_, err = adapter.Complete(context.Background(), ChatInput{
 		RequestID: "request-test-id",
-		Request:   mustParseChatRequest(t, `{"model":"demo-model"}`),
+		Request:   mustParseChatRequest(t, `{"model":"demo-model","messages":[{"role":"user","content":"hello"}]}`),
 	}, "provider-test-key")
 	if !errors.Is(err, ErrResponseTooLarge) {
 		t.Fatalf("Complete() error = %v, want ErrResponseTooLarge", err)
@@ -233,7 +243,7 @@ func TestOpenAIAdapterClosesBodyAfterReadError(t *testing.T) {
 
 	_, err = adapter.Complete(context.Background(), ChatInput{
 		RequestID: "request-test-id",
-		Request:   mustParseChatRequest(t, `{"model":"demo-model"}`),
+		Request:   mustParseChatRequest(t, `{"model":"demo-model","messages":[{"role":"user","content":"hello"}]}`),
 	}, "provider-test-key")
 	if err == nil || !strings.Contains(err.Error(), "read upstream response") {
 		t.Fatalf("Chat() error = %v, want response read error", err)

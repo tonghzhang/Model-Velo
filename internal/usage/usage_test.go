@@ -317,6 +317,8 @@ func TestUsageRedisPostgresPipeline(t *testing.T) {
 		RetentionDays:       90,
 		MaintenanceInterval: time.Hour,
 		MaintenanceBatch:    100,
+		PricingRefresh:      time.Minute,
+		PendingTimeout:      15 * time.Minute,
 	}
 	t.Cleanup(func() {
 		cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -453,6 +455,44 @@ func TestUsageRedisPostgresPipeline(t *testing.T) {
 		t.Fatalf("first Worker.Run() error = %v", err)
 	}
 
+	durable, err := NewDurableEmitter(database.ORM(), emitter, time.Second)
+	if err != nil {
+		t.Fatalf("NewDurableEmitter() error = %v", err)
+	}
+	relayEvent := integrationEvent(t, "request-outbox-republish")
+	if err := durable.Begin(ctx, PendingEvent{
+		EventID: relayEvent.EventID, RequestID: relayEvent.RequestID,
+		TenantID: relayEvent.TenantID, APIKeyID: relayEvent.APIKeyID,
+		RequestedModel: relayEvent.RequestedModel,
+		StartedAt:      relayEvent.StartedAt,
+	}); err != nil {
+		t.Fatalf("DurableEmitter.Begin() error = %v", err)
+	}
+	relayEntryID, err := durable.Emit(ctx, relayEvent)
+	if err != nil {
+		t.Fatalf("DurableEmitter.Emit() error = %v", err)
+	}
+	if err := client.XDel(ctx, settings.StreamKey, relayEntryID).Err(); err != nil {
+		t.Fatalf("delete published event before worker storage: %v", err)
+	}
+	relay, err := NewOutboxRelay(database.ORM(), emitter, time.Second)
+	if err != nil {
+		t.Fatalf("NewOutboxRelay() error = %v", err)
+	}
+	relay.republishAfter = 0
+	if published, err := relay.Publish(ctx); err != nil || published != 1 {
+		t.Fatalf("OutboxRelay.Publish() published=%d error=%v", published, err)
+	}
+	if length, err := client.XLen(ctx, settings.StreamKey).Result(); err != nil || length != 1 {
+		t.Fatalf("republished stream length=%d error=%v", length, err)
+	}
+	if duplicate, err := store.Put(ctx, "direct-relay", relayEvent); err != nil || duplicate {
+		t.Fatalf("Put(relayed event) duplicate=%t error=%v", duplicate, err)
+	}
+	if err := client.Del(ctx, settings.StreamKey).Err(); err != nil {
+		t.Fatalf("clear republished stream event: %v", err)
+	}
+
 	repriceEvent := integrationEvent(t, "request-reprice")
 	repriceEvent.ProviderID = "reprice-provider"
 	repriceEvent.RequestedModel = "reprice-model"
@@ -481,8 +521,10 @@ func TestUsageRedisPostgresPipeline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPricingCatalog(reprice) error = %v", err)
 	}
-	originalCatalog := store.pricing
-	store.pricing = repriceCatalog
+	originalCatalog := store.pricing.Load()
+	if err := store.ReplacePricing(repriceCatalog); err != nil {
+		t.Fatalf("ReplacePricing() error = %v", err)
+	}
 	firstReprice, err := store.Reprice(ctx, RepriceParams{
 		Start:       unpricedEvent.StartedAt.Add(-time.Second),
 		End:         repriceEvent.EndedAt.Add(time.Second),
@@ -506,7 +548,9 @@ func TestUsageRedisPostgresPipeline(t *testing.T) {
 		Limit:       1,
 		Cursor:      firstReprice.NextCursor,
 	})
-	store.pricing = originalCatalog
+	if err := store.ReplacePricing(originalCatalog); err != nil {
+		t.Fatalf("restore pricing error = %v", err)
+	}
 	if err != nil ||
 		repriceResult.Priced != 1 ||
 		repriceResult.Unknown != 0 {
@@ -541,6 +585,9 @@ func TestUsageRedisPostgresPipeline(t *testing.T) {
 	secondEntryID, err := emitter.Emit(ctx, second)
 	if err != nil {
 		t.Fatalf("Emit(second) error = %v", err)
+	}
+	if err := worker.ensureGroup(ctx); err != nil {
+		t.Fatalf("recreate consumer group after stream cleanup: %v", err)
 	}
 	streams, err := client.XReadGroup(ctx, &goredis.XReadGroupArgs{
 		Group:    settings.Group,

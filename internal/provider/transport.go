@@ -9,7 +9,10 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"slices"
 	"strings"
+
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 const (
@@ -64,7 +67,7 @@ func newJSONTransport(config HTTPConfig) *jsonTransport {
 	transport.MaxConnsPerHost = config.MaxConnectionsPerHost
 	return &jsonTransport{
 		client: &http.Client{
-			Transport: transport,
+			Transport: otelhttp.NewTransport(transport),
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
@@ -119,11 +122,27 @@ func (transport *jsonTransport) postStream(
 	body []byte,
 	headers http.Header,
 ) (io.ReadCloser, error) {
+	return transport.postStreamTypes(
+		ctx, endpoint, requestID, body, headers, "text/event-stream",
+	)
+}
+
+func (transport *jsonTransport) postStreamTypes(
+	ctx context.Context,
+	endpoint string,
+	requestID string,
+	body []byte,
+	headers http.Header,
+	acceptedTypes ...string,
+) (io.ReadCloser, error) {
 	request, err := newJSONPostRequest(ctx, endpoint, requestID, body, headers)
 	if err != nil {
 		return nil, err
 	}
-	request.Header.Set("Accept", "text/event-stream")
+	if len(acceptedTypes) == 0 {
+		return nil, ErrInvalidStream
+	}
+	request.Header.Set("Accept", strings.Join(acceptedTypes, ", "))
 
 	response, err := transport.client.Do(request)
 	if err != nil {
@@ -143,7 +162,9 @@ func (transport *jsonTransport) postStream(
 	}
 
 	mediaType, _, err := mime.ParseMediaType(response.Header.Get("Content-Type"))
-	if err != nil || !strings.EqualFold(mediaType, "text/event-stream") {
+	if err != nil || !slices.ContainsFunc(acceptedTypes, func(accepted string) bool {
+		return strings.EqualFold(mediaType, accepted)
+	}) {
 		response.Body.Close()
 		return nil, ErrInvalidStream
 	}

@@ -49,8 +49,12 @@ func TestNewHTTPServerDefaults(t *testing.T) {
 	if server.ReadTimeout != 15*time.Second {
 		t.Errorf("ReadTimeout = %s, want %s", server.ReadTimeout, 15*time.Second)
 	}
-	if server.WriteTimeout != 60*time.Second {
-		t.Errorf("WriteTimeout = %s, want %s", server.WriteTimeout, 60*time.Second)
+	if server.WriteTimeout != maximumRuntimeTimeout+responseWriteGrace {
+		t.Errorf(
+			"WriteTimeout = %s, want %s",
+			server.WriteTimeout,
+			maximumRuntimeTimeout+responseWriteGrace,
+		)
 	}
 	if server.IdleTimeout != 60*time.Second {
 		t.Errorf("IdleTimeout = %s, want %s", server.IdleTimeout, 60*time.Second)
@@ -214,6 +218,12 @@ func setValidInfrastructureEnv(t *testing.T) {
 	t.Setenv("MODEL_VELO_POSTGRES_MAX_CONN_LIFETIME", "")
 	t.Setenv("MODEL_VELO_POSTGRES_MAX_CONN_IDLE_TIME", "")
 	t.Setenv("MODEL_VELO_API_KEY_PEPPER", "test-only-model-velo-api-key-pepper-32-bytes")
+	t.Setenv("MODEL_VELO_ADMIN_KEY_PEPPER", "test-only-model-velo-admin-key-pepper-32-bytes")
+	t.Setenv("MODEL_VELO_CONTROL_MASTER_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
+	t.Setenv("MODEL_VELO_CONTROL_REFRESH_INTERVAL", "")
+	t.Setenv("MODEL_VELO_QUOTA_RESERVATION_TTL", "")
+	t.Setenv("MODEL_VELO_QUOTA_REAP_INTERVAL", "")
+	t.Setenv("MODEL_VELO_QUOTA_DEFAULT_MAX_OUTPUT_TOKENS", "")
 	t.Setenv("MODEL_VELO_REDIS_ADDR", "localhost:6379")
 	t.Setenv("MODEL_VELO_REDIS_PASSWORD", "redis-test-key")
 	t.Setenv("MODEL_VELO_REDIS_DB", "")
@@ -246,6 +256,8 @@ func setValidInfrastructureEnv(t *testing.T) {
 	t.Setenv("MODEL_VELO_USAGE_MAINTENANCE_INTERVAL", "")
 	t.Setenv("MODEL_VELO_USAGE_MAINTENANCE_BATCH_SIZE", "")
 	t.Setenv("MODEL_VELO_USAGE_PRICING_JSON", "")
+	t.Setenv("MODEL_VELO_USAGE_PRICING_REFRESH_INTERVAL", "")
+	t.Setenv("MODEL_VELO_USAGE_PENDING_TIMEOUT", "")
 }
 
 type mainTestAccessController struct{}

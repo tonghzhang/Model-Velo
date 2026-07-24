@@ -27,8 +27,8 @@ type RateLimiter interface { // 租户限流服务接口。
 
 func authenticationMiddleware(access AccessController) gin.HandlerFunc { // 创建使用 access 的认证中间件。
 	return func(c *gin.Context) { // 每个进入受保护路由的请求都会执行该函数。
-		plaintext, err := bearerToken(c.Request) // 从 Authorization 头提取明文网关 API Key。
-		if err != nil {                          // 请求头缺失或格式错误。
+		plaintext, err := requestCredential(c) // 从协议对应的请求头提取明文网关 API Key。
+		if err != nil {                        // 请求头缺失或格式错误。
 			c.Header("WWW-Authenticate", "Bearer") // 告诉客户端应使用 Bearer 认证。
 			writeAPIError(
 				c,
@@ -38,6 +38,9 @@ func authenticationMiddleware(access AccessController) gin.HandlerFunc { // 创�
 				nil,                     // 没有具体请求参数。
 				err.code,                // 具体错误码。
 			)
+			if metrics := routerMetrics(c); metrics != nil {
+				metrics.Authentication("rejected")
+			}
 			return // 不再进入后续路由。
 		}
 
@@ -60,6 +63,9 @@ func authenticationMiddleware(access AccessController) gin.HandlerFunc { // 创�
 					nil,
 					"invalid_api_key",
 				)
+				if metrics := routerMetrics(c); metrics != nil {
+					metrics.Authentication("rejected")
+				}
 				return
 			}
 
@@ -71,6 +77,9 @@ func authenticationMiddleware(access AccessController) gin.HandlerFunc { // 创�
 				nil,
 				"authentication_unavailable",
 			)
+			if metrics := routerMetrics(c); metrics != nil {
+				metrics.Authentication("error")
+			}
 			return
 		}
 
@@ -78,8 +87,33 @@ func authenticationMiddleware(access AccessController) gin.HandlerFunc { // 创�
 		c.Request = c.Request.WithContext( // 为请求替换包含身份的新 Context。
 			context.WithValue(c.Request.Context(), identityContextKey{}, identity), // 将身份保存到标准 Context。
 		)
+		if metrics := routerMetrics(c); metrics != nil {
+			metrics.Authentication("accepted")
+		}
 		c.Next() // 认证成功，继续执行后续中间件和接口函数。
 	}
+}
+
+func requestCredential(c *gin.Context) (string, *bearerTokenError) {
+	if protocolKind(c) != protocolAnthropic {
+		return bearerToken(c.Request)
+	}
+	values := c.Request.Header.Values("x-api-key")
+	if len(values) != 1 {
+		return "", &bearerTokenError{
+			message: "x-api-key header is required",
+			code:    "missing_api_key",
+		}
+	}
+	credential := strings.TrimSpace(values[0])
+	if credential == "" || credential != values[0] ||
+		strings.ContainsAny(credential, " \t\r\n") {
+		return "", &bearerTokenError{
+			message: "x-api-key header is invalid",
+			code:    "invalid_authorization",
+		}
+	}
+	return credential, nil
 }
 
 type bearerTokenError struct { // Authorization 请求头解析错误。

@@ -111,8 +111,10 @@ type completionChoice struct {
 }
 
 type completionMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role             string         `json:"role"`
+	Content          *string        `json:"content"`
+	ReasoningContent *string        `json:"reasoning_content,omitempty"`
+	ToolCalls        []ChatToolCall `json:"tool_calls,omitempty"`
 }
 
 // encodeCompletion 补齐网关响应所需的稳定外壳；上游提供的 ID 和用量优先保留。
@@ -121,6 +123,24 @@ func encodeCompletion(
 	requestID string,
 	model string,
 	content string,
+	finishReason string,
+	usage *completionUsage,
+) ([]byte, error) {
+	return encodeCompletionMessage(
+		id,
+		requestID,
+		model,
+		completionMessage{Role: "assistant", Content: &content},
+		finishReason,
+		usage,
+	)
+}
+
+func encodeCompletionMessage(
+	id string,
+	requestID string,
+	model string,
+	message completionMessage,
 	finishReason string,
 	usage *completionUsage,
 ) ([]byte, error) {
@@ -140,7 +160,7 @@ func encodeCompletion(
 		Created: time.Now().Unix(),
 		Model:   model,
 		Choices: []completionChoice{{
-			Message:      completionMessage{Role: "assistant", Content: content},
+			Message:      message,
 			FinishReason: finishReason,
 		}},
 		Usage: usage,

@@ -14,6 +14,8 @@ import (
 	goredis "github.com/redis/go-redis/v9"
 )
 
+type routeVersionContextKey struct{}
+
 type Status string
 
 const (
@@ -60,7 +62,12 @@ func (cache *Cache) Lookup(ctx context.Context, tenantID, model string, requestB
 		return Result{Status: StatusBypass}, nil
 	}
 
-	key, cacheable, err := cache.key(tenantID, model, requestBody)
+	key, cacheable, err := cache.keyForRouteVersion(
+		routeVersionFromContext(ctx, cache.routeVersion),
+		tenantID,
+		model,
+		requestBody,
+	)
 	if err != nil {
 		return Result{}, err
 	}
@@ -93,7 +100,12 @@ func (cache *Cache) Store(
 		return nil
 	}
 
-	key, cacheable, err := cache.key(tenantID, model, requestBody)
+	key, cacheable, err := cache.keyForRouteVersion(
+		routeVersionFromContext(ctx, cache.routeVersion),
+		tenantID,
+		model,
+		requestBody,
+	)
 	if err != nil {
 		return err
 	}
@@ -107,9 +119,19 @@ func (cache *Cache) Store(
 }
 
 func (cache *Cache) key(tenantID, model string, requestBody []byte) (string, bool, error) {
+	return cache.keyForRouteVersion(cache.routeVersion, tenantID, model, requestBody)
+}
+
+func (cache *Cache) keyForRouteVersion(
+	routeVersion string,
+	tenantID string,
+	model string,
+	requestBody []byte,
+) (string, bool, error) {
 	tenantID = strings.TrimSpace(tenantID)
 	model = strings.TrimSpace(model)
-	if tenantID == "" || model == "" {
+	routeVersion = strings.TrimSpace(routeVersion)
+	if tenantID == "" || model == "" || routeVersion == "" {
 		return "", false, errors.New("response cache tenant and model are required")
 	}
 
@@ -119,7 +141,7 @@ func (cache *Cache) key(tenantID, model string, requestBody []byte) (string, boo
 	}
 	tenantDigest := sha256.Sum256([]byte(tenantID))
 	modelDigest := sha256.Sum256([]byte(model))
-	routeDigest := sha256.Sum256([]byte(cache.routeVersion))
+	routeDigest := sha256.Sum256([]byte(routeVersion))
 	requestDigest := sha256.Sum256(canonicalRequest)
 	return fmt.Sprintf(
 		"model-velo:response-cache:v1:%s:tenant:%x:model:%x:route:%x:request:%x",
@@ -129,6 +151,28 @@ func (cache *Cache) key(tenantID, model string, requestBody []byte) (string, boo
 		routeDigest,
 		requestDigest,
 	), true, nil
+}
+
+// WithRouteVersion pins cache reads and writes to the runtime snapshot used by
+// one request. A hot route change therefore cannot mix old responses into the
+// new cache namespace.
+func WithRouteVersion(ctx context.Context, routeVersion string) context.Context {
+	routeVersion = strings.TrimSpace(routeVersion)
+	if ctx == nil || routeVersion == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, routeVersionContextKey{}, routeVersion)
+}
+
+func routeVersionFromContext(ctx context.Context, fallback string) string {
+	if ctx == nil {
+		return fallback
+	}
+	value, _ := ctx.Value(routeVersionContextKey{}).(string)
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
 }
 
 func canonicalizeJSON(source []byte) ([]byte, bool) {

@@ -2,18 +2,21 @@ package usage
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"sync/atomic"
 	"time"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
+	"model-velo/internal/config"
 	"model-velo/internal/postgres"
 )
 
 type Store struct {
 	database *gorm.DB
-	pricing  *PricingCatalog
+	pricing  atomic.Pointer[PricingCatalog]
 	now      func() time.Time
 }
 
@@ -24,7 +27,54 @@ func NewStore(database *gorm.DB, pricing *PricingCatalog) (*Store, error) {
 	if pricing == nil {
 		return nil, errors.New("usage store requires a pricing catalog")
 	}
-	return &Store{database: database, pricing: pricing, now: time.Now}, nil
+	store := &Store{database: database, now: time.Now}
+	store.pricing.Store(pricing)
+	return store, nil
+}
+
+// ReplacePricing atomically publishes an already validated immutable catalog.
+// Requests already being persisted finish with either the old or the new
+// complete catalog; they never observe a partially updated price list.
+func (store *Store) ReplacePricing(pricing *PricingCatalog) error {
+	if store == nil || pricing == nil {
+		return errors.New("usage pricing catalog is required")
+	}
+	store.pricing.Store(pricing)
+	return nil
+}
+
+func (store *Store) Quote(event Event) CostResult {
+	if store == nil {
+		return CostResult{Caveat: "pricing_store_unavailable"}
+	}
+	pricing := store.pricing.Load()
+	if pricing == nil {
+		return CostResult{Caveat: "pricing_not_configured"}
+	}
+	return pricing.Quote(event)
+}
+
+// ReloadManagedPricing refreshes pricing written by the control plane. A
+// missing managed document intentionally keeps the environment catalog.
+func (store *Store) ReloadManagedPricing(ctx context.Context) (bool, error) {
+	var row postgres.ManagedPricing
+	err := store.database.WithContext(ctx).First(&row, "id = ?", 1).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, errors.New("read managed pricing")
+	}
+	var prices []config.UsagePrice
+	if err := json.Unmarshal([]byte(row.Document), &prices); err != nil {
+		return false, errors.New("decode managed pricing")
+	}
+	catalog, err := NewPricingCatalog(prices)
+	if err != nil {
+		return false, err
+	}
+	store.pricing.Store(catalog)
+	return true, nil
 }
 
 func (store *Store) Put(ctx context.Context, entryID string, event Event) (bool, error) {
@@ -32,16 +82,29 @@ func (store *Store) Put(ctx context.Context, entryID string, event Event) (bool,
 		return false, err
 	}
 	record := store.usageRecord(entryID, event, store.now().UTC())
-	result := store.database.WithContext(ctx).
-		Clauses(clause.OnConflict{
-			Columns:   []clause.Column{{Name: "event_id"}},
-			DoNothing: true,
-		}).
-		Create(&record)
-	if result.Error != nil {
-		return false, result.Error
+	duplicate := false
+	err := store.database.WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
+		result := transaction.
+			Clauses(clause.OnConflict{
+				Columns:   []clause.Column{{Name: "event_id"}},
+				DoNothing: true,
+			}).
+			Create(&record)
+		if result.Error != nil {
+			return result.Error
+		}
+		duplicate = result.RowsAffected == 0
+		if err := transaction.
+			Where("event_id = ?", event.EventID).
+			Delete(&postgres.UsageOutbox{}).Error; err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return false, err
 	}
-	return result.RowsAffected == 0, nil
+	return duplicate, nil
 }
 
 func (store *Store) usageRecord(entryID string, event Event, processedAt time.Time) postgres.UsageEvent {
@@ -95,7 +158,8 @@ func (store *Store) usageRecord(entryID string, event Event, processedAt time.Ti
 			record.RejectedPrediction = int64Pointer(details.RejectedPrediction)
 		}
 	}
-	cost := store.pricing.Quote(event)
+	pricing := store.pricing.Load()
+	cost := pricing.Quote(event)
 	record.CostCaveat = cost.Caveat
 	if cost.Snapshot != nil {
 		record.InputCostNanoUSD = cloneInt64(cost.Snapshot.InputNanoUSD)

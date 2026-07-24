@@ -19,6 +19,23 @@ func NewCollector(input NewEventInput) (*Collector, error) {
 	return &Collector{event: event}, nil
 }
 
+func (collector *Collector) Pending() (PendingEvent, bool) {
+	if collector == nil {
+		return PendingEvent{}, false
+	}
+	collector.mu.Lock()
+	defer collector.mu.Unlock()
+	return PendingEvent{
+		EventID:        collector.event.EventID,
+		RequestID:      collector.event.RequestID,
+		TenantID:       collector.event.TenantID,
+		APIKeyID:       collector.event.APIKeyID,
+		RequestedModel: collector.event.RequestedModel,
+		Stream:         collector.event.Stream,
+		StartedAt:      collector.event.StartedAt,
+	}, true
+}
+
 func (collector *Collector) SetCacheStatus(status string) {
 	if collector == nil {
 		return

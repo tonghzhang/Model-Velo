@@ -12,7 +12,11 @@ import (
 	"testing"
 	"time"
 
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+
 	"model-velo/internal/provider"
+	"model-velo/internal/routing"
 )
 
 func TestStage3ConfigurationBoundaries(t *testing.T) {
@@ -388,6 +392,187 @@ func TestAttemptExecutorRequiresKeysForAPIKeyAdapters(t *testing.T) {
 	}
 }
 
+func TestReliabilityTraceHierarchyAndRedaction(t *testing.T) {
+	exporter := tracetest.NewInMemoryExporter()
+	tracerProvider := sdktrace.NewTracerProvider(
+		sdktrace.WithSyncer(exporter),
+	)
+	previousTracer := reliabilityTracer
+	reliabilityTracer = tracerProvider.Tracer(reliabilityTracerName)
+	t.Cleanup(func() {
+		reliabilityTracer = previousTracer
+		_ = tracerProvider.Shutdown(context.Background())
+	})
+
+	const (
+		primarySecret   = "primary-trace-secret"
+		secondarySecret = "secondary-trace-secret"
+		privatePrompt   = "do not export this prompt"
+	)
+	adapters, err := provider.NewAdapterRegistryFromAdapters(
+		map[string]provider.Adapter{
+			"primary": traceTestAdapter{
+				secret: primarySecret,
+				err:    errors.New("primary network failure"),
+			},
+			"secondary": traceTestAdapter{
+				secret: secondarySecret,
+				body:   []byte(`{"id":"chatcmpl-trace"}`),
+			},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	providerIDs := []string{"primary", "secondary"}
+	breakers, err := NewBreakerRegistry(providerIDs, DefaultBreakerConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	queues, err := NewQueueRegistry(providerIDs, DefaultQueueConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys, err := NewProviderKeyRegistry(providerIDs, []ProviderKeySet{
+		{
+			ProviderID: "primary",
+			Keys:       []ProviderKey{{ID: "primary-key", Secret: primarySecret}},
+		},
+		{
+			ProviderID: "secondary",
+			Keys:       []ProviderKey{{ID: "secondary-key", Secret: secondarySecret}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	retryConfig := DefaultRetryConfig()
+	retryConfig.MaxAttempts = 2
+	retryConfig.InitialBackoff = minimumRetryBackoff
+	retryConfig.MaxBackoff = minimumRetryBackoff
+	retryConfig.JitterRatio = 0
+	retryConfig.RequestTimeout = time.Second
+	retryConfig.AttemptTimeout = 500 * time.Millisecond
+	retry, err := NewRetryPolicy(retryConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempts, err := NewAttemptExecutor(
+		adapters, breakers, queues, keys, retry,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orchestrator, err := NewOrchestrator(attempts, retry)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, parent := tracerProvider.Tracer("test").Start(
+		context.Background(),
+		"http.request",
+	)
+	result, failure := orchestrator.Execute(ctx, ExecutionInput{
+		RequestID: "Bearer " + primarySecret,
+		Request: provider.ChatRequest{
+			Model: "gateway-model",
+			Messages: []provider.ChatMessage{{
+				Role:    "user",
+				Content: []byte(strconv.Quote(privatePrompt)),
+			}},
+		},
+		Plan: routing.Plan{
+			RequestedModel: "gateway-model",
+			Candidates: []routing.Candidate{
+				{
+					ProviderID:    "primary",
+					UpstreamModel: "primary-model",
+					Priority:      0,
+				},
+				{
+					ProviderID:    "secondary",
+					UpstreamModel: "secondary-model",
+					Priority:      1,
+				},
+			},
+		},
+	})
+	parent.End()
+	if failure != nil {
+		t.Fatalf("Execute() failure = %v", failure)
+	}
+	if result.ProviderID != "secondary" || result.Attempts != 3 || result.Fallbacks != 1 {
+		t.Fatalf("Execute() result = %#v", result)
+	}
+
+	spans := exporter.GetSpans()
+	var root tracetest.SpanStub
+	attemptSpans := make(map[string]tracetest.SpanStub)
+	queueSpans := make([]tracetest.SpanStub, 0, 3)
+	var exported strings.Builder
+	for _, span := range spans {
+		fmt.Fprintln(&exported, span.Name, span.Status.Description)
+		for _, field := range span.Attributes {
+			fmt.Fprintln(&exported, field.Key, field.Value.Emit())
+		}
+		for _, event := range span.Events {
+			fmt.Fprintln(&exported, event.Name)
+			for _, field := range event.Attributes {
+				fmt.Fprintln(&exported, field.Key, field.Value.Emit())
+			}
+		}
+		switch span.Name {
+		case "http.request":
+			root = span
+		case "gateway.provider.attempt":
+			attemptSpans[span.SpanContext.SpanID().String()] = span
+		case "gateway.queue.wait":
+			queueSpans = append(queueSpans, span)
+		}
+	}
+	if !root.SpanContext.IsValid() {
+		t.Fatal("root span was not exported")
+	}
+	if len(attemptSpans) != 3 || len(queueSpans) != 3 {
+		t.Fatalf(
+			"exported attempts=%d queues=%d, want 3 each",
+			len(attemptSpans),
+			len(queueSpans),
+		)
+	}
+	for _, attempt := range attemptSpans {
+		if attempt.Parent.SpanID() != root.SpanContext.SpanID() {
+			t.Fatalf(
+				"attempt parent = %s, want root %s",
+				attempt.Parent.SpanID(),
+				root.SpanContext.SpanID(),
+			)
+		}
+	}
+	for _, queue := range queueSpans {
+		if _, ok := attemptSpans[queue.Parent.SpanID().String()]; !ok {
+			t.Fatalf("queue parent %s is not an attempt span", queue.Parent.SpanID())
+		}
+	}
+	traceText := exported.String()
+	for _, eventName := range []string{"gateway.retry", "gateway.fallback"} {
+		if !strings.Contains(traceText, eventName) {
+			t.Fatalf("trace does not contain %q event", eventName)
+		}
+	}
+	for _, sensitive := range []string{
+		primarySecret,
+		secondarySecret,
+		privatePrompt,
+		"Authorization",
+		"Bearer",
+	} {
+		if strings.Contains(traceText, sensitive) {
+			t.Fatalf("trace exported sensitive value %q", sensitive)
+		}
+	}
+}
+
 type reliabilityTestAdapter struct {
 	authentication provider.Authentication
 }
@@ -398,4 +583,25 @@ func (adapter reliabilityTestAdapter) Authentication() provider.Authentication {
 
 func (reliabilityTestAdapter) Complete(context.Context, provider.ChatInput, string) ([]byte, error) {
 	return nil, errors.New("not used")
+}
+
+type traceTestAdapter struct {
+	secret string
+	body   []byte
+	err    error
+}
+
+func (traceTestAdapter) Authentication() provider.Authentication {
+	return provider.AuthenticationAPIKey
+}
+
+func (adapter traceTestAdapter) Complete(
+	_ context.Context,
+	_ provider.ChatInput,
+	apiKey string,
+) ([]byte, error) {
+	if apiKey != adapter.secret {
+		return nil, errors.New("unexpected provider key")
+	}
+	return adapter.body, adapter.err
 }

@@ -2,20 +2,29 @@ package httpapi
 
 import (
 	"context"
-	"log"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 
+	"model-velo/internal/observability"
+	"model-velo/internal/quota"
 	"model-velo/internal/reliability"
 	"model-velo/internal/usage"
 )
 
 type usageSession struct {
-	collector *usage.Collector
-	emitter   usage.Emitter
-	event     usage.Event
-	ready     bool
+	collector     *usage.Collector
+	emitter       usage.Emitter
+	event         usage.Event
+	ready         bool
+	eventID       string
+	quota         *quota.Manager
+	reservationID string
+	metrics       *observability.Metrics
 }
 
 func newUsageSession(
@@ -25,7 +34,8 @@ func newUsageSession(
 	apiKeyID string,
 	model string,
 	stream bool,
-) *usageSession {
+	metrics *observability.Metrics,
+) (*usageSession, error) {
 	collector, err := usage.NewCollector(usage.NewEventInput{
 		RequestID:      requestIDFromContext(ctx),
 		TenantID:       tenantID,
@@ -34,10 +44,23 @@ func newUsageSession(
 		Stream:         stream,
 	})
 	if err != nil {
-		log.Printf("usage collector unavailable request_id=%s", requestIDFromContext(ctx))
-		return nil
+		return nil, fmt.Errorf("create usage collector: %w", err)
 	}
-	return &usageSession{collector: collector, emitter: emitter}
+	pending, pendingOK := collector.Pending()
+	if !pendingOK {
+		return nil, errors.New("usage lifecycle could not be prepared")
+	}
+	if lifecycle, ok := emitter.(usage.LifecycleEmitter); ok {
+		if err := lifecycle.Begin(ctx, pending); err != nil {
+			metrics.UsageDelivery("lifecycle_begin", "error")
+			return nil, fmt.Errorf("begin usage lifecycle: %w", err)
+		}
+		metrics.UsageDelivery("lifecycle_begin", "success")
+	}
+	return &usageSession{
+		collector: collector, emitter: emitter, eventID: pending.EventID,
+		metrics: metrics,
+	}, nil
 }
 
 func (session *usageSession) finish(c *gin.Context) {
@@ -67,13 +90,44 @@ func (session *usageSession) finish(c *gin.Context) {
 	if !session.ready {
 		return
 	}
-	if _, err := session.emitter.Emit(c.Request.Context(), session.event); err != nil {
-		log.Printf(
-			"usage emit failed request_id=%s event_id=%s",
-			session.event.RequestID,
-			session.event.EventID,
+	if session.quota != nil && session.reservationID != "" {
+		settleContext, cancel := context.WithTimeout(
+			context.WithoutCancel(c.Request.Context()), 2*time.Second,
 		)
+		if err := session.quota.Settle(
+			settleContext, session.reservationID, session.event,
+		); err != nil {
+			slog.Error(
+				"quota settlement failed",
+				"request_id", session.event.RequestID,
+				"event_id", session.event.EventID,
+				"error", err,
+			)
+		}
+		cancel()
 	}
+	if _, err := session.emitter.Emit(c.Request.Context(), session.event); err != nil {
+		session.metrics.UsageDelivery("finalize", "deferred")
+		slog.Warn(
+			"usage immediate publish deferred",
+			"request_id", session.event.RequestID,
+			"event_id", session.event.EventID,
+			"error", err,
+		)
+		return
+	}
+	session.metrics.UsageDelivery("finalize", "published")
+}
+
+func (session *usageSession) attachQuota(
+	manager *quota.Manager,
+	reservationID string,
+) {
+	if session == nil {
+		return
+	}
+	session.quota = manager
+	session.reservationID = strings.TrimSpace(reservationID)
 }
 
 func (session *usageSession) finalize(outcome usage.Outcome) {

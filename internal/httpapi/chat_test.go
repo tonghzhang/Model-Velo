@@ -1576,7 +1576,7 @@ func TestChatCompletionRejectsLargeBody(t *testing.T) {
 	defer upstream.Close()
 
 	router := newTestRouter(t, upstream.URL, time.Second)
-	requestBody := strings.Repeat("x", (1<<20)+1)
+	requestBody := strings.Repeat("x", (16<<20)+1)
 	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(requestBody))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Authorization", "Bearer model-velo-test-key")

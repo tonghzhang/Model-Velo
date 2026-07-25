@@ -60,6 +60,18 @@
   --shadow: 0 1px 2px rgb(0 0 0 / 20%), 0 18px 40px rgb(0 0 0 / 16%);
 }
 
+.layer-portal {
+  --workspace-accent: #5f9d86;
+}
+
+.layer-admin {
+  --workspace-accent: #c7874c;
+}
+
+.layer-owner {
+  --workspace-accent: #ca7564;
+}
+
 @theme inline {
   --color-background: var(--background);
   --color-surface: var(--surface);
@@ -127,6 +139,22 @@ textarea:focus-visible {
 
 .tabular {
   font-variant-numeric: tabular-nums;
+}
+
+.context-link {
+  display: inline-flex;
+  height: 30px;
+  align-items: center;
+  gap: 7px;
+  padding: 0 9px;
+  border-left: 1px solid var(--border-strong);
+  color: var(--muted-foreground);
+  font-size: 10.5px;
+  transition: color 120ms ease;
+}
+
+.context-link:hover {
+  color: var(--foreground);
 }
 
 .panel {
@@ -255,5 +283,16 @@ textarea:focus-visible {
   .overview-primary-grid,
   .overview-secondary-grid {
     grid-template-columns: minmax(0, 1fr) !important;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
   }
 }

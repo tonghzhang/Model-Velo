@@ -38,10 +38,12 @@ func registerAdminRoutes(
 	service *controlplane.Service,
 	quotaManager *quota.Manager,
 	tenantManager *apikey.Manager,
+	usageReader PlatformUsageReader,
 ) {
 	handler := adminHandler{
 		auth: auth, service: service, quota: quotaManager, tenants: tenantManager,
 	}
+	usageQueries := adminUsageHandler{reader: usageReader}
 	group := router.Group("/admin/v1")
 	group.Use(handler.authenticate)
 
@@ -52,6 +54,21 @@ func registerAdminRoutes(
 	group.GET("/audit", handler.require(adminauth.PermissionAuditRead), handler.audit)
 	group.GET("/principals", handler.require(adminauth.PermissionAdminRead), handler.principals)
 	group.POST("/principals", handler.require(adminauth.PermissionAdminWrite), handler.createPrincipal)
+	group.GET(
+		"/usage/events",
+		handler.require(adminauth.PermissionUsageRead),
+		usageQueries.list,
+	)
+	group.GET(
+		"/usage/summary",
+		handler.require(adminauth.PermissionUsageRead),
+		usageQueries.summary,
+	)
+	group.GET(
+		"/usage/series",
+		handler.require(adminauth.PermissionUsageRead),
+		usageQueries.series,
+	)
 	group.PATCH(
 		"/principals/:id",
 		handler.require(adminauth.PermissionAdminWrite),

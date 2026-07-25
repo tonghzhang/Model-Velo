@@ -399,6 +399,16 @@ func TestUsageRedisPostgresPipeline(t *testing.T) {
 	if duplicate, err := store.Put(ctx, "direct-other-key", otherKeyEvent); err != nil || duplicate {
 		t.Fatalf("Put(other key event) duplicate=%t error=%v", duplicate, err)
 	}
+	otherTenantEvent := integrationEvent(t, "request-other-tenant")
+	otherTenantEvent.TenantID = "00000000-0000-4000-8000-000000000099"
+	otherTenantEvent.APIKeyID = "api-key-other-tenant"
+	if duplicate, err := store.Put(
+		ctx,
+		"direct-other-tenant",
+		otherTenantEvent,
+	); err != nil || duplicate {
+		t.Fatalf("Put(other tenant event) duplicate=%t error=%v", duplicate, err)
+	}
 	window := QueryFilter{
 		Start:    time.Now().UTC().Add(-time.Hour),
 		End:      time.Now().UTC().Add(time.Hour),
@@ -417,6 +427,54 @@ func TestUsageRedisPostgresPipeline(t *testing.T) {
 	)
 	if err != nil || len(otherTenant.Data) != 0 {
 		t.Fatalf("List(other tenant) page = %#v, error = %v", otherTenant, err)
+	}
+	platformWindow := window
+	platformWindow.APIKeyID = ""
+	platformPage, err := store.PlatformList(
+		ctx,
+		"",
+		ListParams{Filter: platformWindow},
+	)
+	if err != nil ||
+		len(platformPage.Data) != 3 ||
+		platformPage.Data[0].TenantID == "" {
+		t.Fatalf("PlatformList() page = %#v, error = %v", platformPage, err)
+	}
+	tenantSummary, err := store.PlatformSummary(
+		ctx,
+		first.TenantID,
+		SummaryParams{Filter: platformWindow},
+	)
+	if err != nil || tenantSummary.Totals.Requests != 2 {
+		t.Fatalf(
+			"PlatformSummary(tenant) = %#v, error = %v",
+			tenantSummary,
+			err,
+		)
+	}
+	platformSummary, err := store.PlatformSummary(
+		ctx,
+		"",
+		SummaryParams{Filter: platformWindow, GroupBy: "tenant"},
+	)
+	if err != nil ||
+		platformSummary.Totals.Requests != 3 ||
+		len(platformSummary.Groups) != 2 {
+		t.Fatalf(
+			"PlatformSummary() = %#v, error = %v",
+			platformSummary,
+			err,
+		)
+	}
+	platformSeries, err := store.PlatformSeries(ctx, "", SeriesParams{
+		Filter:   platformWindow,
+		Interval: "hour",
+		Timezone: "UTC",
+	})
+	if err != nil ||
+		len(platformSeries) != 1 ||
+		platformSeries[0].Totals.Requests != 3 {
+		t.Fatalf("PlatformSeries() = %#v, error = %v", platformSeries, err)
 	}
 	summary, err := store.Summary(ctx, first.TenantID, SummaryParams{Filter: window})
 	if err != nil ||

@@ -1,4 +1,16 @@
 export type ThemeMode = "light" | "dark" | "system"
+export type WorkspaceLayer = "portal" | "admin" | "owner"
+export type DataScope =
+  | "runtime"
+  | "tenants"
+  | "keys"
+  | "quotas"
+  | "quotaWindows"
+  | "pricing"
+  | "audit"
+  | "principals"
+  | "usage"
+  | "models"
 
 export interface ConsoleSettings {
   baseUrl: string
@@ -150,6 +162,10 @@ export interface UsageRecord {
   first_token_ms?: number
 }
 
+export interface PlatformUsageRecord extends UsageRecord {
+  tenant_id: string
+}
+
 export interface Totals {
   requests: number
   successful_requests: number
@@ -186,6 +202,25 @@ export interface Totals {
 export interface SeriesPoint {
   bucket: string
   totals: Totals
+}
+
+export interface UsageGroup {
+  value: string
+  totals: Totals
+}
+
+export interface UsageSummary {
+  totals: Totals
+  groups?: UsageGroup[]
+  groups_truncated?: boolean
+}
+
+export interface AdminUsageSnapshot {
+  events: PlatformUsageRecord[]
+  totals: Totals
+  series: SeriesPoint[]
+  tenantGroups: UsageGroup[]
+  keyGroups: UsageGroup[]
 }
 
 export interface QuotaPolicy {
@@ -278,4 +313,9 @@ export interface ConsoleData {
   audit: AuditRecord[]
   principals: Principal[]
   visibleModels: string[]
+}
+
+export interface ConsoleLoadResult {
+  data: ConsoleData
+  scopeErrors: Partial<Record<DataScope, string>>
 }

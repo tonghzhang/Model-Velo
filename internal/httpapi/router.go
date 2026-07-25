@@ -197,9 +197,13 @@ func NewRouter(
 	protected.GET("/usage/series", usageQueries.series)
 
 	if settings.adminAuth != nil && settings.controlPlane != nil {
+		platformUsage, ok := usageReader.(PlatformUsageReader)
+		if !ok {
+			panic("httpapi: platform usage reader is unavailable")
+		}
 		registerAdminRoutes(
 			router, settings.adminAuth, settings.controlPlane, settings.quota,
-			settings.tenantAdmin,
+			settings.tenantAdmin, platformUsage,
 		)
 	}
 

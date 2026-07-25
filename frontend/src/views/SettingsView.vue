@@ -59,7 +59,7 @@ async function testConnection() {
 </script>
 
 <template>
-  <PageHeader title="控制台设置" description="连接现有 Model-Velo API；凭据仅保留在当前浏览器标签页。">
+  <PageHeader title="连接与外观" description="连接现有 Model-Velo API；凭据仅保留在当前浏览器标签页。">
     <Button size="sm" @click="save"><Save class="size-3.5" />保存并同步</Button>
   </PageHeader>
 

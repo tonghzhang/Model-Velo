@@ -1,7 +1,13 @@
 import { computed, readonly, ref, watch } from "vue"
 import { demoData } from "@/data/demo"
 import { loadRealConsoleData } from "@/lib/api"
-import type { ConsoleData, ConsoleSettings, ThemeMode, Totals } from "@/types"
+import type {
+  ConsoleData,
+  ConsoleSettings,
+  DataScope,
+  ThemeMode,
+  Totals,
+} from "@/types"
 
 const SETTINGS_KEY = "model-velo-console.settings.v1"
 const CREDENTIALS_KEY = "model-velo-console.credentials.v1"
@@ -50,6 +56,7 @@ const settings = ref<ConsoleSettings>(readSettings())
 const data = ref<ConsoleData>(structuredClone(settings.value.demoMode ? demoData : emptyData))
 const loading = ref(false)
 const error = ref<string | null>(null)
+const scopeErrors = ref<Partial<Record<DataScope, string>>>({})
 const lastUpdated = ref<Date | null>(settings.value.demoMode ? new Date() : null)
 let activeController: AbortController | null = null
 
@@ -88,12 +95,15 @@ async function refresh() {
     if (settings.value.demoMode) {
       await new Promise((resolve) => window.setTimeout(resolve, 280))
       data.value = structuredClone(demoData)
+      scopeErrors.value = {}
     } else {
-      data.value = await loadRealConsoleData(
+      const result = await loadRealConsoleData(
         settings.value,
         structuredClone(emptyData),
         controller.signal,
       )
+      data.value = result.data
+      scopeErrors.value = result.scopeErrors
     }
     lastUpdated.value = new Date()
   } catch (cause) {
@@ -115,6 +125,7 @@ export function useConsole() {
     data: readonly(data),
     loading: readonly(loading),
     error: readonly(error),
+    scopeErrors: readonly(scopeErrors),
     lastUpdated: readonly(lastUpdated),
     isDemo: computed(() => settings.value.demoMode),
     refresh,

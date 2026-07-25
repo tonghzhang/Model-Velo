@@ -104,7 +104,7 @@ OpenAI、Mistral、DeepSeek、xAI、Zhipu、Groq、NVIDIA、Together 和 Cloudfl
 - `GET /v1/usage/summary`：请求、成功/失败、缓存、token、已知/未知成本、延迟、TTFT 和重试/Fallback 汇总，`group_by` 支持 `model`、`provider`、`status`、`cache`、`api_key`；
 - `GET /v1/usage/series`：按 `hour`、`day`、`week`、`month` 或 `year` 返回时间序列，并接受 IANA timezone。
 
-`api_key_id` 省略时自动使用当前 Key，显式值也只能等于当前 Key；项目尚未定义管理员 Scope，因此不会默认开放租户级跨 Key 查询。默认查询最近 30 天，单次范围最多 366 天，明细每页最多 200 条，分组最多返回 1000 组并显式标记截断。所有响应带 `Cache-Control: no-store`。成本以整数 nanoUSD 存储与聚合，接口同时返回精确十进制 USD 字符串；未知价格、缺失 usage 或无法覆盖早期失败 attempt 时会保留 caveat。
+`api_key_id` 省略时自动使用当前 Key，显式值也只能等于当前 Key。默认查询最近 30 天，单次范围最多 366 天，明细每页最多 200 条，分组最多返回 1000 组并显式标记截断。所有响应带 `Cache-Control: no-store`。成本以整数 nanoUSD 存储与聚合，接口同时返回精确十进制 USD 字符串；未知价格、缺失 usage 或无法覆盖早期失败 attempt 时会保留 caveat。
 
 历史 schema v1 没有 API Key ID，Worker 仍能可靠消费和存储，但它不能被安全归属到某一把 Key，因此不会出现在普通 Key 的 HTTP 查询中；可通过 PostgreSQL 管理通道或带 tenant 条件的 `reprice-usage` 处理。系统不会为了补齐归属而猜测或把 v1 数据暴露给整个租户。
 
@@ -117,6 +117,7 @@ OpenAI、Mistral、DeepSeek、xAI、Zhipu、Groq、NVIDIA、Together 和 Cloudfl
 - `GET /admin/v1/principals`、`POST /admin/v1/principals`、`PATCH /admin/v1/principals/:id`：管理员与角色；
 - `GET/POST/PUT /admin/v1/quotas`、`GET /admin/v1/quota-windows`：额度策略和当前已结算/预留窗口；
 - `GET/POST /admin/v1/tenants`、`PUT /admin/v1/tenants/:id`、`GET/POST /admin/v1/tenants/:id/keys`、`PATCH /admin/v1/api-keys/:id`：租户、模型授权及业务 Key 生命周期；
+- `GET /admin/v1/usage/events`、`GET /admin/v1/usage/summary`、`GET /admin/v1/usage/series`：需要 `usage:read` 的跨租户只读 Usage 查询，可按 `tenant_id` 与 `api_key_id` 下钻，汇总额外支持 `group_by=tenant`；明细不开放原始 Usage JSON；
 - `GET /admin/v1/audit`：只读游标分页审计。
 
 ## 配置

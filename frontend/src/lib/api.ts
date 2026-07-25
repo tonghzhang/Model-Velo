@@ -2,7 +2,10 @@ import type {
   APIKey,
   AuditRecord,
   ConsoleData,
+  ConsoleLoadResult,
   ConsoleSettings,
+  DataScope,
+  PlatformUsageRecord,
   PricingView,
   Principal,
   QuotaPolicy,
@@ -12,6 +15,7 @@ import type {
   Tenant,
   Totals,
   UsageRecord,
+  UsageSummary,
 } from "@/types"
 
 interface APIErrorShape {
@@ -74,6 +78,14 @@ function query(params: Record<string, string | number | boolean | undefined>): s
   return encoded ? `?${encoded}` : ""
 }
 
+export interface AdminUsageQuery {
+  start?: string
+  end?: string
+  tenantID?: string
+  apiKeyID?: string
+  model?: string
+}
+
 export const gatewayAPI = {
   health(settings: ConsoleSettings, signal?: AbortSignal) {
     return request<{ status: string }>(settings, "/healthz", undefined, signal)
@@ -132,6 +144,65 @@ export const gatewayAPI = {
       signal,
     )
   },
+  adminUsageEvents(
+    settings: ConsoleSettings,
+    params: AdminUsageQuery,
+    signal?: AbortSignal,
+  ) {
+    return request<{ data: PlatformUsageRecord[]; next_cursor?: string }>(
+      settings,
+      `/admin/v1/usage/events${query({
+        start: params.start,
+        end: params.end,
+        tenant_id: params.tenantID,
+        api_key_id: params.apiKeyID,
+        model: params.model,
+        limit: 100,
+      })}`,
+      settings.adminKey,
+      signal,
+    )
+  },
+  adminUsageSummary(
+    settings: ConsoleSettings,
+    params: AdminUsageQuery,
+    groupBy?: "tenant" | "api_key",
+    signal?: AbortSignal,
+  ) {
+    return request<UsageSummary>(
+      settings,
+      `/admin/v1/usage/summary${query({
+        start: params.start,
+        end: params.end,
+        tenant_id: params.tenantID,
+        api_key_id: params.apiKeyID,
+        model: params.model,
+        group_by: groupBy,
+      })}`,
+      settings.adminKey,
+      signal,
+    )
+  },
+  adminUsageSeries(
+    settings: ConsoleSettings,
+    params: AdminUsageQuery,
+    signal?: AbortSignal,
+  ) {
+    return request<{ data: SeriesPoint[] }>(
+      settings,
+      `/admin/v1/usage/series${query({
+        start: params.start,
+        end: params.end,
+        tenant_id: params.tenantID,
+        api_key_id: params.apiKeyID,
+        model: params.model,
+        interval: "day",
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
+      })}`,
+      settings.adminKey,
+      signal,
+    )
+  },
   usageEvents(settings: ConsoleSettings, signal?: AbortSignal) {
     return request<{ data: UsageRecord[]; next_cursor?: string }>(
       settings,
@@ -177,45 +248,84 @@ export async function loadRealConsoleData(
   settings: ConsoleSettings,
   empty: ConsoleData,
   signal?: AbortSignal,
-): Promise<ConsoleData> {
+): Promise<ConsoleLoadResult> {
   const next = structuredClone(empty)
+  const scopeErrors: Partial<Record<DataScope, string>> = {}
+
+  function capture(scope: DataScope, reason: unknown) {
+    if (reason instanceof GatewayAPIError) {
+      scopeErrors[scope] =
+        reason.status === 403 ? "当前凭据没有该数据域的读取权限" : reason.message
+      return
+    }
+    scopeErrors[scope] = reason instanceof Error ? reason.message : "数据读取失败"
+  }
+
   const health = await gatewayAPI.health(settings, signal)
   next.health = health.status === "ok" ? "healthy" : "degraded"
 
   if (settings.adminKey) {
-    const [runtime, tenants, quotas, windows, pricing, audit, principals] = await Promise.all([
-      gatewayAPI.runtime(settings, signal),
-      gatewayAPI.tenants(settings, signal),
-      gatewayAPI.quotas(settings, signal),
-      gatewayAPI.quotaWindows(settings, signal),
-      gatewayAPI.pricing(settings, signal),
-      gatewayAPI.audit(settings, signal),
-      gatewayAPI.principals(settings, signal),
-    ])
-    next.runtime = runtime
-    next.tenants = tenants.items
-    next.quotas = quotas.items
-    next.quotaWindows = windows.items
-    next.pricing = pricing
-    next.audit = audit.items
-    next.principals = principals.items
-    const keyResponses = await Promise.all(
-      next.tenants.map((tenant) => gatewayAPI.keys(settings, tenant.id, signal)),
-    )
-    next.keys = keyResponses.flatMap((response) => response.items)
+    const [runtime, tenants, quotas, windows, pricing, audit, principals] =
+      await Promise.allSettled([
+        gatewayAPI.runtime(settings, signal),
+        gatewayAPI.tenants(settings, signal),
+        gatewayAPI.quotas(settings, signal),
+        gatewayAPI.quotaWindows(settings, signal),
+        gatewayAPI.pricing(settings, signal),
+        gatewayAPI.audit(settings, signal),
+        gatewayAPI.principals(settings, signal),
+      ] as const)
+    signal?.throwIfAborted()
+    if (runtime.status === "rejected") capture("runtime", runtime.reason)
+    if (tenants.status === "rejected") capture("tenants", tenants.reason)
+    if (quotas.status === "rejected") capture("quotas", quotas.reason)
+    if (windows.status === "rejected") capture("quotaWindows", windows.reason)
+    if (pricing.status === "rejected") capture("pricing", pricing.reason)
+    if (audit.status === "rejected") capture("audit", audit.reason)
+    if (principals.status === "rejected") capture("principals", principals.reason)
+
+    if (runtime.status === "fulfilled") next.runtime = runtime.value
+    if (tenants.status === "fulfilled") next.tenants = tenants.value.items
+    if (quotas.status === "fulfilled") next.quotas = quotas.value.items
+    if (windows.status === "fulfilled") next.quotaWindows = windows.value.items
+    if (pricing.status === "fulfilled") next.pricing = pricing.value
+    if (audit.status === "fulfilled") next.audit = audit.value.items
+    if (principals.status === "fulfilled") next.principals = principals.value.items
+
+    if (next.tenants.length) {
+      const keyResponses = await Promise.allSettled(
+        next.tenants.map((tenant) => gatewayAPI.keys(settings, tenant.id, signal)),
+      )
+      signal?.throwIfAborted()
+      next.keys = keyResponses.flatMap((response) =>
+        response.status === "fulfilled" ? response.value.items : [],
+      )
+      const rejected = keyResponses.find(
+        (response): response is PromiseRejectedResult => response.status === "rejected",
+      )
+      if (rejected) capture("keys", rejected.reason)
+    }
   }
 
   if (settings.gatewayKey) {
-    const [events, summary, series, models] = await Promise.all([
+    const [events, summary, series, models] = await Promise.allSettled([
       gatewayAPI.usageEvents(settings, signal),
       gatewayAPI.usageSummary(settings, signal),
       gatewayAPI.usageSeries(settings, signal),
       gatewayAPI.models(settings, signal),
-    ])
-    next.usage = events.data
-    next.totals = summary.totals
-    next.series = series.data
-    next.visibleModels = models.data.map((item) => item.id)
+    ] as const)
+    signal?.throwIfAborted()
+    if (events.status === "rejected") capture("usage", events.reason)
+    if (summary.status === "rejected") capture("usage", summary.reason)
+    if (series.status === "rejected") capture("usage", series.reason)
+    if (models.status === "rejected") capture("models", models.reason)
+
+    if (events.status === "fulfilled") next.usage = events.value.data
+    if (summary.status === "fulfilled") next.totals = summary.value.totals
+    if (series.status === "fulfilled") next.series = series.value.data
+    if (models.status === "fulfilled") {
+      next.visibleModels = models.value.data.map((item) => item.id)
+    }
   }
-  return next
+  return { data: next, scopeErrors }
 }

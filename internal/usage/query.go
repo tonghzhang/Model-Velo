@@ -108,6 +108,16 @@ type Page struct {
 	NextCursor string   `json:"next_cursor,omitempty"`
 }
 
+type PlatformRecord struct {
+	TenantID string `json:"tenant_id"`
+	Record
+}
+
+type PlatformPage struct {
+	Data       []PlatformRecord `json:"data"`
+	NextCursor string           `json:"next_cursor,omitempty"`
+}
+
 type Totals struct {
 	Requests            int64   `json:"requests"`
 	SuccessfulRequests  int64   `json:"successful_requests"`
@@ -233,43 +243,13 @@ func (store *Store) List(ctx context.Context, tenantID string, params ListParams
 	if err != nil {
 		return Page{}, err
 	}
-	limit := params.Limit
-	if limit == 0 {
-		limit = defaultPageLimit
-	}
-	if limit < 1 || limit > maximumPageLimit {
-		return Page{}, fmt.Errorf("%w: limit must be between 1 and %d", ErrInvalidQuery, maximumPageLimit)
-	}
-
 	query, err := store.filteredQuery(ctx, tenantID, filter)
 	if err != nil {
 		return Page{}, err
 	}
-	if params.Cursor != "" {
-		cursor, err := decodeListCursor(params.Cursor)
-		if err != nil {
-			return Page{}, err
-		}
-		startedAt := time.Unix(0, cursor.StartedAt).UTC()
-		query = query.Where(
-			"(started_at < ?) OR (started_at = ? AND event_id < ?)",
-			startedAt,
-			startedAt,
-			cursor.EventID,
-		)
-	}
-
-	var rows []postgres.UsageEvent
-	if err := query.
-		Order("started_at DESC").
-		Order("event_id DESC").
-		Limit(limit + 1).
-		Find(&rows).Error; err != nil {
+	rows, hasMore, err := listRows(query, params.Limit, params.Cursor)
+	if err != nil {
 		return Page{}, err
-	}
-	hasMore := len(rows) > limit
-	if hasMore {
-		rows = rows[:limit]
 	}
 	page := Page{Data: make([]Record, 0, len(rows))}
 	for _, row := range rows {
@@ -281,6 +261,80 @@ func (store *Store) List(ctx context.Context, tenantID string, params ListParams
 	return page, nil
 }
 
+func (store *Store) PlatformList(
+	ctx context.Context,
+	tenantID string,
+	params ListParams,
+) (PlatformPage, error) {
+	filter, err := NormalizeQueryFilter(params.Filter, store.now())
+	if err != nil {
+		return PlatformPage{}, err
+	}
+	query, err := store.platformQuery(ctx, tenantID, filter)
+	if err != nil {
+		return PlatformPage{}, err
+	}
+	rows, hasMore, err := listRows(query, params.Limit, params.Cursor)
+	if err != nil {
+		return PlatformPage{}, err
+	}
+	page := PlatformPage{Data: make([]PlatformRecord, 0, len(rows))}
+	for _, row := range rows {
+		page.Data = append(page.Data, PlatformRecord{
+			TenantID: row.TenantID,
+			Record:   recordFromRow(row, params.IncludeRaw),
+		})
+	}
+	if hasMore && len(rows) > 0 {
+		page.NextCursor = encodeListCursor(rows[len(rows)-1])
+	}
+	return page, nil
+}
+
+func listRows(
+	query *gorm.DB,
+	requestedLimit int,
+	encodedCursor string,
+) ([]postgres.UsageEvent, bool, error) {
+	limit := requestedLimit
+	if limit == 0 {
+		limit = defaultPageLimit
+	}
+	if limit < 1 || limit > maximumPageLimit {
+		return nil, false, fmt.Errorf(
+			"%w: limit must be between 1 and %d",
+			ErrInvalidQuery,
+			maximumPageLimit,
+		)
+	}
+	if encodedCursor != "" {
+		cursor, err := decodeListCursor(encodedCursor)
+		if err != nil {
+			return nil, false, err
+		}
+		startedAt := time.Unix(0, cursor.StartedAt).UTC()
+		query = query.Where(
+			"(started_at < ?) OR (started_at = ? AND event_id < ?)",
+			startedAt,
+			startedAt,
+			cursor.EventID,
+		)
+	}
+	var rows []postgres.UsageEvent
+	if err := query.
+		Order("started_at DESC").
+		Order("event_id DESC").
+		Limit(limit + 1).
+		Find(&rows).Error; err != nil {
+		return nil, false, err
+	}
+	hasMore := len(rows) > limit
+	if hasMore {
+		rows = rows[:limit]
+	}
+	return rows, hasMore, nil
+}
+
 func (store *Store) Summary(ctx context.Context, tenantID string, params SummaryParams) (Summary, error) {
 	filter, err := NormalizeQueryFilter(params.Filter, store.now())
 	if err != nil {
@@ -290,15 +344,39 @@ func (store *Store) Summary(ctx context.Context, tenantID string, params Summary
 	if err != nil {
 		return Summary{}, err
 	}
+	return summaryFromQuery(query, params.GroupBy, false)
+}
+
+func (store *Store) PlatformSummary(
+	ctx context.Context,
+	tenantID string,
+	params SummaryParams,
+) (Summary, error) {
+	filter, err := NormalizeQueryFilter(params.Filter, store.now())
+	if err != nil {
+		return Summary{}, err
+	}
+	query, err := store.platformQuery(ctx, tenantID, filter)
+	if err != nil {
+		return Summary{}, err
+	}
+	return summaryFromQuery(query, params.GroupBy, true)
+}
+
+func summaryFromQuery(
+	query *gorm.DB,
+	groupBy string,
+	allowTenantGroup bool,
+) (Summary, error) {
 	var total aggregateRow
 	if err := query.Select(aggregateSelect("")).Scan(&total).Error; err != nil {
 		return Summary{}, err
 	}
 	summary := Summary{Totals: totalsFromAggregate(total)}
-	if strings.TrimSpace(params.GroupBy) == "" {
+	if strings.TrimSpace(groupBy) == "" {
 		return summary, nil
 	}
-	column, err := groupColumn(params.GroupBy)
+	column, err := groupColumn(groupBy, allowTenantGroup)
 	if err != nil {
 		return Summary{}, err
 	}
@@ -349,6 +427,41 @@ func (store *Store) Series(ctx context.Context, tenantID string, params SeriesPa
 	if err != nil {
 		return nil, err
 	}
+	return seriesFromQuery(query, expression, timezone)
+}
+
+func (store *Store) PlatformSeries(
+	ctx context.Context,
+	tenantID string,
+	params SeriesParams,
+) ([]SeriesPoint, error) {
+	filter, err := NormalizeQueryFilter(params.Filter, store.now())
+	if err != nil {
+		return nil, err
+	}
+	expression, err := seriesExpression(params.Interval)
+	if err != nil {
+		return nil, err
+	}
+	timezone := strings.TrimSpace(params.Timezone)
+	if timezone == "" {
+		timezone = "UTC"
+	}
+	if _, err := time.LoadLocation(timezone); err != nil {
+		return nil, fmt.Errorf("%w: timezone is invalid", ErrInvalidQuery)
+	}
+	query, err := store.platformQuery(ctx, tenantID, filter)
+	if err != nil {
+		return nil, err
+	}
+	return seriesFromQuery(query, expression, timezone)
+}
+
+func seriesFromQuery(
+	query *gorm.DB,
+	expression string,
+	timezone string,
+) ([]SeriesPoint, error) {
 	selectSQL := fmt.Sprintf(
 		"%s AS group_value, %s",
 		expression,
@@ -381,9 +494,29 @@ func (store *Store) filteredQuery(
 	if tenantID == "" {
 		return nil, fmt.Errorf("%w: tenant is required", ErrInvalidQuery)
 	}
+	return store.baseQuery(ctx, filter).
+		Where("tenant_id = ?", tenantID), nil
+}
+
+func (store *Store) platformQuery(
+	ctx context.Context,
+	tenantID string,
+	filter QueryFilter,
+) (*gorm.DB, error) {
+	tenantID = strings.TrimSpace(tenantID)
+	if len(tenantID) > 64 {
+		return nil, fmt.Errorf("%w: tenant filter is too long", ErrInvalidQuery)
+	}
+	query := store.baseQuery(ctx, filter)
+	if tenantID != "" {
+		query = query.Where("tenant_id = ?", tenantID)
+	}
+	return query, nil
+}
+
+func (store *Store) baseQuery(ctx context.Context, filter QueryFilter) *gorm.DB {
 	query := store.database.WithContext(ctx).
 		Model(&postgres.UsageEvent{}).
-		Where("tenant_id = ?", tenantID).
 		Where("started_at >= ? AND started_at < ?", filter.Start, filter.End)
 	if filter.Model != "" {
 		query = query.Where("requested_model = ?", filter.Model)
@@ -406,7 +539,7 @@ func (store *Store) filteredQuery(
 	if filter.Stream != nil {
 		query = query.Where("stream = ?", *filter.Stream)
 	}
-	return query, nil
+	return query
 }
 
 const aggregateColumns = `
@@ -446,8 +579,12 @@ func aggregateSelect(group string) string {
 	return group + " AS group_value, " + aggregateColumns
 }
 
-func groupColumn(group string) (string, error) {
+func groupColumn(group string, allowTenant bool) (string, error) {
 	switch strings.ToLower(strings.TrimSpace(group)) {
+	case "tenant":
+		if allowTenant {
+			return "tenant_id", nil
+		}
 	case "model":
 		return "requested_model", nil
 	case "provider":
@@ -461,6 +598,7 @@ func groupColumn(group string) (string, error) {
 	default:
 		return "", fmt.Errorf("%w: group_by is unsupported", ErrInvalidQuery)
 	}
+	return "", fmt.Errorf("%w: group_by is unsupported", ErrInvalidQuery)
 }
 
 func seriesExpression(interval string) (string, error) {

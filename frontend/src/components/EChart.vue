@@ -9,7 +9,7 @@ import {
 } from "echarts/components"
 import { CanvasRenderer } from "echarts/renderers"
 import type { EChartsCoreOption } from "echarts/core"
-import { nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
+import { nextTick, onBeforeUnmount, onMounted, useTemplateRef, watch } from "vue"
 
 echarts.use([
   BarChart,
@@ -27,7 +27,7 @@ const props = defineProps<{
   height?: number
 }>()
 
-const element = ref<HTMLDivElement | null>(null)
+const element = useTemplateRef<HTMLDivElement>("chart")
 let chart: echarts.ECharts | null = null
 let resizeObserver: ResizeObserver | null = null
 let themeObserver: MutationObserver | null = null
@@ -67,5 +67,5 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div ref="element" class="w-full" :style="{ height: `${height || 280}px` }" />
+  <div ref="chart" class="w-full" :style="{ height: `${height || 280}px` }" />
 </template>

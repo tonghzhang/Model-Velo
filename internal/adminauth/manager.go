@@ -42,6 +42,7 @@ const (
 	PermissionAdminWrite   Permission = "admin:write"
 	PermissionTenantRead   Permission = "tenant:read"
 	PermissionTenantWrite  Permission = "tenant:write"
+	PermissionUsageRead    Permission = "usage:read"
 )
 
 var (
@@ -60,23 +61,24 @@ var rolePermissions = map[Role]map[Permission]struct{}{
 		PermissionQuotaRead: {}, PermissionQuotaWrite: {},
 		PermissionAuditRead: {}, PermissionAdminRead: {},
 		PermissionAdminWrite: {}, PermissionTenantRead: {},
-		PermissionTenantWrite: {},
+		PermissionTenantWrite: {}, PermissionUsageRead: {},
 	},
 	RoleOperator: {
 		PermissionRuntimeRead: {}, PermissionRuntimeWrite: {},
 		PermissionPricingRead: {}, PermissionQuotaRead: {},
 		PermissionQuotaWrite: {}, PermissionTenantRead: {},
-		PermissionTenantWrite: {},
+		PermissionTenantWrite: {}, PermissionUsageRead: {},
 	},
 	RoleBilling: {
 		PermissionPricingRead: {}, PermissionPricingWrite: {},
 		PermissionQuotaRead: {}, PermissionQuotaWrite: {},
-		PermissionAuditRead: {},
+		PermissionAuditRead: {}, PermissionUsageRead: {},
 	},
 	RoleAuditor: {
 		PermissionRuntimeRead: {}, PermissionPricingRead: {},
 		PermissionQuotaRead: {}, PermissionAuditRead: {},
 		PermissionAdminRead: {}, PermissionTenantRead: {},
+		PermissionUsageRead: {},
 	},
 }
 

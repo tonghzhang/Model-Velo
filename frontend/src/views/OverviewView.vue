@@ -4,7 +4,6 @@ import type { EChartsCoreOption } from "echarts/core"
 import {
   ArrowRight,
   CheckCircle2,
-  ChevronDown,
   CircleAlert,
   Clock3,
   DatabaseZap,
@@ -20,6 +19,7 @@ import StatusBadge from "@/components/StatusBadge.vue"
 import Badge from "@/components/ui/Badge.vue"
 import Button from "@/components/ui/Button.vue"
 import Skeleton from "@/components/ui/Skeleton.vue"
+import { useAdminUsage } from "@/composables/useAdminUsage"
 import { useConsole } from "@/composables/useConsole"
 import {
   compactNumber,
@@ -29,16 +29,34 @@ import {
   shortID,
 } from "@/lib/format"
 
-const { data, loading, refresh } = useConsole()
+const { data, loading: consoleLoading, refresh: refreshConsole } = useConsole()
+const {
+  snapshot: platformUsage,
+  loading: usageLoading,
+  error: usageError,
+  refresh: refreshUsage,
+} = useAdminUsage()
+const loading = computed(() => consoleLoading.value || usageLoading.value)
+
+function refresh() {
+  void Promise.all([refreshConsole(), refreshUsage()])
+}
 
 const successRate = computed(() => {
-  if (!data.value.totals.requests) return 0
-  return (data.value.totals.successful_requests / data.value.totals.requests) * 100
+  if (!platformUsage.value.totals.requests) return 0
+  return (
+    (platformUsage.value.totals.successful_requests /
+      platformUsage.value.totals.requests) *
+    100
+  )
 })
 
 const cacheRate = computed(() => {
-  if (!data.value.totals.requests) return 0
-  return (data.value.totals.cache_hits / data.value.totals.requests) * 100
+  if (!platformUsage.value.totals.requests) return 0
+  return (
+    (platformUsage.value.totals.cache_hits / platformUsage.value.totals.requests) *
+    100
+  )
 })
 
 const chartOption = computed<EChartsCoreOption>(() => ({
@@ -55,7 +73,7 @@ const chartOption = computed<EChartsCoreOption>(() => ({
   xAxis: {
     type: "category",
     boundaryGap: false,
-    data: data.value.series.map((point) => point.bucket.slice(5)),
+    data: platformUsage.value.series.map((point) => point.bucket.slice(5)),
     axisLine: { lineStyle: { color: "#5b6058" } },
     axisTick: { show: false },
     axisLabel: { color: "#858b81", fontSize: 10, interval: 1 },
@@ -89,7 +107,7 @@ const chartOption = computed<EChartsCoreOption>(() => ({
           ],
         },
       },
-      data: data.value.series.map((point) => point.totals.requests),
+      data: platformUsage.value.series.map((point) => point.totals.requests),
     },
     {
       name: "缓存命中",
@@ -97,7 +115,7 @@ const chartOption = computed<EChartsCoreOption>(() => ({
       smooth: 0.3,
       symbol: "none",
       lineStyle: { width: 1.5 },
-      data: data.value.series.map((point) => point.totals.cache_hits),
+      data: platformUsage.value.series.map((point) => point.totals.cache_hits),
     },
     {
       name: "失败",
@@ -105,14 +123,14 @@ const chartOption = computed<EChartsCoreOption>(() => ({
       smooth: 0.3,
       symbol: "none",
       lineStyle: { width: 1.5 },
-      data: data.value.series.map((point) => point.totals.failed_requests),
+      data: platformUsage.value.series.map((point) => point.totals.failed_requests),
     },
   ],
 }))
 
 const providerStats = computed(() => {
   const providerMap = new Map<string, { requests: number; latency: number; failures: number }>()
-  for (const record of data.value.usage) {
+  for (const record of platformUsage.value.events) {
     const provider = record.provider_id || "unknown"
     const current = providerMap.get(provider) || { requests: 0, latency: 0, failures: 0 }
     current.requests += 1
@@ -129,20 +147,38 @@ const providerStats = computed(() => {
     }))
     .sort((a, b) => b.requests - a.requests)
 })
+
+const tenantByID = computed(
+  () => new Map(data.value.tenants.map((tenant) => [tenant.id, tenant])),
+)
+
 </script>
 
 <template>
-  <PageHeader title="运行总览" description="网关运行状态、流量、成本与可靠性信号。">
-    <div class="flex h-8 items-center gap-2 rounded-md border border-border bg-surface px-2.5 text-[11px] text-muted-foreground">
-      近 14 天
-      <ChevronDown class="size-3" />
+  <PageHeader
+    title="运行总览"
+    description="控制面运行状态，以及跨租户的平台流量与可靠性信号。"
+  >
+    <div class="flex h-8 items-center border border-border bg-surface px-2.5 text-[11px] text-muted-foreground">
+      近 14 天 · 平台口径
     </div>
     <Button variant="secondary" size="sm" :disabled="loading" @click="refresh">
       刷新数据
     </Button>
   </PageHeader>
 
-  <template v-if="loading && !data.totals.requests">
+  <div
+    v-if="usageError"
+    class="mb-4 flex items-center gap-3 border border-negative/30 bg-negative-soft px-3.5 py-2.5 text-xs text-negative"
+  >
+    <CircleAlert class="size-4 shrink-0" />
+    <span>平台用量读取失败：{{ usageError }}</span>
+    <RouterLink to="/admin/usage" class="ml-auto font-semibold underline underline-offset-2">
+      查看详情
+    </RouterLink>
+  </div>
+
+  <template v-if="loading && !platformUsage.totals.requests">
     <div class="overview-metric-grid grid grid-cols-5 border border-border bg-surface">
       <div v-for="index in 5" :key="index" class="px-5 py-5">
         <Skeleton class="h-3 w-20" />
@@ -153,39 +189,33 @@ const providerStats = computed(() => {
   </template>
   <div v-else class="overview-metric-grid grid grid-cols-5 border border-border bg-surface">
     <MetricCell
-      label="总请求"
-      :value="compactNumber(data.totals.requests)"
-      trend="+12.8%"
-      tone="positive"
-      note="相较上一周期"
+      label="平台请求"
+      :value="compactNumber(platformUsage.totals.requests)"
+      :note="`${platformUsage.tenantGroups.length} 个活跃租户`"
     />
     <MetricCell
       label="成功率"
       :value="`${successRate.toFixed(2)}%`"
-      trend="+0.34%"
       tone="positive"
-      :note="`${compactNumber(data.totals.failed_requests)} 个失败请求`"
+      :note="`${compactNumber(platformUsage.totals.failed_requests)} 个失败请求`"
     />
     <MetricCell
       label="总 Token"
-      :value="compactNumber(data.totals.total_tokens)"
-      trend="+8.2%"
+      :value="compactNumber(platformUsage.totals.total_tokens)"
       tone="neutral"
-      :note="`${compactNumber(data.totals.cache_saved_tokens)} 已节省`"
+      :note="`${compactNumber(platformUsage.totals.cache_saved_tokens)} 已节省`"
     />
     <MetricCell
-      label="估算成本"
-      :value="formatUSD(data.totals.total_cost_usd)"
-      trend="-3.6%"
+      label="已知成本"
+      :value="formatUSD(platformUsage.totals.total_cost_usd)"
       tone="positive"
-      :note="`${data.totals.unknown_cost_requests} 个请求成本未知`"
+      :note="`${platformUsage.totals.unknown_cost_requests} 个请求成本未知`"
     />
     <MetricCell
       label="平均延迟"
-      :value="formatDuration(data.totals.average_latency_ms)"
-      trend="-86 ms"
+      :value="formatDuration(platformUsage.totals.average_latency_ms)"
       tone="positive"
-      :note="`TTFT ${formatDuration(data.totals.average_first_token_ms)}`"
+      :note="`TTFT ${formatDuration(platformUsage.totals.average_first_token_ms)}`"
     />
   </div>
 
@@ -257,7 +287,7 @@ const providerStats = computed(() => {
             <div class="mt-0.5 text-[10.5px] text-muted-foreground">当前查询窗口</div>
           </div>
           <span class="tabular text-xs font-semibold">
-            {{ data.totals.retries }} / {{ data.totals.fallbacks }}
+            {{ platformUsage.totals.retries }} / {{ platformUsage.totals.fallbacks }}
           </span>
         </div>
       </div>
@@ -269,10 +299,10 @@ const providerStats = computed(() => {
       <div class="panel-header">
         <div>
           <div class="text-[13px] font-semibold">最近请求</div>
-          <div class="mt-0.5 text-[10.5px] text-muted-foreground">当前业务 API Key 的 Usage 事件</div>
+          <div class="mt-0.5 text-[10.5px] text-muted-foreground">跨租户 Usage 事件</div>
         </div>
         <RouterLink
-          to="/requests"
+          to="/admin/usage"
           class="flex items-center gap-1 text-[11px] font-semibold text-accent hover:underline"
         >
           查看全部 <ArrowRight class="size-3" />
@@ -283,6 +313,7 @@ const providerStats = computed(() => {
           <thead>
             <tr>
               <th>状态</th>
+              <th>租户</th>
               <th>请求 ID</th>
               <th>模型</th>
               <th>Provider</th>
@@ -292,8 +323,13 @@ const providerStats = computed(() => {
             </tr>
           </thead>
           <tbody>
-            <tr v-for="record in data.usage.slice(0, 6)" :key="record.event_id">
+            <tr v-for="record in platformUsage.events.slice(0, 6)" :key="record.event_id">
               <td><StatusBadge :status="record.status" /></td>
+              <td>
+                <span class="max-w-32 truncate text-[10.5px] font-semibold">
+                  {{ tenantByID.get(record.tenant_id)?.display_name || shortID(record.tenant_id) }}
+                </span>
+              </td>
               <td class="font-mono text-[11px] text-muted-foreground">
                 {{ shortID(record.request_id) }}
               </td>

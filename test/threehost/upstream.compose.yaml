@@ -1,0 +1,46 @@
+name: model-velo-upstream
+
+x-fake-upstream: &fake-upstream
+  image: model-velo-fake-upstream:local
+  build:
+    context: ../..
+    dockerfile: test/fakeupstream/Dockerfile
+  restart: unless-stopped
+  read_only: true
+  security_opt:
+    - no-new-privileges:true
+
+services:
+  main:
+    <<: *fake-upstream
+    command:
+      - -addr
+      - :9000
+      - -name
+      - main
+    ports:
+      - "${UPSTREAM_BIND:-0.0.0.0}:9000:9000"
+
+  fail:
+    <<: *fake-upstream
+    command:
+      - -addr
+      - :9000
+      - -name
+      - fail
+      - -scenario
+      - mock/error-503
+    ports:
+      - "${UPSTREAM_BIND:-0.0.0.0}:9001:9000"
+
+  fallback:
+    <<: *fake-upstream
+    command:
+      - -addr
+      - :9000
+      - -name
+      - fallback
+      - -scenario
+      - mock/instant
+    ports:
+      - "${UPSTREAM_BIND:-0.0.0.0}:9002:9000"

@@ -2,9 +2,6 @@ name: model-velo-upstream
 
 x-fake-upstream: &fake-upstream
   image: model-velo-fake-upstream:local
-  build:
-    context: ../..
-    dockerfile: test/fakeupstream/Dockerfile
   restart: unless-stopped
   read_only: true
   security_opt:
@@ -13,6 +10,9 @@ x-fake-upstream: &fake-upstream
 services:
   main:
     <<: *fake-upstream
+    build:
+      context: ../..
+      dockerfile: test/fakeupstream/Dockerfile
     command:
       - -addr
       - :9000

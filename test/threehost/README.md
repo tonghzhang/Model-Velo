@@ -67,14 +67,18 @@ Linux、Git、Bash 和 k6。三台机器都应启用时间同步。
 git clone <model-velo-repository> model-velo
 cd model-velo
 git checkout <commit>
-docker compose -f test/threehost/upstream.compose.yaml up -d --build
+
+docker compose -f test/threehost/upstream.compose.yaml build main
+docker compose -f test/threehost/upstream.compose.yaml up -d --no-build
 
 curl http://127.0.0.1:9000/healthz
 curl http://127.0.0.1:9001/healthz
 curl http://127.0.0.1:9002/healthz
 ```
 
-`upstream.compose.yaml` 复用一个镜像启动三份进程，不需要为每个 Provider 手写一套服务。
+`upstream.compose.yaml` 只通过 `main` 构建一次
+`model-velo-fake-upstream:local`，再复用该镜像启动三份进程，不需要为每个 Provider
+构建不同镜像或手写一套服务。
 
 ## 2. 网关机
 

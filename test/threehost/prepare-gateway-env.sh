@@ -35,13 +35,13 @@ for upstream_url in \
   "$UPSTREAM_MAIN_URL" \
   "$UPSTREAM_FAIL_URL" \
   "$UPSTREAM_FALLBACK_URL"; do
-  if [[ ! "$upstream_url" =~ ^https?://[A-Za-z0-9._:\[\]-]+$ ]]; then
+  if [[ ! "$upstream_url" =~ ^https?://[][A-Za-z0-9._:-]+$ ]]; then
     printf 'upstream URL must be an http(s) origin without path: %s\n' \
       "$upstream_url" >&2
     exit 1
   fi
 done
-if [[ ! "$GATEWAY_BIND" =~ ^[A-Za-z0-9.:\[\]-]+$ ]]; then
+if [[ ! "$GATEWAY_BIND" =~ ^[][A-Za-z0-9.:-]+$ ]]; then
   printf 'GATEWAY_BIND is invalid: %s\n' "$GATEWAY_BIND" >&2
   exit 1
 fi

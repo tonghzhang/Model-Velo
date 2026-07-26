@@ -6,6 +6,20 @@
 三台服务器（网关、k6 客户端、假上游）的可执行测试包和结果口径见
 [`test/threehost/README.md`](../test/threehost/README.md)。
 
+正式远端测试使用 `test/threehost/run-complete-client.sh`，只测 Model-Velo，不启动
+其他网关。它覆盖闭合并发容量、开放目标 RPS、爬坡、突发、耐久、Payload、Cache、
+Queue、限流、上游错误/抖动/长尾和逐 Chunk SSE；每个 case 保存起止时间与假上游调用
+计数。网关机同时采集 Docker 与 Prometheus，结束后导出 Usage/PostgreSQL/Redis/日志。
+合并三机同一 `RUN_ID` 的结果后运行：
+
+```bash
+python3 test/threehost/summarize.py test-results/threehost/<RUN_ID>
+```
+
+交付整个 `<RUN_ID>` 目录（不含任何 `.env` 或密钥），而不是只交一张终端截图或一个 QPS
+数字。这样下一轮能够区分客户端 dropped iterations、网关 CPU/Queue、Retry 放大、
+Redis/Usage Worker 积压和假上游长尾。
+
 ## HTTP 基准
 
 基准使用进程内 Gin 网关与本地 `httptest` 上游，不访问公网，不包含 PostgreSQL/Redis 延迟。

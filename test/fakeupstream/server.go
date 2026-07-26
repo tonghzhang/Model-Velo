@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net/http"
 	"sort"
@@ -35,6 +36,12 @@ type scenario struct {
 	retryAfter            time.Duration
 	hasStreamError        bool
 	hasStreamDrop         bool
+	delayJitter           time.Duration
+	spikePercent          int
+	spikeMultiplier       int
+	failurePercent        int
+	failureStatus         int
+	responseBytes         int
 }
 
 var scenarioCatalog = map[string]scenario{
@@ -56,6 +63,40 @@ var scenarioCatalog = map[string]scenario{
 		initialDelay:  time.Second,
 		chunkInterval: 50 * time.Millisecond,
 		chunkCount:    64,
+	},
+	"mock/jitter": {
+		name:         "mock/jitter",
+		description:  "deterministic 25-175 ms latency selected from the request ID",
+		initialDelay: 100 * time.Millisecond,
+		delayJitter:  75 * time.Millisecond,
+		chunkCount:   1,
+	},
+	"mock/spike-5": {
+		name:            "mock/spike-5",
+		description:     "100 ms latency with deterministic 5 percent 20x spikes",
+		initialDelay:    100 * time.Millisecond,
+		spikePercent:    5,
+		spikeMultiplier: 20,
+		chunkCount:      1,
+	},
+	"mock/error-rate-10": {
+		name:           "mock/error-rate-10",
+		description:    "deterministic 10 percent HTTP 503 responses",
+		chunkCount:     1,
+		failurePercent: 10,
+		failureStatus:  http.StatusServiceUnavailable,
+	},
+	"mock/payload-10k": {
+		name:          "mock/payload-10k",
+		description:   "immediate success with a 10 KiB assistant message",
+		chunkCount:    10,
+		responseBytes: 10 << 10,
+	},
+	"mock/payload-50k": {
+		name:          "mock/payload-50k",
+		description:   "immediate success with a 50 KiB assistant message",
+		chunkCount:    50,
+		responseBytes: 50 << 10,
 	},
 	"mock/error-400": {
 		name:        "mock/error-400",
@@ -109,6 +150,17 @@ type upstreamServer struct {
 	attemptsMu sync.Mutex
 	attempts   map[string]attemptState
 	sequence   atomic.Uint64
+
+	requests       atomic.Uint64
+	completed      atomic.Uint64
+	errors         atomic.Uint64
+	streams        atomic.Uint64
+	streamFailures atomic.Uint64
+	active         atomic.Int64
+	maxActive      atomic.Int64
+	statsStartedAt atomic.Int64
+	statsMu        sync.Mutex
+	scenarioStats  map[string]scenarioStats
 }
 
 type attemptState struct {
@@ -116,28 +168,41 @@ type attemptState struct {
 	lastSeenAt time.Time
 }
 
+type scenarioStats struct {
+	Requests int64 `json:"requests"`
+	Errors   int64 `json:"errors"`
+	Streams  int64 `json:"streams"`
+}
+
 func newUpstreamServer(providerName, scenarioOverride string) (*upstreamServer, error) {
 	providerName = strings.TrimSpace(providerName)
 	scenarioOverride = strings.TrimSpace(scenarioOverride)
 	if !validProviderName(providerName) {
-		return nil, errors.New("provider name must contain only letters, digits, dot, dash, or underscore")
+		return nil, errors.New(
+			"provider name must contain only letters, digits, dot, dash, " +
+				"or underscore",
+		)
 	}
 	if scenarioOverride != "" {
 		if _, exists := scenarioCatalog[scenarioOverride]; !exists {
 			return nil, fmt.Errorf("unknown forced scenario %q", scenarioOverride)
 		}
 	}
-	return &upstreamServer{
+	server := &upstreamServer{
 		providerName:     providerName,
 		scenarioOverride: scenarioOverride,
 		attempts:         map[string]attemptState{},
-	}, nil
+		scenarioStats:    map[string]scenarioStats{},
+	}
+	server.statsStartedAt.Store(time.Now().UnixNano())
+	return server, nil
 }
 
 func (s *upstreamServer) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.HandleFunc("GET /__admin/scenarios", s.handleScenarios)
+	mux.HandleFunc("GET /__admin/stats", s.handleStats)
 	mux.HandleFunc("POST /__admin/reset", s.handleReset)
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("POST /chat/completions", s.handleChatCompletions)
@@ -174,18 +239,64 @@ func (s *upstreamServer) handleScenarios(w http.ResponseWriter, _ *http.Request)
 	})
 }
 
+func (s *upstreamServer) handleStats(w http.ResponseWriter, _ *http.Request) {
+	s.statsMu.Lock()
+	names := make([]string, 0, len(s.scenarioStats))
+	for name := range s.scenarioStats {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	scenarios := make([]scenarioStatsEntry, 0, len(names))
+	for _, name := range names {
+		stats := s.scenarioStats[name]
+		scenarios = append(scenarios, scenarioStatsEntry{
+			Name:     name,
+			Requests: stats.Requests,
+			Errors:   stats.Errors,
+			Streams:  stats.Streams,
+		})
+	}
+	s.statsMu.Unlock()
+
+	writeJSON(w, http.StatusOK, upstreamStatsResponse{
+		Provider:       s.providerName,
+		StartedAt:      time.Unix(0, s.statsStartedAt.Load()).UTC(),
+		Requests:       s.requests.Load(),
+		Completed:      s.completed.Load(),
+		Errors:         s.errors.Load(),
+		Streams:        s.streams.Load(),
+		StreamFailures: s.streamFailures.Load(),
+		Active:         s.active.Load(),
+		MaxActive:      s.maxActive.Load(),
+		Scenarios:      scenarios,
+	})
+}
+
 func (s *upstreamServer) handleReset(w http.ResponseWriter, _ *http.Request) {
 	s.attemptsMu.Lock()
 	s.attempts = map[string]attemptState{}
 	s.attemptsMu.Unlock()
+	s.requests.Store(0)
+	s.completed.Store(0)
+	s.errors.Store(0)
+	s.streams.Store(0)
+	s.streamFailures.Store(0)
+	s.maxActive.Store(s.active.Load())
+	s.statsStartedAt.Store(time.Now().UnixNano())
+	s.statsMu.Lock()
+	s.scenarioStats = map[string]scenarioStats{}
+	s.statsMu.Unlock()
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *upstreamServer) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
+	s.beginRequest()
+	defer s.finishRequest()
 	w.Header().Set("X-Mock-Provider", s.providerName)
 
 	request, err := decodeChatRequest(w, r)
 	if err != nil {
+		s.recordError("")
 		statusCode := http.StatusBadRequest
 		var maxBytesError *http.MaxBytesError
 		if errors.As(err, &maxBytesError) {
@@ -196,17 +307,22 @@ func (s *upstreamServer) handleChatCompletions(w http.ResponseWriter, r *http.Re
 	}
 	selected, err := s.selectScenario(request.Model)
 	if err != nil {
+		s.recordError("")
 		writeUpstreamError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	s.recordScenario(selected.name, request.Stream)
 	w.Header().Set("X-Mock-Scenario", selected.name)
 
 	if (selected.hasStreamError || selected.hasStreamDrop) && !request.Stream {
+		s.recordError(selected.name)
 		writeUpstreamError(w, http.StatusBadRequest, selected.name+" requires stream=true")
 		return
 	}
-	attempt, shouldFail, err := s.beginAttempt(r.Header.Get("X-Request-ID"), selected)
+	requestID := r.Header.Get("X-Request-ID")
+	attempt, shouldFail, err := s.beginAttempt(requestID, selected)
 	if err != nil {
+		s.recordError(selected.name)
 		statusCode := http.StatusBadRequest
 		if errors.Is(err, errRetryStateCapacity) {
 			statusCode = http.StatusServiceUnavailable
@@ -216,10 +332,17 @@ func (s *upstreamServer) handleChatCompletions(w http.ResponseWriter, r *http.Re
 	}
 	w.Header().Set("X-Mock-Attempt", strconv.Itoa(attempt))
 	if shouldFail {
+		s.recordError(selected.name)
 		writeUpstreamError(w, http.StatusInternalServerError, "mock retryable failure")
 		return
 	}
+	if selected.shouldFail(requestID) {
+		s.recordError(selected.name)
+		writeUpstreamError(w, selected.failureStatus, "mock deterministic percentage failure")
+		return
+	}
 	if selected.statusCode != 0 {
+		s.recordError(selected.name)
 		if selected.retryAfter > 0 {
 			w.Header().Set("Retry-After", strconv.Itoa(int(selected.retryAfter.Seconds())))
 		}
@@ -227,18 +350,62 @@ func (s *upstreamServer) handleChatCompletions(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	initialDelay := selected.delayFor(requestID)
 	if request.Stream {
-		s.writeStream(r.Context(), w, request, selected)
+		if selected.hasStreamError || selected.hasStreamDrop {
+			s.streamFailures.Add(1)
+		}
+		s.writeStream(r.Context(), w, request, selected, initialDelay)
 		return
 	}
-	if !waitFor(r.Context(), selected.totalDuration()) {
+	if !waitFor(r.Context(), selected.totalDuration(initialDelay)) {
 		return
 	}
 	writeJSON(
 		w,
 		http.StatusOK,
-		s.chatResponse(request, r.Header.Get("X-Request-ID"), selected),
+		s.chatResponse(request, requestID, selected),
 	)
+}
+
+func (s *upstreamServer) beginRequest() {
+	s.requests.Add(1)
+	active := s.active.Add(1)
+	for {
+		maxActive := s.maxActive.Load()
+		if active <= maxActive || s.maxActive.CompareAndSwap(maxActive, active) {
+			return
+		}
+	}
+}
+
+func (s *upstreamServer) finishRequest() {
+	s.active.Add(-1)
+	s.completed.Add(1)
+}
+
+func (s *upstreamServer) recordScenario(name string, stream bool) {
+	s.statsMu.Lock()
+	stats := s.scenarioStats[name]
+	stats.Requests++
+	if stream {
+		stats.Streams++
+		s.streams.Add(1)
+	}
+	s.scenarioStats[name] = stats
+	s.statsMu.Unlock()
+}
+
+func (s *upstreamServer) recordError(name string) {
+	s.errors.Add(1)
+	if name == "" {
+		return
+	}
+	s.statsMu.Lock()
+	stats := s.scenarioStats[name]
+	stats.Errors++
+	s.scenarioStats[name] = stats
+	s.statsMu.Unlock()
 }
 
 func (s *upstreamServer) selectScenario(model string) (scenario, error) {
@@ -306,6 +473,13 @@ func (s *upstreamServer) chatResponse(
 	selected scenario,
 ) chatResponse {
 	content := "mock response from " + s.providerName
+	if selected.responseBytes > len(content) {
+		content += strings.Repeat("x", selected.responseBytes-len(content))
+	}
+	completionTokens := selected.chunkCount
+	if selected.responseBytes > 0 {
+		completionTokens = (selected.responseBytes + 3) / 4
+	}
 	return chatResponse{
 		ID:      s.responseID(requestID),
 		Object:  "chat.completion",
@@ -323,8 +497,8 @@ func (s *upstreamServer) chatResponse(
 		},
 		Usage: tokenUsage{
 			PromptTokens:     4,
-			CompletionTokens: selected.chunkCount,
-			TotalTokens:      4 + selected.chunkCount,
+			CompletionTokens: completionTokens,
+			TotalTokens:      4 + completionTokens,
 		},
 		SystemFingerprint: "mock-" + s.providerName,
 	}
@@ -335,12 +509,13 @@ func (s *upstreamServer) writeStream(
 	w http.ResponseWriter,
 	request chatRequest,
 	selected scenario,
+	initialDelay time.Duration,
 ) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
-	if !waitFor(ctx, selected.initialDelay) {
+	if !waitFor(ctx, initialDelay) {
 		return
 	}
 	if selected.hasStreamError {
@@ -463,8 +638,39 @@ func decodeChatRequest(w http.ResponseWriter, r *http.Request) (chatRequest, err
 	return request, nil
 }
 
-func (s scenario) totalDuration() time.Duration {
-	return s.initialDelay + time.Duration(s.chunkCount)*s.chunkInterval
+func (s scenario) totalDuration(initialDelay time.Duration) time.Duration {
+	return initialDelay + time.Duration(s.chunkCount)*s.chunkInterval
+}
+
+func (s scenario) delayFor(requestID string) time.Duration {
+	delay := s.initialDelay
+	hash := requestHash(requestID)
+	if s.delayJitter > 0 {
+		width := int64(s.delayJitter)*2 + 1
+		offset := time.Duration(int64(hash%uint64(width))) - s.delayJitter
+		delay += offset
+	}
+	if s.spikePercent > 0 &&
+		s.spikeMultiplier > 1 &&
+		int(hash%100) < s.spikePercent {
+		delay *= time.Duration(s.spikeMultiplier)
+	}
+	if delay < 0 {
+		return 0
+	}
+	return delay
+}
+
+func (s scenario) shouldFail(requestID string) bool {
+	return s.failurePercent > 0 &&
+		s.failureStatus != 0 &&
+		int(requestHash(requestID)%100) < s.failurePercent
+}
+
+func requestHash(requestID string) uint64 {
+	hash := fnv.New64a()
+	_, _ = hash.Write([]byte(strings.TrimSpace(requestID)))
+	return hash.Sum64()
 }
 
 func waitFor(ctx context.Context, delay time.Duration) bool {
@@ -639,4 +845,24 @@ type scenariosResponse struct {
 	Default   string                `json:"default"`
 	Override  string                `json:"override,omitempty"`
 	Scenarios []scenarioDescription `json:"scenarios"`
+}
+
+type scenarioStatsEntry struct {
+	Name     string `json:"name"`
+	Requests int64  `json:"requests"`
+	Errors   int64  `json:"errors"`
+	Streams  int64  `json:"streams"`
+}
+
+type upstreamStatsResponse struct {
+	Provider       string               `json:"provider"`
+	StartedAt      time.Time            `json:"started_at"`
+	Requests       uint64               `json:"requests"`
+	Completed      uint64               `json:"completed"`
+	Errors         uint64               `json:"errors"`
+	Streams        uint64               `json:"streams"`
+	StreamFailures uint64               `json:"stream_failures"`
+	Active         int64                `json:"active"`
+	MaxActive      int64                `json:"max_active"`
+	Scenarios      []scenarioStatsEntry `json:"scenarios"`
 }

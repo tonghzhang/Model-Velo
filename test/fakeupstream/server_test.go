@@ -61,7 +61,8 @@ func TestUpstreamServerChatCompletions(t *testing.T) {
 		if response.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d, want 200", response.StatusCode)
 		}
-		if contentType := response.Header.Get("Content-Type"); !strings.HasPrefix(contentType, "text/event-stream") {
+		contentType := response.Header.Get("Content-Type")
+		if !strings.HasPrefix(contentType, "text/event-stream") {
 			t.Fatalf("Content-Type = %q, want text/event-stream", contentType)
 		}
 
@@ -135,6 +136,86 @@ func TestUpstreamServerRetrySequenceIsolatedByRequestID(t *testing.T) {
 	for message := range errorsByRequest {
 		t.Error(message)
 	}
+}
+
+func TestUpstreamServerLoadScenariosAndStats(t *testing.T) {
+	upstream, err := newUpstreamServer("load-provider", "")
+	if err != nil {
+		t.Fatalf("new upstream server: %v", err)
+	}
+	testServer := httptest.NewServer(upstream.handler())
+	defer testServer.Close()
+
+	payloadResponse := postChat(
+		t,
+		testServer.URL,
+		"payload-request",
+		"mock/payload-10k",
+		false,
+	)
+	defer payloadResponse.Body.Close()
+
+	var payload chatResponse
+	if err := json.NewDecoder(payloadResponse.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode payload response: %v", err)
+	}
+	if got := len(payload.Choices[0].Message.Content); got != 10<<10 {
+		t.Fatalf("payload bytes = %d, want %d", got, 10<<10)
+	}
+
+	failingID := requestIDWithFailureOutcome(true)
+	errorResponse := postChat(
+		t,
+		testServer.URL,
+		failingID,
+		"mock/error-rate-10",
+		false,
+	)
+	_, _ = io.Copy(io.Discard, errorResponse.Body)
+	_ = errorResponse.Body.Close()
+	if errorResponse.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("failure status = %d, want 503", errorResponse.StatusCode)
+	}
+
+	successID := requestIDWithFailureOutcome(false)
+	successResponse := postChat(
+		t,
+		testServer.URL,
+		successID,
+		"mock/error-rate-10",
+		false,
+	)
+	_, _ = io.Copy(io.Discard, successResponse.Body)
+	_ = successResponse.Body.Close()
+	if successResponse.StatusCode != http.StatusOK {
+		t.Fatalf("success status = %d, want 200", successResponse.StatusCode)
+	}
+
+	response, err := http.Get(testServer.URL + "/__admin/stats")
+	if err != nil {
+		t.Fatalf("get stats: %v", err)
+	}
+	defer response.Body.Close()
+	var stats upstreamStatsResponse
+	if err := json.NewDecoder(response.Body).Decode(&stats); err != nil {
+		t.Fatalf("decode stats: %v", err)
+	}
+	if stats.Requests != 3 || stats.Completed != 3 || stats.Errors != 1 {
+		t.Fatalf("unexpected totals: %+v", stats)
+	}
+	if stats.MaxActive < 1 {
+		t.Fatalf("max active = %d, want at least 1", stats.MaxActive)
+	}
+}
+
+func requestIDWithFailureOutcome(fail bool) string {
+	for index := range 10_000 {
+		requestID := "failure-outcome-" + strconv.Itoa(index)
+		if (requestHash(requestID)%100 < 10) == fail {
+			return requestID
+		}
+	}
+	panic("unable to find deterministic failure outcome")
 }
 
 func postChat(

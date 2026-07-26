@@ -5,7 +5,7 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH= cd -- "$script_dir/../.." && pwd)
 
 compose_file=${COMPOSE_FILE:-"$repo_root/compose.yaml"}
-services_csv=${SERVICES:-gateway,usage-worker}
+services_csv=${SERVICES:-gateway,usage-worker,postgres,redis}
 duration_seconds=${DURATION_SECONDS:-600}
 interval_seconds=${INTERVAL_SECONDS:-1}
 output_file=${OUTPUT_FILE:-"$repo_root/test-results/threehost/compose-stats.jsonl"}

@@ -94,7 +94,7 @@ umask 077
   printf '\n'
   printf 'MODEL_VELO_PROVIDER_KEYS_JSON=%s\n' "$provider_keys_json"
   printf 'MODEL_VELO_ROUTING_JSON=%s\n' "$routing_json"
-  printf 'MODEL_VELO_BREAKER_FAILURE_THRESHOLD=50\n'
+  printf 'MODEL_VELO_BREAKER_FAILURE_THRESHOLD=5\n'
   printf 'MODEL_VELO_BREAKER_OPEN_DURATION=30s\n'
   printf 'MODEL_VELO_BREAKER_HALF_OPEN_PROBES=1\n'
   printf 'MODEL_VELO_QUEUE_MAX_IN_FLIGHT=256\n'

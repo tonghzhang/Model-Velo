@@ -1,9 +1,13 @@
 import http from 'k6/http';
 import { check } from 'k6';
-import { Rate, Trend } from 'k6/metrics';
+import { Counter, Rate, Trend } from 'k6/metrics';
 
 export const chatSuccess = new Rate('chat_success');
 export const streamFirstByte = new Trend('stream_first_byte_ms', true);
+export const responses200 = new Counter('chat_responses_200');
+export const responses429 = new Counter('chat_responses_429');
+export const responses5xx = new Counter('chat_responses_5xx');
+export const responsesOther = new Counter('chat_responses_other');
 export const requestTimeout = __ENV.REQUEST_TIMEOUT || '20s';
 
 export const expected200 = http.expectedStatuses(200);
@@ -55,9 +59,37 @@ export function chatURL(value) {
 }
 
 export function requestID(target) {
-  const safeTarget = target.replace(/[^A-Za-z0-9_-]/g, '-').slice(0, 24);
+  const prefix = (__ENV.REQUEST_PREFIX || 'k6').trim();
+  const safePrefix = prefix.replace(/[^A-Za-z0-9._-]/g, '-').slice(0, 48);
+  const safeTarget = target.replace(/[^A-Za-z0-9_-]/g, '-').slice(0, 16);
   const random = Math.floor(Math.random() * 0x100000000).toString(16);
-  return `k6-${safeTarget}-${__VU}-${__ITER}-${Date.now().toString(36)}-${random}`;
+  return `${safePrefix}-${safeTarget}-${__VU}-${__ITER}-${Date.now().toString(36)}-${random}`;
+}
+
+function promptContent(id, promptBytes, cacheMode) {
+  const identity = cacheMode === 'shared' ? 'shared' : id;
+  let content = `model-velo benchmark request ${identity} `;
+  if (content.length < promptBytes) {
+    content += 'x'.repeat(promptBytes - content.length);
+  }
+  return content.slice(0, promptBytes);
+}
+
+export function recordHTTPStatus(response, tags = {}) {
+  switch (response.status) {
+    case 200:
+      responses200.add(1, tags);
+      break;
+    case 429:
+      responses429.add(1, tags);
+      break;
+    default:
+      if (response.status >= 500 && response.status <= 599) {
+        responses5xx.add(1, tags);
+      } else {
+        responsesOther.add(1, tags);
+      }
+  }
 }
 
 export function sendChat({
@@ -67,13 +99,17 @@ export function sendChat({
   stream = false,
   target = 'unknown',
   responseCallback = expected200,
+  promptBytes = 200,
+  cacheMode = 'bypass',
 }) {
   const id = requestID(target);
   const headers = {
-    'Cache-Control': 'no-store',
     'Content-Type': 'application/json',
     'X-Request-ID': id,
   };
+  if (cacheMode === 'bypass') {
+    headers['Cache-Control'] = 'no-store';
+  }
   if (apiKey) {
     headers.Authorization = `Bearer ${apiKey}`;
   }
@@ -83,7 +119,7 @@ export function sendChat({
     messages: [
       {
         role: 'user',
-        content: `model-velo benchmark request ${id}`,
+        content: promptContent(id, promptBytes, cacheMode),
       },
     ],
     stream,
@@ -96,12 +132,15 @@ export function sendChat({
       model,
       stream: String(stream),
       target,
+      cache_mode: cacheMode,
+      prompt_bytes: String(promptBytes),
     },
     timeout: requestTimeout,
   });
 }
 
 export function verifySuccessfulChat(response, stream, tags = {}) {
+  recordHTTPStatus(response, tags);
   const assertions = stream
     ? {
         'stream status is 200': (res) => res.status === 200,

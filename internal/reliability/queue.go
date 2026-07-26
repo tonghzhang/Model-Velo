@@ -33,7 +33,7 @@ type QueueConfig struct {
 
 func DefaultQueueConfig() QueueConfig {
 	return QueueConfig{
-		MaxInFlight: 20,
+		MaxInFlight: 256,
 		MaxWaiting:  100,
 		WaitTimeout: 2 * time.Second,
 	}

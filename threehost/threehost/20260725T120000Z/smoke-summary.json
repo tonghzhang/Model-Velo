@@ -1,0 +1,178 @@
+{
+    "root_group": {
+        "name": "",
+        "path": "",
+        "id": "d41d8cd98f00b204e9800998ecf8427e",
+        "groups": {},
+        "checks": {
+                "fake upstream is healthy": {
+                    "fails": 0,
+                    "name": "fake upstream is healthy",
+                    "path": "::fake upstream is healthy",
+                    "id": "7930b329c03b9ff24cacf29e7222e1a3",
+                    "passes": 1
+                },
+                "gateway is ready": {
+                    "id": "f94d33b229bbbdcbeef6a450cb5fc984",
+                    "passes": 1,
+                    "fails": 0,
+                    "name": "gateway is ready",
+                    "path": "::gateway is ready"
+                },
+                "chat status is 200": {
+                    "name": "chat status is 200",
+                    "path": "::chat status is 200",
+                    "id": "8b366dfc28447643d7a100f81d49e9cb",
+                    "passes": 2,
+                    "fails": 0
+                },
+                "chat body is a completion": {
+                    "path": "::chat body is a completion",
+                    "id": "dd8a724b149dbb7fedc9ddf36bff0341",
+                    "passes": 2,
+                    "fails": 0,
+                    "name": "chat body is a completion"
+                },
+                "stream status is 200": {
+                    "fails": 0,
+                    "name": "stream status is 200",
+                    "path": "::stream status is 200",
+                    "id": "d15eb5c4982b20ba39bac56e96c9eff4",
+                    "passes": 1
+                },
+                "stream content type is SSE": {
+                    "name": "stream content type is SSE",
+                    "path": "::stream content type is SSE",
+                    "id": "50a79a216c54aaeb47d07c1cbfcc3332",
+                    "passes": 1,
+                    "fails": 0
+                },
+                "stream has terminal marker": {
+                    "fails": 0,
+                    "name": "stream has terminal marker",
+                    "path": "::stream has terminal marker",
+                    "id": "787cf8391739503c3d3fdb967bb841df",
+                    "passes": 1
+                }
+            }
+    },
+    "metrics": {
+        "http_reqs": {
+            "count": 5,
+            "rate": 9.16406775996011
+        },
+        "http_req_blocked": {
+            "avg": 0.4294272,
+            "med": 0.00422,
+            "p(90)": 1.1923028000000002,
+            "p(95)": 1.4397524,
+            "p(99)": 1.63771208,
+            "max": 1.687202
+        },
+        "chat_success": {
+            "passes": 3,
+            "fails": 0,
+            "thresholds": {
+                "rate==1": false
+            },
+            "value": 1
+        },
+        "http_req_sending": {
+            "p(90)": 0.053858600000000006,
+            "p(95)": 0.06094179999999999,
+            "p(99)": 0.06660836,
+            "max": 0.068025,
+            "avg": 0.030132200000000005,
+            "med": 0.019629
+        },
+        "iteration_duration": {
+            "p(95)": 545.455489,
+            "p(99)": 545.455489,
+            "max": 545.455489,
+            "avg": 545.455489,
+            "med": 545.455489,
+            "p(90)": 545.455489
+        },
+        "checks": {
+            "passes": 9,
+            "fails": 0,
+            "thresholds": {
+                "rate==1": false
+            },
+            "value": 1
+        },
+        "http_req_receiving": {
+            "avg": 64.9019556,
+            "med": 0.041297,
+            "p(90)": 194.62608740000005,
+            "p(95)": 259.47496519999993,
+            "p(99)": 311.35406744,
+            "max": 324.323843
+        },
+        "http_req_duration{expected_response:true}": {
+            "p(90)": 322.0048118,
+            "p(95)": 425.4668333999999,
+            "p(99)": 508.23645067999996,
+            "max": 528.928855,
+            "avg": 108.4359378,
+            "med": 0.875398
+        },
+        "http_req_tls_handshaking": {
+            "p(95)": 0,
+            "p(99)": 0,
+            "max": 0,
+            "avg": 0,
+            "med": 0,
+            "p(90)": 0
+        },
+        "stream_first_byte_ms": {
+            "avg": 204.585383,
+            "med": 204.585383,
+            "p(90)": 204.585383,
+            "p(95)": 204.585383,
+            "p(99)": 204.585383,
+            "max": 204.585383
+        },
+        "http_req_failed": {
+            "passes": 0,
+            "fails": 5,
+            "value": 0
+        },
+        "data_received": {
+            "count": 5588,
+            "rate": 10241.76212853142
+        },
+        "http_req_duration": {
+            "avg": 108.4359378,
+            "med": 0.875398,
+            "p(90)": 322.0048118,
+            "p(95)": 425.4668333999999,
+            "p(99)": 508.23645067999996,
+            "max": 528.928855
+        },
+        "http_req_connecting": {
+            "avg": 0.1532252,
+            "med": 0,
+            "p(90)": 0.3838178,
+            "p(95)": 0.3853274,
+            "p(99)": 0.38653508,
+            "max": 0.386837
+        },
+        "iterations": {
+            "count": 1,
+            "rate": 1.8328135519920221
+        },
+        "http_req_waiting": {
+            "avg": 43.50385,
+            "med": 0.807143,
+            "p(90)": 127.3825498,
+            "p(95)": 165.98396639999999,
+            "p(99)": 196.86509968000001,
+            "max": 204.585383
+        },
+        "data_sent": {
+            "count": 1409,
+            "rate": 2582.4342947567593
+        }
+    }
+}

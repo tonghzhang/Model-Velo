@@ -116,7 +116,7 @@ func TestLoadStartupConfig(t *testing.T) {
 	if len(got.apiKeySecurity.Pepper) < 32 {
 		t.Errorf("API key pepper length = %d, want at least 32", len(got.apiKeySecurity.Pepper))
 	}
-	if got.rateLimit.Environment != "test" || got.rateLimit.MaxRequests != 60 {
+	if got.rateLimit.Environment != "test" || got.rateLimit.MaxRequests != 6_000 {
 		t.Errorf("rate limit config = %#v", got.rateLimit)
 	}
 	if got.responseCache.TTL != 5*time.Minute || got.responseCache.RouteVersion != "routes-v1" {

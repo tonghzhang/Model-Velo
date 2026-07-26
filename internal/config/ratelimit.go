@@ -13,7 +13,7 @@ const (
 	rateLimitRequestsEnv           = "MODEL_VELO_RATE_LIMIT_REQUESTS"
 	rateLimitWindowEnv             = "MODEL_VELO_RATE_LIMIT_WINDOW"
 	rateLimitFailureEnv            = "MODEL_VELO_RATE_LIMIT_FAILURE_POLICY"
-	defaultRateLimitRequests int64 = 60
+	defaultRateLimitRequests int64 = 6_000
 	maximumRateLimitRequests int64 = 1_000_000
 )
 

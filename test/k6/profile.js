@@ -7,36 +7,31 @@ import {
 } from './common.js';
 
 const targetURL = required('TARGET_URL');
-const target = (__ENV.TARGET_NAME || 'target').trim();
+const target = (__ENV.TARGET_NAME || 'gateway').trim();
 const apiKey = (__ENV.API_KEY || '').trim();
 const model = (__ENV.MODEL || 'mock/instant').trim();
 const stream = booleanValue('STREAM', false);
-const mode = (__ENV.LOAD_MODE || 'rate').trim().toLowerCase();
-const duration = (__ENV.DURATION || '30s').trim();
-const rate = integerValue('RATE', 20);
-const vus = integerValue('VUS', 10);
-const preAllocatedVUs = integerValue('PRE_ALLOCATED_VUS', Math.max(rate, 10));
+const profileMode = (__ENV.PROFILE_MODE || 'rate').trim().toLowerCase();
+const startValue = integerValue('START_VALUE', 1, 0);
+const preAllocatedVUs = integerValue('PRE_ALLOCATED_VUS', 100);
 const maxVUs = integerValue('MAX_VUS', preAllocatedVUs);
 const promptBytes = integerValue('PROMPT_BYTES', 200, 64);
 const cacheMode = (__ENV.CACHE_MODE || 'bypass').trim().toLowerCase();
-const allowDroppedIterations = booleanValue('ALLOW_DROPPED_ITERATIONS', false);
-const minimumSuccessRate = Number(__ENV.MIN_SUCCESS_RATE || '0.99');
-const maximumFailureRate = Number(__ENV.MAX_FAILURE_RATE || '0.01');
+const minimumSuccessRate = Number(__ENV.MIN_SUCCESS_RATE || '0');
+const maximumFailureRate = Number(__ENV.MAX_FAILURE_RATE || '1');
+const stages = parseStages(required('STAGES'));
 
-if (!model) {
-  throw new Error('MODEL must not be empty');
-}
-if (!['rate', 'vus'].includes(mode)) {
-  throw new Error('LOAD_MODE must be rate or vus');
+if (!['rate', 'vus'].includes(profileMode)) {
+  throw new Error('PROFILE_MODE must be rate or vus');
 }
 if (!['bypass', 'unique', 'shared'].includes(cacheMode)) {
   throw new Error('CACHE_MODE must be bypass, unique, or shared');
 }
-if (promptBytes > 512 * 1024) {
-  throw new Error('PROMPT_BYTES must not exceed 524288');
-}
 if (maxVUs < preAllocatedVUs) {
   throw new Error('MAX_VUS must be greater than or equal to PRE_ALLOCATED_VUS');
+}
+if (promptBytes > 512 * 1024) {
+  throw new Error('PROMPT_BYTES must not exceed 524288');
 }
 if (
   !Number.isFinite(minimumSuccessRate) ||
@@ -53,38 +48,50 @@ if (
   throw new Error('MAX_FAILURE_RATE must be between 0 and 1');
 }
 
+function parseStages(value) {
+  return value.split(',').map((entry) => {
+    const separator = entry.indexOf(':');
+    if (separator <= 0 || separator === entry.length - 1) {
+      throw new Error('STAGES entries must use target:duration');
+    }
+    const targetValue = Number(entry.slice(0, separator));
+    const duration = entry.slice(separator + 1).trim();
+    if (!Number.isInteger(targetValue) || targetValue < 0 || !duration) {
+      throw new Error('STAGES contains an invalid target or duration');
+    }
+    return { target: targetValue, duration };
+  });
+}
+
 const scenario =
-  mode === 'rate'
+  profileMode === 'rate'
     ? {
-        executor: 'constant-arrival-rate',
-        rate,
+        executor: 'ramping-arrival-rate',
+        startRate: startValue,
         timeUnit: '1s',
-        duration,
         preAllocatedVUs,
         maxVUs,
+        stages,
         gracefulStop: '30s',
       }
     : {
-        executor: 'constant-vus',
-        vus,
-        duration,
-        gracefulStop: '30s',
+        executor: 'ramping-vus',
+        startVUs: startValue,
+        stages,
+        gracefulRampDown: '30s',
       };
 
 export const options = {
   scenarios: {
-    load: scenario,
+    profile: scenario,
   },
   thresholds: {
     checks: [`rate>=${minimumSuccessRate}`],
     chat_success: [`rate>=${minimumSuccessRate}`],
     http_req_failed: [`rate<=${maximumFailureRate}`],
-    ...(mode === 'rate' && !allowDroppedIterations
-      ? { dropped_iterations: ['count==0'] }
-      : {}),
   },
   summaryTrendStats: ['avg', 'med', 'p(90)', 'p(95)', 'p(99)', 'max'],
-  userAgent: 'model-velo-k6',
+  userAgent: 'model-velo-k6-profile',
 };
 
 export default function () {
@@ -101,7 +108,6 @@ export default function () {
     target,
     model,
     stream: String(stream),
-    cache_mode: cacheMode,
-    prompt_bytes: String(promptBytes),
+    profile_mode: profileMode,
   });
 }

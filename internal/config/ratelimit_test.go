@@ -18,8 +18,8 @@ func TestLoadRateLimitDefaults(t *testing.T) {
 	if got.Environment != "development" {
 		t.Errorf("Environment = %q, want development", got.Environment)
 	}
-	if got.MaxRequests != 60 || got.Window != time.Minute {
-		t.Errorf("quota = %d/%s, want 60/1m", got.MaxRequests, got.Window)
+	if got.MaxRequests != 6_000 || got.Window != time.Minute {
+		t.Errorf("quota = %d/%s, want 6000/1m", got.MaxRequests, got.Window)
 	}
 	if got.FailurePolicy != RateLimitFailClosed {
 		t.Errorf("FailurePolicy = %q, want %q", got.FailurePolicy, RateLimitFailClosed)

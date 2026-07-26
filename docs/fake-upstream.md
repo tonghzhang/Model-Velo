@@ -39,6 +39,11 @@ MODEL_VELO_PROVIDER_KEYS_JSON={"providers":[{"provider_id":"mock-primary","keys"
 | `mock/instant` | 立即返回确定性响应 |
 | `mock/typical` | TTFT 200 ms，16 个流式内容 Chunk，间隔 20 ms |
 | `mock/slow` | TTFT 1 s，64 个流式内容 Chunk，间隔 50 ms |
+| `mock/jitter` | 按 request ID 确定性产生 25–175 ms 延迟 |
+| `mock/spike-5` | 100 ms 基线，按 request ID 确定性产生 5% 的 2 s 长尾 |
+| `mock/error-rate-10` | 按 request ID 确定性返回 10% HTTP 503 |
+| `mock/payload-10k` | 返回 10 KiB assistant 文本 |
+| `mock/payload-50k` | 返回 50 KiB assistant 文本 |
 | `mock/error-400` | 返回 HTTP 400 |
 | `mock/error-401` | 返回 HTTP 401 |
 | `mock/error-429` | 返回 HTTP 429 和 `Retry-After: 1` |
@@ -55,6 +60,16 @@ Chunk 间隔。`mock/retry-2` 的状态按 `X-Request-ID` 隔离，避免并发 
 ```bash
 curl -X POST http://127.0.0.1:9000/__admin/reset
 ```
+
+`reset` 也会清空当前用例的统计。运行结束后读取：
+
+```bash
+curl http://127.0.0.1:9000/__admin/stats
+```
+
+返回值包含请求数、完成数、HTTP 错误数、流式请求/断流数、当前和峰值并发，以及各场景
+计数。三机 runner 会在每个 case 前 reset、结束后保存 stats，因此能够区分网关接收的
+请求数和实际放大到上游的 Attempt 数。
 
 ## 模拟两个 Provider
 
@@ -78,14 +93,17 @@ Toxiproxy，不在假上游 Handler 中重复实现网络代理。
 
 ## 是否需要不同阶段的脚本
 
-假上游不需要不同脚本，始终使用这个服务。k6 客户端建议按目的拆成三类脚本，并共享
+假上游不需要不同脚本，始终使用这个服务。负载客户端按目的拆分脚本，并共享
 请求构造代码：
 
 1. `smoke`：低并发验证状态码、响应格式和 SSE 完整性；
 2. `load`：先直连假上游，再经过 Model-Velo，使用 `mock/instant`、`mock/typical`
    测网关开销和容量；
-3. `reliability`：使用 429、5xx、`mock/retry-2`、SSE 错误和双 Provider，
-   断言 Retry、Fallback、Breaker 与取消行为。
+3. `profile`：执行升压、降压和突发 arrival-rate 曲线；
+4. `fault`：在抖动、长尾、错误比例、Queue 和限流场景下继续记录状态分布；
+5. `reliability`：使用 429、5xx、`mock/retry-2`、SSE 错误和双 Provider，
+   断言 Retry、Fallback 与 SSE 提交边界；
+6. `streamload`：逐行读取 SSE，单独统计响应头、首事件、首内容、总时长和 Chunk 间隔。
 
 同一个 k6 脚本内部可以配置多个 `stages` 表示升压、稳定和降压；不要把每个并发阶段
 复制成单独脚本。

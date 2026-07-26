@@ -11,6 +11,9 @@
 *.out
 coverage.*
 *.bench
+/test-results/
+/test/threehost/client.env
+/test/threehost/gateway.env
 
 # Local logs, databases, and editor state.
 *.log

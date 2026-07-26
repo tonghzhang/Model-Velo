@@ -1,5 +1,11 @@
 # 可复现 benchmark 与故障门禁
 
+跨机器容量与可靠性测试使用同一个[可编程假 LLM 上游](fake-upstream.md)，通过场景选择
+延迟、错误、重试序列和 SSE 行为，不访问真实付费 API。
+
+三台服务器（网关、k6 客户端、假上游）的可执行测试包和结果口径见
+[`test/threehost/README.md`](../test/threehost/README.md)。
+
 ## HTTP 基准
 
 基准使用进程内 Gin 网关与本地 `httptest` 上游，不访问公网，不包含 PostgreSQL/Redis 延迟。

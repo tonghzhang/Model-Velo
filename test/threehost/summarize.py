@@ -7,6 +7,7 @@ import re
 import statistics
 import sys
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 
 
@@ -22,6 +23,35 @@ def number(value, default=0.0):
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def parse_timestamp(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def case_window(cases):
+    starts = [
+        timestamp
+        for timestamp in (parse_timestamp(case.get("started_at")) for case in cases)
+        if timestamp is not None
+    ]
+    ends = [
+        timestamp
+        for timestamp in (parse_timestamp(case.get("ended_at")) for case in cases)
+        if timestamp is not None
+    ]
+    return (min(starts) if starts else None, max(ends) if ends else None)
+
+
+def in_window(timestamp, started_at, ended_at):
+    if timestamp is None or started_at is None or ended_at is None:
+        return True
+    return started_at <= timestamp <= ended_at
 
 
 def metric_value(metrics, name, field="value"):
@@ -310,18 +340,25 @@ def parse_bytes(value):
     return amount * base ** powers.get(unit, 0)
 
 
-def read_resources(result_dir):
+def read_resources(result_dir, started_at=None, ended_at=None):
     samples = defaultdict(list)
-    for path in result_dir.rglob("*-stats.jsonl"):
+    for path in result_dir.rglob("*stats*.jsonl"):
+        if path.name == "client-stats.jsonl":
+            continue
         try:
             lines = path.read_text(encoding="utf-8").splitlines()
         except OSError:
             continue
         for line in lines:
             try:
-                stats = json.loads(line).get("stats", {})
+                payload = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if not in_window(
+                parse_timestamp(payload.get("timestamp")), started_at, ended_at
+            ):
+                continue
+            stats = payload.get("stats", {})
             name = stats.get("Name") or stats.get("Container") or stats.get("ID")
             if not name:
                 continue
@@ -375,6 +412,7 @@ def read_client_resource(result_dir):
         return {}
 
     cpu = [number(sample.get("cpu_pct")) for sample in samples]
+    cpu_peak_sample = max(samples, key=lambda sample: number(sample.get("cpu_pct")))
     used_memory = [
         max(
             0,
@@ -387,6 +425,7 @@ def read_client_resource(result_dir):
         "samples": len(samples),
         "cpu_avg_pct": statistics.fmean(cpu),
         "cpu_max_pct": max(cpu),
+        "cpu_peak_at": cpu_peak_sample.get("timestamp", ""),
         "memory_used_avg_mb": statistics.fmean(used_memory) / (1024 * 1024),
         "memory_used_max_mb": max(used_memory) / (1024 * 1024),
         "load_1m_max": max(number(sample.get("load_1m")) for sample in samples),
@@ -401,15 +440,26 @@ def read_client_resource(result_dir):
 
 
 PROMETHEUS_LINE = re.compile(
-    r"^(model_velo_[A-Za-z0-9_:]+(?:\{[^}]*\})?)\s+"
+    r"^((?:model_velo_|go_|process_)[A-Za-z0-9_:]+(?:\{[^}]*\})?)\s+"
     r"(-?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?)$"
 )
+PROMETHEUS_SERIES = re.compile(
+    r"^((?:model_velo_|go_|process_)[A-Za-z0-9_:]+)(?:\{(.*)\})?$"
+)
+PROMETHEUS_LABEL = re.compile(r'([A-Za-z_][A-Za-z0-9_]*)="((?:\\.|[^"])*)"')
 
 
-def read_prometheus(result_dir):
+def read_prometheus(result_dir, started_at=None, ended_at=None):
     series = {}
+    points = defaultdict(list)
     for path in result_dir.rglob("*.promlog"):
+        snapshot_at = None
         for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("# snapshot "):
+                snapshot_at = parse_timestamp(line.removeprefix("# snapshot ").strip())
+                continue
+            if not in_window(snapshot_at, started_at, ended_at):
+                continue
             match = PROMETHEUS_LINE.match(line.strip())
             if not match:
                 continue
@@ -417,12 +467,369 @@ def read_prometheus(result_dir):
             value = number(match.group(2))
             current = series.setdefault(
                 key,
-                {"source": path.name, "series": match.group(1), "samples": 0, "max": value},
+                {
+                    "source": path.name,
+                    "series": match.group(1),
+                    "samples": 0,
+                    "first": value,
+                    "min": value,
+                    "max": value,
+                },
             )
             current["samples"] += 1
             current["last"] = value
+            current["min"] = min(current["min"], value)
             current["max"] = max(current["max"], value)
-    return sorted(series.values(), key=lambda item: (item["source"], item["series"]))
+            if snapshot_at is not None:
+                points[key].append((snapshot_at, value))
+    output = sorted(series.values(), key=lambda item: (item["source"], item["series"]))
+    for item in output:
+        item["delta"] = max(0.0, item.get("last", 0.0) - item["first"])
+    return output, points
+
+
+def prometheus_identity(key):
+    _, separator, series = key.partition(":")
+    if not separator:
+        return "", {}
+    match = PROMETHEUS_SERIES.match(series)
+    if not match:
+        return "", {}
+    labels = {}
+    for label in PROMETHEUS_LABEL.finditer(match.group(2) or ""):
+        try:
+            labels[label.group(1)] = json.loads(f'"{label.group(2)}"')
+        except json.JSONDecodeError:
+            labels[label.group(1)] = label.group(2)
+    return match.group(1), labels
+
+
+def window_delta(samples, started_at, ended_at):
+    if not samples or started_at is None or ended_at is None:
+        return 0.0
+    before = None
+    after = None
+    first_inside = None
+    last_inside = None
+    for timestamp, value in samples:
+        if timestamp <= started_at:
+            before = value
+        if started_at <= timestamp <= ended_at:
+            if first_inside is None:
+                first_inside = value
+            last_inside = value
+        if timestamp >= ended_at:
+            after = value
+            break
+    first = before if before is not None else first_inside
+    last = after if after is not None else last_inside
+    if first is None or last is None:
+        return 0.0
+    return max(0.0, last - first)
+
+
+def window_max(samples, started_at, ended_at):
+    values = [
+        value
+        for timestamp, value in samples
+        if started_at is not None
+        and ended_at is not None
+        and started_at <= timestamp <= ended_at
+    ]
+    return max(values) if values else 0.0
+
+
+def prometheus_counter(
+    points, metric, started_at, ended_at, labels=None, source=None
+):
+    total = 0.0
+    labels = labels or {}
+    for key, samples in points.items():
+        if source and not key.startswith(f"{source}:"):
+            continue
+        name, series_labels = prometheus_identity(key)
+        if name != metric:
+            continue
+        if any(series_labels.get(name) != value for name, value in labels.items()):
+            continue
+        total += window_delta(samples, started_at, ended_at)
+    return total
+
+
+def prometheus_gauge_max(
+    points, metric, started_at, ended_at, labels=None, source=None
+):
+    maximum = 0.0
+    labels = labels or {}
+    for key, samples in points.items():
+        if source and not key.startswith(f"{source}:"):
+            continue
+        name, series_labels = prometheus_identity(key)
+        if name != metric:
+            continue
+        if any(series_labels.get(name) != value for name, value in labels.items()):
+            continue
+        maximum = max(maximum, window_max(samples, started_at, ended_at))
+    return maximum
+
+
+def histogram_quantile(buckets, quantile):
+    if not buckets:
+        return 0.0
+    ordered = sorted(buckets.items(), key=lambda item: item[0])
+    count = ordered[-1][1]
+    if count <= 0:
+        return 0.0
+    target = count * quantile
+    previous_bound = 0.0
+    previous_count = 0.0
+    for bound, cumulative in ordered:
+        if cumulative < target:
+            if math.isfinite(bound):
+                previous_bound = bound
+            previous_count = cumulative
+            continue
+        if not math.isfinite(bound):
+            return previous_bound
+        bucket_count = cumulative - previous_count
+        if bucket_count <= 0:
+            return bound
+        fraction = (target - previous_count) / bucket_count
+        return previous_bound + (bound - previous_bound) * fraction
+    return ordered[-1][0]
+
+
+STAGE_ORDER = {
+    stage: index
+    for index, stage in enumerate(
+        (
+            "authentication",
+            "usage_begin",
+            "authorization",
+            "rate_limit",
+            "route_plan",
+            "quota_reserve",
+            "cache_lookup",
+            "provider_queue",
+            "provider_call",
+            "reliability",
+            "cache_store",
+            "quota_settle",
+            "usage_finalize",
+        )
+    )
+}
+
+
+def case_stage_metrics(points, started_at, ended_at):
+    stages = defaultdict(
+        lambda: {"buckets": defaultdict(float), "sum_seconds": 0.0, "count": 0.0}
+    )
+    for key, samples in points.items():
+        metric, labels = prometheus_identity(key)
+        stage = labels.get("stage", "")
+        if not stage:
+            continue
+        delta = window_delta(samples, started_at, ended_at)
+        if metric == "model_velo_request_stage_duration_seconds_bucket":
+            raw_bound = labels.get("le", "")
+            bound = math.inf if raw_bound == "+Inf" else number(raw_bound, math.nan)
+            if not math.isnan(bound):
+                stages[stage]["buckets"][bound] += delta
+        elif metric == "model_velo_request_stage_duration_seconds_sum":
+            stages[stage]["sum_seconds"] += delta
+        elif metric == "model_velo_request_stage_duration_seconds_count":
+            stages[stage]["count"] += delta
+
+    output = []
+    for stage, values in stages.items():
+        count = values["count"]
+        if count <= 0:
+            continue
+        output.append(
+            {
+                "stage": stage,
+                "count": int(count),
+                "avg_ms": values["sum_seconds"] / count * 1000,
+                "p50_ms": histogram_quantile(values["buckets"], 0.50) * 1000,
+                "p95_ms": histogram_quantile(values["buckets"], 0.95) * 1000,
+                "p99_ms": histogram_quantile(values["buckets"], 0.99) * 1000,
+            }
+        )
+    return sorted(
+        output,
+        key=lambda item: (STAGE_ORDER.get(item["stage"], len(STAGE_ORDER)), item["stage"]),
+    )
+
+
+def case_error_counts(points, started_at, ended_at):
+    counts = defaultdict(float)
+    for key, samples in points.items():
+        metric, labels = prometheus_identity(key)
+        if metric != "model_velo_http_errors_total":
+            continue
+        count = window_delta(samples, started_at, ended_at)
+        if count > 0:
+            counts[(labels.get("status", ""), labels.get("code", ""))] += count
+    return [
+        {"status": status, "code": code, "count": int(count)}
+        for (status, code), count in sorted(
+            counts.items(), key=lambda item: (-item[1], item[0])
+        )
+    ]
+
+
+def build_performance_diagnostics(points, rows):
+    diagnostics = []
+    for row in rows:
+        if row.get("target") != "gateway":
+            continue
+        started_at = parse_timestamp(row.get("started_at"))
+        ended_at = parse_timestamp(row.get("ended_at"))
+        if started_at is None or ended_at is None:
+            continue
+        duration_seconds = max(0.0, (ended_at - started_at).total_seconds())
+        stages = case_stage_metrics(points, started_at, ended_at)
+        diagnostics.append(
+            {
+                "case": row.get("case", ""),
+                "phase": row.get("phase", ""),
+                "load": row.get("load", ""),
+                "duration_seconds": duration_seconds,
+                "stages": stages,
+                "errors": case_error_counts(points, started_at, ended_at),
+                "postgres": {
+                    "waits": int(
+                        prometheus_counter(
+                            points,
+                            "model_velo_postgres_waits_total",
+                            started_at,
+                            ended_at,
+                        )
+                    ),
+                    "wait_ms": prometheus_counter(
+                        points,
+                        "model_velo_postgres_wait_duration_seconds_total",
+                        started_at,
+                        ended_at,
+                    )
+                    * 1000,
+                    "in_use_max": int(
+                        prometheus_gauge_max(
+                            points,
+                            "model_velo_postgres_connections",
+                            started_at,
+                            ended_at,
+                            {"state": "in_use"},
+                        )
+                    ),
+                    "open_max": int(
+                        prometheus_gauge_max(
+                            points,
+                            "model_velo_postgres_connections",
+                            started_at,
+                            ended_at,
+                            {"state": "open"},
+                        )
+                    ),
+                },
+                "redis": {
+                    "waits": int(
+                        prometheus_counter(
+                            points,
+                            "model_velo_redis_pool_events_total",
+                            started_at,
+                            ended_at,
+                            {"event": "wait"},
+                        )
+                    ),
+                    "timeouts": int(
+                        prometheus_counter(
+                            points,
+                            "model_velo_redis_pool_events_total",
+                            started_at,
+                            ended_at,
+                            {"event": "timeout"},
+                        )
+                    ),
+                    "wait_ms": prometheus_counter(
+                        points,
+                        "model_velo_redis_pool_wait_duration_seconds_total",
+                        started_at,
+                        ended_at,
+                    )
+                    * 1000,
+                    "pending_max": int(
+                        prometheus_gauge_max(
+                            points,
+                            "model_velo_redis_pool_connections",
+                            started_at,
+                            ended_at,
+                            {"state": "pending"},
+                        )
+                    ),
+                    "total_max": int(
+                        prometheus_gauge_max(
+                            points,
+                            "model_velo_redis_pool_connections",
+                            started_at,
+                            ended_at,
+                            {"state": "total"},
+                        )
+                    ),
+                },
+                "runtime": {
+                    "process_cpu_avg_pct": (
+                        prometheus_counter(
+                            points,
+                            "process_cpu_seconds_total",
+                            started_at,
+                            ended_at,
+                            source="gateway-metrics.promlog",
+                        )
+                        / duration_seconds
+                        * 100
+                        if duration_seconds > 0
+                        else 0.0
+                    ),
+                    "rss_max_mb": prometheus_gauge_max(
+                        points,
+                        "process_resident_memory_bytes",
+                        started_at,
+                        ended_at,
+                        source="gateway-metrics.promlog",
+                    )
+                    / (1024 * 1024),
+                    "heap_max_mb": prometheus_gauge_max(
+                        points,
+                        "go_memstats_heap_alloc_bytes",
+                        started_at,
+                        ended_at,
+                        source="gateway-metrics.promlog",
+                    )
+                    / (1024 * 1024),
+                    "goroutines_max": int(
+                        prometheus_gauge_max(
+                            points,
+                            "go_goroutines",
+                            started_at,
+                            ended_at,
+                            source="gateway-metrics.promlog",
+                        )
+                    ),
+                    "gc_cycles": int(
+                        prometheus_counter(
+                            points,
+                            "go_gc_duration_seconds_count",
+                            started_at,
+                            ended_at,
+                            source="gateway-metrics.promlog",
+                        )
+                    ),
+                },
+            }
+        )
+    return diagnostics
 
 
 def read_usage_evidence(result_dir):
@@ -531,10 +938,34 @@ def capacity_findings(capacity, rate, comparisons, stream_pairs):
 def actionable_findings(resources, client_resource, prometheus, rows):
     findings = []
     if client_resource.get("cpu_max_pct", 0) >= 90:
-        findings.append(
-            f"Client host CPU reached {client_resource['cpu_max_pct']:.1f}%; "
-            "capacity results may be load-generator limited."
+        peak_at = parse_timestamp(client_resource.get("cpu_peak_at"))
+        peak_case = next(
+            (
+                row
+                for row in rows
+                if peak_at is not None
+                and (
+                    parse_timestamp(row.get("started_at")) or peak_at
+                ) <= peak_at
+                <= (parse_timestamp(row.get("ended_at")) or peak_at)
+            ),
+            {},
         )
+        if peak_case.get("target") == "direct":
+            findings.append(
+                f"Client host CPU reached {client_resource['cpu_max_pct']:.1f}% "
+                f"during direct baseline {peak_case.get('case')}; "
+                "that direct-throughput point may be load-generator limited."
+            )
+        else:
+            findings.append(
+                f"Client host CPU reached {client_resource['cpu_max_pct']:.1f}%"
+                + (
+                    f" during {peak_case.get('case')}."
+                    if peak_case.get("case")
+                    else "."
+                )
+            )
     for resource in resources:
         name = resource["container"].lower()
         if "gateway" in name and resource["cpu_max_pct"] >= 90:
@@ -583,6 +1014,61 @@ def actionable_findings(resources, client_resource, prometheus, rows):
     failed_cases = [row["case"] for row in rows if row.get("exit_code", 0) != 0]
     if failed_cases:
         findings.append(f"{len(failed_cases)} cases exited non-zero: {', '.join(failed_cases[:8])}.")
+    return findings
+
+
+def performance_findings(diagnostics):
+    findings = []
+    diagnosed = [item for item in diagnostics if item["stages"]]
+    if not diagnosed:
+        return findings
+
+    pre_provider_names = {
+        "authentication",
+        "usage_begin",
+        "authorization",
+        "rate_limit",
+        "route_plan",
+        "quota_reserve",
+    }
+    representative = max(
+        diagnosed,
+        key=lambda item: (
+            number(item.get("load")),
+            item.get("duration_seconds", 0),
+        ),
+    )
+    pre_provider = [
+        stage
+        for stage in representative["stages"]
+        if stage["stage"] in pre_provider_names
+    ]
+    if pre_provider:
+        slowest = max(pre_provider, key=lambda stage: stage["p99_ms"])
+        findings.append(
+            f"{representative['case']} slowest pre-provider stage was "
+            f"{slowest['stage']} at P99 {slowest['p99_ms']:.2f} ms."
+        )
+
+    postgres_waits = sum(item["postgres"]["waits"] for item in diagnosed)
+    postgres_wait_ms = sum(item["postgres"]["wait_ms"] for item in diagnosed)
+    redis_waits = sum(item["redis"]["waits"] for item in diagnosed)
+    redis_timeouts = sum(item["redis"]["timeouts"] for item in diagnosed)
+    findings.append(
+        f"Diagnosed cases recorded {postgres_waits} PostgreSQL pool waits "
+        f"({postgres_wait_ms:.1f} ms cumulative) and {redis_waits} Redis pool waits "
+        f"with {redis_timeouts} timeouts."
+    )
+
+    errors = defaultdict(int)
+    for item in diagnosed:
+        for error in item["errors"]:
+            errors[error["code"]] += error["count"]
+    if errors:
+        code, count = max(errors.items(), key=lambda item: item[1])
+        findings.append(
+            f"Most frequent classified gateway error was {code}: {count} responses."
+        )
     return findings
 
 
@@ -747,6 +1233,85 @@ def write_markdown(path, summary):
             ]
         )
 
+    performance = summary.get("performance_diagnostics", [])
+    stage_rows = [
+        [
+            item["case"],
+            stage["stage"],
+            stage["count"],
+            fmt(stage["avg_ms"], 3),
+            fmt(stage["p50_ms"], 3),
+            fmt(stage["p95_ms"], 3),
+            fmt(stage["p99_ms"], 3),
+        ]
+        for item in performance
+        for stage in item["stages"]
+    ]
+    if stage_rows:
+        lines.extend(
+            [
+                "## Hot-path stage timing",
+                "",
+                "The `reliability` row contains queue, provider calls, retries, and "
+                "fallbacks; it overlaps the `provider_queue` and `provider_call` rows.",
+                "",
+                markdown_table(
+                    ["case", "stage", "count", "avg ms", "P50 ms", "P95 ms", "P99 ms"],
+                    stage_rows,
+                ),
+                "",
+                "### Dependency pools and Go runtime",
+                "",
+                markdown_table(
+                    [
+                        "case",
+                        "PG waits",
+                        "PG wait ms",
+                        "PG in-use max",
+                        "Redis waits",
+                        "Redis wait ms",
+                        "Redis pending max",
+                        "process CPU avg",
+                        "RSS max MB",
+                        "goroutines max",
+                    ],
+                    [
+                        [
+                            item["case"],
+                            item["postgres"]["waits"],
+                            fmt(item["postgres"]["wait_ms"], 2),
+                            item["postgres"]["in_use_max"],
+                            item["redis"]["waits"],
+                            fmt(item["redis"]["wait_ms"], 2),
+                            item["redis"]["pending_max"],
+                            fmt(item["runtime"]["process_cpu_avg_pct"], 1) + "%",
+                            fmt(item["runtime"]["rss_max_mb"], 1),
+                            item["runtime"]["goroutines_max"],
+                        ]
+                        for item in performance
+                    ],
+                ),
+                "",
+            ]
+        )
+        errors = [
+            [item["case"], error["status"], error["code"], error["count"]]
+            for item in performance
+            for error in item["errors"]
+        ]
+        if errors:
+            lines.extend(
+                [
+                    "### Gateway error codes",
+                    "",
+                    markdown_table(
+                        ["case", "HTTP status", "error code", "count"],
+                        errors,
+                    ),
+                    "",
+                ]
+            )
+
     resources = summary["resources"]
     if resources:
         lines.extend(
@@ -871,19 +1436,46 @@ def main():
             "reliability",
         }
     ]
-    resources = read_resources(result_dir)
+    started_at, ended_at = case_window(cases)
+    resources = read_resources(result_dir, started_at, ended_at)
     client_resource = read_client_resource(result_dir)
-    prometheus = read_prometheus(result_dir)
+    prometheus, prometheus_points = read_prometheus(
+        result_dir, started_at, ended_at
+    )
+    performance_diagnostics = build_performance_diagnostics(
+        prometheus_points, k6_rows
+    )
     usage = read_usage_evidence(result_dir)
     usage_reconciliation = reconcile_usage(k6_rows, stream_rows, usage)
 
     warnings = []
-    if not resources:
+    stats_paths = [
+        path
+        for path in result_dir.rglob("*stats*.jsonl")
+        if path.name != "client-stats.jsonl"
+    ]
+    prometheus_paths = list(result_dir.rglob("*.promlog"))
+    if stats_paths and not resources:
+        warnings.append(
+            "Docker stats files exist, but their timestamps do not overlap "
+            "the benchmark case window."
+        )
+    elif not resources:
         warnings.append("Missing gateway/upstream Docker stats JSONL files.")
     if not client_resource:
         warnings.append("Missing client host resource samples.")
-    if not prometheus:
+    if prometheus_paths and not prometheus:
+        warnings.append(
+            "Prometheus capture exists, but its timestamps do not overlap "
+            "the benchmark case window."
+        )
+    elif not prometheus:
         warnings.append("Missing Prometheus time-series capture.")
+    elif not any(item["stages"] for item in performance_diagnostics):
+        warnings.append(
+            "Prometheus capture does not contain per-stage request histograms; "
+            "confirm the gateway image includes diagnostic metrics."
+        )
     if not usage:
         warnings.append("Missing post-run Usage/PostgreSQL/Redis evidence.")
     elif usage.get("drain", {}).get("state") not in {"", "complete", None}:
@@ -918,6 +1510,7 @@ def main():
             k6_rows + stream_rows,
         )
     )
+    findings.extend(performance_findings(performance_diagnostics))
     if not findings:
         if k6_rows or stream_rows:
             findings.append(
@@ -941,6 +1534,7 @@ def main():
         "resources": resources,
         "client_resource": client_resource,
         "prometheus": prometheus,
+        "performance_diagnostics": performance_diagnostics,
         "usage_evidence": usage,
         "usage_reconciliation": usage_reconciliation,
         "findings": findings,
@@ -951,7 +1545,13 @@ def main():
         encoding="utf-8",
     )
     write_markdown(result_dir / "summary.md", summary)
-    print(f"wrote {result_dir / 'summary.json'} and {result_dir / 'summary.md'}")
+    from render_html import render
+
+    render(result_dir)
+    print(
+        f"wrote {result_dir / 'summary.json'}, "
+        f"{result_dir / 'summary.md'}, and {result_dir / 'summary.html'}"
+    )
 
 
 if __name__ == "__main__":

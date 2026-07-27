@@ -5,7 +5,7 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH= cd -- "$script_dir/../.." && pwd)
 env_file=${1:-"$script_dir/benchmark.env"}
 
-if [[ ! -f "$env_file" ]]; then
+if [[ "$env_file" != "-" && ! -f "$env_file" ]]; then
   printf 'missing benchmark environment file: %s\n' "$env_file" >&2
   exit 1
 fi
@@ -17,8 +17,10 @@ for command_name in curl git k6 python3; do
 done
 
 set -a
-# shellcheck disable=SC1090
-. "$env_file"
+if [[ "$env_file" != "-" ]]; then
+  # shellcheck disable=SC1090
+  . "$env_file"
+fi
 set +a
 
 : "${GATEWAY_URL:?GATEWAY_URL is required}"
@@ -62,6 +64,7 @@ RATE_LIMIT_TEST_RATE=${RATE_LIMIT_TEST_RATE:-100}
 RATE_LIMIT_TEST_DURATION=${RATE_LIMIT_TEST_DURATION:-2m}
 RESULTS_ROOT=${RESULTS_ROOT:-"$repo_root/test-results/threehost"}
 SAVE_RAW_METRICS=${SAVE_RAW_METRICS:-false}
+TEST_PROFILE=${TEST_PROFILE:-complete}
 
 RUN_CAPACITY=${RUN_CAPACITY:-true}
 RUN_WARMUP=${RUN_WARMUP:-true}
@@ -192,6 +195,7 @@ trap 'cleanup; summarize' EXIT
 
 {
   printf 'run_id=%s\n' "$run_id"
+  printf 'test_profile=%s\n' "$TEST_PROFILE"
   printf 'request_prefix=%s\n' "$request_prefix"
   printf 'commit=%s\n' "$(git -C "$repo_root" rev-parse HEAD)"
   printf 'started_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"

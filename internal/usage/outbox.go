@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"gorm.io/gorm"
@@ -13,6 +14,12 @@ import (
 )
 
 const defaultOutboxRepublishPeriod = 30 * time.Second
+
+const (
+	durableEmitterBatchSize = 100
+	durableEmitterBatchWait = 5 * time.Millisecond
+	durableEmitterQueueSize = 4_096
+)
 
 // PendingEvent is the durable minimum recorded before an authenticated request
 // reaches a provider. It intentionally excludes prompts and provider secrets.
@@ -33,11 +40,24 @@ type LifecycleEmitter interface {
 	Begin(context.Context, PendingEvent) error
 }
 
-// DurableEmitter stores request lifecycle state in PostgreSQL. The worker owns
-// Redis publication so online requests do not compete with replay traffic.
+// DurableEmitter stores request lifecycle state in PostgreSQL. Concurrent
+// requests share short, bounded batches so durability does not require two
+// individual SQL round trips per request.
 type DurableEmitter struct {
 	database *gorm.DB
 	timeout  time.Duration
+	writes   chan durableWrite
+	stop     chan struct{}
+	done     chan struct{}
+	stateMu  sync.RWMutex
+	closed   bool
+	stopOnce sync.Once
+}
+
+type durableWrite struct {
+	record postgres.UsageOutbox
+	ready  bool
+	result chan error
 }
 
 func NewDurableEmitter(
@@ -50,7 +70,15 @@ func NewDurableEmitter(
 	case timeout <= 0:
 		return nil, errors.New("durable usage emitter timeout must be positive")
 	default:
-		return &DurableEmitter{database: database, timeout: timeout}, nil
+		emitter := &DurableEmitter{
+			database: database,
+			timeout:  timeout,
+			writes:   make(chan durableWrite, durableEmitterQueueSize),
+			stop:     make(chan struct{}),
+			done:     make(chan struct{}),
+		}
+		go emitter.run()
+		return emitter, nil
 	}
 }
 
@@ -58,8 +86,6 @@ func (emitter *DurableEmitter) Begin(ctx context.Context, pending PendingEvent) 
 	if err := validatePendingEvent(pending); err != nil {
 		return err
 	}
-	writeContext, cancel := detachedTimeout(ctx, emitter.timeout)
-	defer cancel()
 	record := postgres.UsageOutbox{
 		EventID:        pending.EventID,
 		RequestID:      pending.RequestID,
@@ -70,12 +96,8 @@ func (emitter *DurableEmitter) Begin(ctx context.Context, pending PendingEvent) 
 		State:          postgres.UsageOutboxPending,
 		StartedAt:      pending.StartedAt.UTC(),
 	}
-	result := emitter.database.WithContext(writeContext).
-		Session(&gorm.Session{SkipDefaultTransaction: true}).
-		Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "event_id"}}, DoNothing: true}).
-		Create(&record)
-	if result.Error != nil {
-		return fmt.Errorf("record usage request lifecycle: %w", result.Error)
+	if err := emitter.enqueue(ctx, durableWrite{record: record}); err != nil {
+		return fmt.Errorf("record usage request lifecycle: %w", err)
 	}
 	return nil
 }
@@ -85,24 +107,195 @@ func (emitter *DurableEmitter) Emit(ctx context.Context, event Event) (string, e
 	if err != nil {
 		return "", err
 	}
-	writeContext, cancel := detachedTimeout(ctx, emitter.timeout)
-	defer cancel()
-	result := emitter.database.WithContext(writeContext).
-		Session(&gorm.Session{SkipDefaultTransaction: true}).
-		Model(&postgres.UsageOutbox{}).
-		Where("event_id = ?", event.EventID).
-		Updates(map[string]any{
-			"payload":      string(payload),
-			"state":        postgres.UsageOutboxReady,
-			"published_at": nil,
-		})
-	if result.Error != nil {
-		return "", fmt.Errorf("finalize usage outbox event: %w", result.Error)
+	payloadText := string(payload)
+	record := postgres.UsageOutbox{
+		EventID:        event.EventID,
+		RequestID:      event.RequestID,
+		TenantID:       event.TenantID,
+		APIKeyID:       event.APIKeyID,
+		RequestedModel: event.RequestedModel,
+		Stream:         event.Stream,
+		State:          postgres.UsageOutboxReady,
+		Payload:        &payloadText,
+		StartedAt:      event.StartedAt.UTC(),
 	}
-	if result.RowsAffected != 1 {
-		return "", errors.New("usage outbox lifecycle record is missing")
+	if err := emitter.enqueue(ctx, durableWrite{record: record, ready: true}); err != nil {
+		return "", fmt.Errorf("finalize usage outbox event: %w", err)
 	}
 	return "", nil
+}
+
+func (emitter *DurableEmitter) Close(ctx context.Context) error {
+	emitter.stopOnce.Do(func() {
+		emitter.stateMu.Lock()
+		emitter.closed = true
+		close(emitter.stop)
+		emitter.stateMu.Unlock()
+	})
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-emitter.done:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("close durable usage emitter: %w", ctx.Err())
+	}
+}
+
+func (emitter *DurableEmitter) enqueue(
+	ctx context.Context,
+	write durableWrite,
+) error {
+	writeContext, cancel := detachedTimeout(ctx, emitter.timeout)
+	defer cancel()
+	write.result = make(chan error, 1)
+
+	emitter.stateMu.RLock()
+	if emitter.closed {
+		emitter.stateMu.RUnlock()
+		return errors.New("durable usage emitter is closed")
+	}
+	select {
+	case emitter.writes <- write:
+		emitter.stateMu.RUnlock()
+	case <-emitter.done:
+		emitter.stateMu.RUnlock()
+		return errors.New("durable usage emitter is closed")
+	case <-writeContext.Done():
+		emitter.stateMu.RUnlock()
+		return writeContext.Err()
+	}
+
+	select {
+	case err := <-write.result:
+		return err
+	case <-emitter.done:
+		return errors.New("durable usage emitter closed before write completed")
+	case <-writeContext.Done():
+		return writeContext.Err()
+	}
+}
+
+func (emitter *DurableEmitter) run() {
+	defer close(emitter.done)
+	for {
+		select {
+		case first := <-emitter.writes:
+			emitter.writeBatch(emitter.collect(first, false))
+		case <-emitter.stop:
+			emitter.drain()
+			return
+		}
+	}
+}
+
+func (emitter *DurableEmitter) collect(
+	first durableWrite,
+	stopping bool,
+) []durableWrite {
+	batch := make([]durableWrite, 0, durableEmitterBatchSize)
+	batch = append(batch, first)
+	if stopping {
+		for len(batch) < durableEmitterBatchSize {
+			select {
+			case write := <-emitter.writes:
+				batch = append(batch, write)
+			default:
+				return batch
+			}
+		}
+		return batch
+	}
+
+	timer := time.NewTimer(durableEmitterBatchWait)
+	defer timer.Stop()
+	for len(batch) < durableEmitterBatchSize {
+		select {
+		case write := <-emitter.writes:
+			batch = append(batch, write)
+		case <-timer.C:
+			return batch
+		case <-emitter.stop:
+			return batch
+		}
+	}
+	return batch
+}
+
+func (emitter *DurableEmitter) drain() {
+	for {
+		select {
+		case first := <-emitter.writes:
+			emitter.writeBatch(emitter.collect(first, true))
+		default:
+			return
+		}
+	}
+}
+
+func (emitter *DurableEmitter) writeBatch(batch []durableWrite) {
+	pending := make([]postgres.UsageOutbox, 0, len(batch))
+	ready := make([]postgres.UsageOutbox, 0, len(batch))
+	for _, write := range batch {
+		if write.ready {
+			ready = append(ready, write.record)
+			continue
+		}
+		pending = append(pending, write.record)
+	}
+
+	pendingErr := emitter.writePending(pending)
+	readyErr := emitter.writeReady(ready)
+	for _, write := range batch {
+		if write.ready {
+			write.result <- readyErr
+			continue
+		}
+		write.result <- pendingErr
+	}
+}
+
+func (emitter *DurableEmitter) writePending(
+	records []postgres.UsageOutbox,
+) error {
+	if len(records) == 0 {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), emitter.timeout)
+	defer cancel()
+	if err := emitter.database.WithContext(ctx).
+		Session(&gorm.Session{SkipDefaultTransaction: true}).
+		Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "event_id"}},
+			DoNothing: true,
+		}).
+		CreateInBatches(&records, len(records)).Error; err != nil {
+		return err
+	}
+	return nil
+}
+
+func (emitter *DurableEmitter) writeReady(
+	records []postgres.UsageOutbox,
+) error {
+	if len(records) == 0 {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), emitter.timeout)
+	defer cancel()
+	if err := emitter.database.WithContext(ctx).
+		Session(&gorm.Session{SkipDefaultTransaction: true}).
+		Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "event_id"}},
+			DoUpdates: clause.AssignmentColumns([]string{
+				"payload", "state", "published_at", "updated_at",
+			}),
+		}).
+		CreateInBatches(&records, len(records)).Error; err != nil {
+		return err
+	}
+	return nil
 }
 
 // OutboxRelay republishes ready records and safely republishes published

@@ -518,6 +518,80 @@ func TestUsageRedisPostgresPipeline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDurableEmitter() error = %v", err)
 	}
+	defer func() {
+		closeContext, closeCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer closeCancel()
+		if err := durable.Close(closeContext); err != nil {
+			t.Errorf("DurableEmitter.Close() error = %v", err)
+		}
+	}()
+
+	const concurrentLifecycleCount = 200
+	concurrentEvents := make([]Event, 0, concurrentLifecycleCount)
+	concurrentEventIDs := make([]string, 0, concurrentLifecycleCount)
+	for index := 0; index < concurrentLifecycleCount; index++ {
+		event := integrationEvent(t, "request-batched-"+strconv.Itoa(index))
+		concurrentEvents = append(concurrentEvents, event)
+		concurrentEventIDs = append(concurrentEventIDs, event.EventID)
+	}
+	var lifecycleWait sync.WaitGroup
+	lifecycleErrors := make(chan error, concurrentLifecycleCount)
+	for _, event := range concurrentEvents {
+		lifecycleWait.Add(1)
+		go func(event Event) {
+			defer lifecycleWait.Done()
+			if err := durable.Begin(ctx, PendingEvent{
+				EventID: event.EventID, RequestID: event.RequestID,
+				TenantID: event.TenantID, APIKeyID: event.APIKeyID,
+				RequestedModel: event.RequestedModel, Stream: event.Stream,
+				StartedAt: event.StartedAt,
+			}); err != nil {
+				lifecycleErrors <- err
+				return
+			}
+			if _, err := durable.Emit(ctx, event); err != nil {
+				lifecycleErrors <- err
+			}
+		}(event)
+	}
+	lifecycleWait.Wait()
+	close(lifecycleErrors)
+	for err := range lifecycleErrors {
+		t.Errorf("batched durable lifecycle error = %v", err)
+	}
+	var batchedReady int64
+	if err := database.ORM().Model(&postgres.UsageOutbox{}).
+		Where("event_id IN ? AND state = ?", concurrentEventIDs, postgres.UsageOutboxReady).
+		Count(&batchedReady).Error; err != nil || batchedReady != concurrentLifecycleCount {
+		t.Fatalf(
+			"batched ready lifecycles = %d, want %d, error = %v",
+			batchedReady, concurrentLifecycleCount, err,
+		)
+	}
+	if err := database.ORM().
+		Where("event_id IN ?", concurrentEventIDs).
+		Delete(&postgres.UsageOutbox{}).Error; err != nil {
+		t.Fatalf("delete batched usage lifecycles: %v", err)
+	}
+
+	finalOnlyEvent := integrationEvent(t, "request-final-without-begin")
+	if _, err := durable.Emit(ctx, finalOnlyEvent); err != nil {
+		t.Fatalf("DurableEmitter.Emit(without Begin) error = %v", err)
+	}
+	var finalOnly postgres.UsageOutbox
+	if err := database.ORM().
+		Where("event_id = ?", finalOnlyEvent.EventID).
+		First(&finalOnly).Error; err != nil ||
+		finalOnly.State != postgres.UsageOutboxReady ||
+		finalOnly.Payload == nil {
+		t.Fatalf("final-only outbox row = %#v, error = %v", finalOnly, err)
+	}
+	if err := database.ORM().
+		Where("event_id = ?", finalOnlyEvent.EventID).
+		Delete(&postgres.UsageOutbox{}).Error; err != nil {
+		t.Fatalf("delete final-only usage lifecycle: %v", err)
+	}
+
 	relayEvent := integrationEvent(t, "request-outbox-republish")
 	if err := durable.Begin(ctx, PendingEvent{
 		EventID: relayEvent.EventID, RequestID: relayEvent.RequestID,

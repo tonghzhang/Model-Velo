@@ -117,6 +117,13 @@ func run() error { // 装配基础设施、启动 HTTP 服务并等待关闭。
 	if err != nil {
 		return fmt.Errorf("configure durable usage emitter: %w", err)
 	}
+	defer func() {
+		closeContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := usageEmitter.Close(closeContext); err != nil {
+			slog.Error("durable usage emitter shutdown failed", "error", err)
+		}
+	}()
 	usagePricing, err := usage.NewPricingCatalog(startup.usage.Pricing)
 	if err != nil {
 		return fmt.Errorf("configure usage pricing: %w", err)

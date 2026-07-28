@@ -12,6 +12,11 @@ if [[ ! "$run_id" =~ ^[A-Za-z0-9._-]+$ || ${#run_id} -gt 48 ]]; then
   printf 'usage: MODEL_VELO_BENCH_API_KEY=... %s <RUN_ID>\n' "$0" >&2
   exit 1
 fi
+MODEL_VELO_BENCH_API_KEY=${MODEL_VELO_BENCH_API_KEY:-}
+if [[ -z "$MODEL_VELO_BENCH_API_KEY" && -t 0 ]]; then
+  read -r -s -p 'Benchmark API key: ' MODEL_VELO_BENCH_API_KEY
+  printf '\n' >&2
+fi
 : "${MODEL_VELO_BENCH_API_KEY:?MODEL_VELO_BENCH_API_KEY is required}"
 if [[ ! -f "$env_file" ]]; then
   printf 'environment file not found: %s\n' "$env_file" >&2

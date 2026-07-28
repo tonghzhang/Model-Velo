@@ -110,17 +110,8 @@ func run() error { // 装配基础设施、启动 HTTP 服务并等待关闭。
 	if err != nil { // 响应缓存配置无效。
 		return fmt.Errorf("configure response cache: %w", err) // 返回缓存组件配置错误。
 	}
-	redisUsageEmitter, err := usage.NewRedisEmitter(
-		redisClient.Native(),
-		startup.usage.StreamKey,
-		startup.usage.EmitTimeout,
-	)
-	if err != nil {
-		return fmt.Errorf("configure usage emitter: %w", err)
-	}
 	usageEmitter, err := usage.NewDurableEmitter(
 		database.ORM(),
-		redisUsageEmitter,
 		startup.usage.EmitTimeout,
 	)
 	if err != nil {
@@ -182,6 +173,12 @@ func run() error { // 装配基础设施、启动 HTTP 服务并等待关闭。
 	metrics := observability.NewMetrics()
 	if err := metrics.RegisterRuntime(runtimeManager); err != nil {
 		return fmt.Errorf("register runtime metrics: %w", err)
+	}
+	if err := metrics.RegisterDependencies(
+		database.SQL(),
+		redisClient.Native(),
+	); err != nil {
+		return fmt.Errorf("register dependency metrics: %w", err)
 	}
 	readiness := health.NewChecker(
 		database.SQL(),

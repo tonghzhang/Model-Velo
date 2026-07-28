@@ -20,6 +20,11 @@ type Store struct {
 	now      func() time.Time
 }
 
+type storeEntry struct {
+	entryID string
+	event   Event
+}
+
 func NewStore(database *gorm.DB, pricing *PricingCatalog) (*Store, error) {
 	if database == nil {
 		return nil, errors.New("usage store requires PostgreSQL")
@@ -78,33 +83,61 @@ func (store *Store) ReloadManagedPricing(ctx context.Context) (bool, error) {
 }
 
 func (store *Store) Put(ctx context.Context, entryID string, event Event) (bool, error) {
-	if err := event.Validate(); err != nil {
+	stored, duplicates, err := store.putBatch(
+		ctx,
+		[]storeEntry{{entryID: entryID, event: event}},
+	)
+	if err != nil {
 		return false, err
 	}
-	record := store.usageRecord(entryID, event, store.now().UTC())
-	duplicate := false
+	return stored == 0 && duplicates == 1, nil
+}
+
+func (store *Store) putBatch(
+	ctx context.Context,
+	entries []storeEntry,
+) (int64, int64, error) {
+	if len(entries) == 0 {
+		return 0, 0, nil
+	}
+	processedAt := store.now().UTC()
+	records := make([]postgres.UsageEvent, 0, len(entries))
+	eventIDs := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if err := entry.event.Validate(); err != nil {
+			return 0, 0, err
+		}
+		records = append(records, store.usageRecord(
+			entry.entryID,
+			entry.event,
+			processedAt,
+		))
+		eventIDs = append(eventIDs, entry.event.EventID)
+	}
+
+	var stored int64
 	err := store.database.WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
 		result := transaction.
 			Clauses(clause.OnConflict{
 				Columns:   []clause.Column{{Name: "event_id"}},
 				DoNothing: true,
 			}).
-			Create(&record)
+			Create(&records)
 		if result.Error != nil {
 			return result.Error
 		}
-		duplicate = result.RowsAffected == 0
+		stored = result.RowsAffected
 		if err := transaction.
-			Where("event_id = ?", event.EventID).
+			Where("event_id IN ?", eventIDs).
 			Delete(&postgres.UsageOutbox{}).Error; err != nil {
 			return err
 		}
 		return nil
 	})
 	if err != nil {
-		return false, err
+		return 0, 0, err
 	}
-	return duplicate, nil
+	return stored, int64(len(entries)) - stored, nil
 }
 
 func (store *Store) usageRecord(entryID string, event Event, processedAt time.Time) postgres.UsageEvent {

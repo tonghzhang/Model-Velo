@@ -9,6 +9,8 @@ import (
 )
 
 type Emitter interface {
+	// Emit returns a Redis entry ID for immediate delivery. A durable emitter
+	// may return an empty ID after the event is safely queued in its outbox.
 	Emit(ctx context.Context, event Event) (string, error)
 }
 

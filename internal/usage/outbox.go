@@ -12,10 +12,7 @@ import (
 	"model-velo/internal/postgres"
 )
 
-const (
-	defaultOutboxBatchSize       = 100
-	defaultOutboxRepublishPeriod = 30 * time.Second
-)
+const defaultOutboxRepublishPeriod = 30 * time.Second
 
 // PendingEvent is the durable minimum recorded before an authenticated request
 // reaches a provider. It intentionally excludes prompts and provider secrets.
@@ -36,29 +33,24 @@ type LifecycleEmitter interface {
 	Begin(context.Context, PendingEvent) error
 }
 
-// DurableEmitter stores request lifecycle state in PostgreSQL before making a
-// best-effort immediate delivery to Redis. The worker relays anything left in
-// the outbox, so Redis downtime cannot silently discard a finalized event.
+// DurableEmitter stores request lifecycle state in PostgreSQL. The worker owns
+// Redis publication so online requests do not compete with replay traffic.
 type DurableEmitter struct {
 	database *gorm.DB
-	redis    *RedisEmitter
 	timeout  time.Duration
 }
 
 func NewDurableEmitter(
 	database *gorm.DB,
-	redis *RedisEmitter,
 	timeout time.Duration,
 ) (*DurableEmitter, error) {
 	switch {
 	case database == nil:
 		return nil, errors.New("durable usage emitter requires PostgreSQL")
-	case redis == nil:
-		return nil, errors.New("durable usage emitter requires Redis")
 	case timeout <= 0:
 		return nil, errors.New("durable usage emitter timeout must be positive")
 	default:
-		return &DurableEmitter{database: database, redis: redis, timeout: timeout}, nil
+		return &DurableEmitter{database: database, timeout: timeout}, nil
 	}
 }
 
@@ -79,6 +71,7 @@ func (emitter *DurableEmitter) Begin(ctx context.Context, pending PendingEvent) 
 		StartedAt:      pending.StartedAt.UTC(),
 	}
 	result := emitter.database.WithContext(writeContext).
+		Session(&gorm.Session{SkipDefaultTransaction: true}).
 		Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "event_id"}}, DoNothing: true}).
 		Create(&record)
 	if result.Error != nil {
@@ -95,6 +88,7 @@ func (emitter *DurableEmitter) Emit(ctx context.Context, event Event) (string, e
 	writeContext, cancel := detachedTimeout(ctx, emitter.timeout)
 	defer cancel()
 	result := emitter.database.WithContext(writeContext).
+		Session(&gorm.Session{SkipDefaultTransaction: true}).
 		Model(&postgres.UsageOutbox{}).
 		Where("event_id = ?", event.EventID).
 		Updates(map[string]any{
@@ -108,26 +102,7 @@ func (emitter *DurableEmitter) Emit(ctx context.Context, event Event) (string, e
 	if result.RowsAffected != 1 {
 		return "", errors.New("usage outbox lifecycle record is missing")
 	}
-
-	entryID, publishErr := emitter.redis.Emit(ctx, event)
-	if publishErr != nil {
-		return "", publishErr
-	}
-	emitter.markPublished(event.EventID)
-	return entryID, nil
-}
-
-func (emitter *DurableEmitter) markPublished(eventID string) {
-	ctx, cancel := context.WithTimeout(context.Background(), emitter.timeout)
-	defer cancel()
-	now := time.Now().UTC()
-	_ = emitter.database.WithContext(ctx).
-		Model(&postgres.UsageOutbox{}).
-		Where("event_id = ? AND state = ?", eventID, postgres.UsageOutboxReady).
-		Updates(map[string]any{
-			"state":        postgres.UsageOutboxPublished,
-			"published_at": now,
-		}).Error
+	return "", nil
 }
 
 // OutboxRelay republishes ready records and safely republishes published
@@ -135,8 +110,8 @@ func (emitter *DurableEmitter) markPublished(eventID string) {
 type OutboxRelay struct {
 	database       *gorm.DB
 	emitter        *RedisEmitter
+	consumerGroup  string
 	batchSize      int
-	timeout        time.Duration
 	pendingTimeout time.Duration
 	republishAfter time.Duration
 }
@@ -144,21 +119,24 @@ type OutboxRelay struct {
 func NewOutboxRelay(
 	database *gorm.DB,
 	emitter *RedisEmitter,
-	timeout time.Duration,
+	consumerGroup string,
+	batchSize int64,
 ) (*OutboxRelay, error) {
 	switch {
 	case database == nil:
 		return nil, errors.New("usage outbox relay requires PostgreSQL")
 	case emitter == nil:
 		return nil, errors.New("usage outbox relay requires Redis")
-	case timeout <= 0:
-		return nil, errors.New("usage outbox relay timeout must be positive")
+	case consumerGroup == "":
+		return nil, errors.New("usage outbox relay requires a consumer group")
+	case batchSize <= 0 || batchSize > 1_000:
+		return nil, errors.New("usage outbox relay batch size is invalid")
 	default:
 		return &OutboxRelay{
 			database:       database,
 			emitter:        emitter,
-			batchSize:      defaultOutboxBatchSize,
-			timeout:        timeout,
+			consumerGroup:  consumerGroup,
+			batchSize:      int(batchSize),
 			pendingTimeout: 15 * time.Minute,
 			republishAfter: defaultOutboxRepublishPeriod,
 		}, nil
@@ -177,46 +155,110 @@ func (relay *OutboxRelay) Publish(ctx context.Context) (int, error) {
 	if _, err := relay.recoverPending(ctx); err != nil {
 		return 0, err
 	}
+
+	records, err := relay.readyRecords(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if len(records) > 0 {
+		return relay.publishRecords(ctx, records)
+	}
+
+	caughtUp, err := relay.consumerCaughtUp(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if !caughtUp {
+		return 0, nil
+	}
+
+	records, err = relay.stalePublishedRecords(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return relay.publishRecords(ctx, records)
+}
+
+func (relay *OutboxRelay) readyRecords(
+	ctx context.Context,
+) ([]postgres.UsageOutbox, error) {
+	var records []postgres.UsageOutbox
+	if err := relay.database.WithContext(ctx).
+		Where("state = ?", postgres.UsageOutboxReady).
+		Order("updated_at ASC").
+		Limit(relay.batchSize).
+		Find(&records).Error; err != nil {
+		return nil, fmt.Errorf("read ready usage outbox: %w", err)
+	}
+	return records, nil
+}
+
+func (relay *OutboxRelay) stalePublishedRecords(
+	ctx context.Context,
+) ([]postgres.UsageOutbox, error) {
 	republishBefore := time.Now().UTC().Add(-relay.republishAfter)
 	var records []postgres.UsageOutbox
 	if err := relay.database.WithContext(ctx).
 		Where(
-			"state = ? OR (state = ? AND (published_at IS NULL OR published_at <= ?))",
-			postgres.UsageOutboxReady,
+			"state = ? AND (published_at IS NULL OR published_at <= ?)",
 			postgres.UsageOutboxPublished,
 			republishBefore,
 		).
-		Order("updated_at ASC").
+		Order("published_at ASC").
 		Limit(relay.batchSize).
 		Find(&records).Error; err != nil {
-		return 0, fmt.Errorf("read usage outbox: %w", err)
+		return nil, fmt.Errorf("read published usage outbox: %w", err)
 	}
+	return records, nil
+}
 
-	published := 0
+func (relay *OutboxRelay) consumerCaughtUp(ctx context.Context) (bool, error) {
+	groups, err := relay.emitter.client.XInfoGroups(ctx, relay.emitter.stream).Result()
+	if err != nil {
+		return false, fmt.Errorf("read usage consumer group: %w", err)
+	}
+	for _, group := range groups {
+		if group.Name == relay.consumerGroup {
+			return group.Pending == 0 && group.Lag == 0, nil
+		}
+	}
+	return false, fmt.Errorf("usage consumer group %q was not found", relay.consumerGroup)
+}
+
+func (relay *OutboxRelay) publishRecords(
+	ctx context.Context,
+	records []postgres.UsageOutbox,
+) (int, error) {
+	eventIDs := make([]string, 0, len(records))
 	for _, record := range records {
 		if record.Payload == nil {
-			return published, fmt.Errorf("usage outbox event %s has no payload", record.EventID)
+			return 0, fmt.Errorf("usage outbox event %s has no payload", record.EventID)
 		}
 		event, err := Decode([]byte(*record.Payload))
 		if err != nil {
-			return published, fmt.Errorf("decode usage outbox event %s: %w", record.EventID, err)
+			return 0, fmt.Errorf("decode usage outbox event %s: %w", record.EventID, err)
 		}
 		if _, err := relay.emitter.Emit(ctx, event); err != nil {
-			return published, err
+			return 0, err
 		}
-		now := time.Now().UTC()
-		if err := relay.database.WithContext(ctx).
-			Model(&postgres.UsageOutbox{}).
-			Where("event_id = ?", record.EventID).
-			Updates(map[string]any{
-				"state":        postgres.UsageOutboxPublished,
-				"published_at": now,
-			}).Error; err != nil {
-			return published, fmt.Errorf("mark usage outbox published: %w", err)
-		}
-		published++
+		eventIDs = append(eventIDs, record.EventID)
 	}
-	return published, nil
+	if len(eventIDs) == 0 {
+		return 0, nil
+	}
+
+	now := time.Now().UTC()
+	if err := relay.database.WithContext(ctx).
+		Session(&gorm.Session{SkipDefaultTransaction: true}).
+		Model(&postgres.UsageOutbox{}).
+		Where("event_id IN ?", eventIDs).
+		Updates(map[string]any{
+			"state":        postgres.UsageOutboxPublished,
+			"published_at": now,
+		}).Error; err != nil {
+		return 0, fmt.Errorf("mark usage outbox published: %w", err)
+	}
+	return len(eventIDs), nil
 }
 
 func (relay *OutboxRelay) recoverPending(ctx context.Context) (int, error) {

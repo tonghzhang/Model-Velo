@@ -1,6 +1,7 @@
 package usage
 
 import (
+	"strings"
 	"sync"
 	"time"
 )
@@ -40,6 +41,7 @@ func (collector *Collector) SetCacheStatus(status string) {
 	if collector == nil {
 		return
 	}
+	status = strings.ToLower(strings.TrimSpace(status))
 	collector.mu.Lock()
 	defer collector.mu.Unlock()
 	if !collector.finalized && status != "" {

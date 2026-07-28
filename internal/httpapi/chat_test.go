@@ -158,8 +158,11 @@ func TestChatCompletionUsageLifecycle(t *testing.T) {
 		}
 
 		event := singleUsageEvent(t, emitter)
+		if err := event.Validate(); err != nil {
+			t.Fatalf("cache usage event validation error = %v", err)
+		}
 		if event.Status != usage.StatusCacheHit ||
-			event.CacheStatus != string(responsecache.StatusHit) ||
+			event.CacheStatus != "hit" ||
 			event.UsageSource != usage.UsageSourceCacheReplay ||
 			event.ProviderID != "" ||
 			event.Attempts != 0 ||
@@ -236,11 +239,14 @@ func TestChatCompletionUsageLifecycle(t *testing.T) {
 		}
 
 		event := singleUsageEvent(t, emitter)
+		if err := event.Validate(); err != nil {
+			t.Fatalf("stream usage event validation error = %v", err)
+		}
 		if event.Status != usage.StatusStreamCompleted ||
 			!event.Stream ||
 			event.FirstTokenMS == nil ||
 			event.UsageSource != usage.UsageSourceProvider ||
-			event.CacheStatus != string(responsecache.StatusBypass) ||
+			event.CacheStatus != "bypass" ||
 			event.Usage == nil ||
 			event.Usage.Total != 7 {
 			t.Fatalf("stream usage event = %#v", event)

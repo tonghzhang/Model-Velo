@@ -5,6 +5,7 @@ import (
 	"errors"   // 判断具体认证错误类型。
 	"net/http" // 读取请求头并使用 HTTP 状态码。
 	"strings"  // 解析 Authorization 请求头。
+	"time"
 
 	"github.com/gin-gonic/gin" // Gin 中间件与请求上下文。
 
@@ -44,8 +45,25 @@ func authenticationMiddleware(access AccessController) gin.HandlerFunc { // 创�
 			return // 不再进入后续路由。
 		}
 
+		startedAt := time.Now()
 		identity, authenticateErr := access.Authenticate(c.Request.Context(), plaintext) // 验证 API Key 并取得租户身份。
-		if authenticateErr != nil {                                                      // API Key 验证失败。
+		result := "accepted"
+		switch {
+		case c.Request.Context().Err() != nil:
+			result = "canceled"
+		case errors.Is(authenticateErr, apikey.ErrInvalidCredential),
+			errors.Is(authenticateErr, apikey.ErrKeyInactive),
+			errors.Is(authenticateErr, apikey.ErrKeyRevoked),
+			errors.Is(authenticateErr, apikey.ErrKeyExpired),
+			errors.Is(authenticateErr, apikey.ErrTenantInactive):
+			result = "rejected"
+		case authenticateErr != nil:
+			result = "error"
+		}
+		routerMetrics(c).RequestStage(
+			"authentication", result, "", time.Since(startedAt),
+		)
+		if authenticateErr != nil { // API Key 验证失败。
 			if c.Request.Context().Err() != nil { // 请求已经取消时不再写响应。
 				return
 			}

@@ -20,6 +20,7 @@ import (
 	"model-velo/internal/gateway"
 	"model-velo/internal/observability"
 	"model-velo/internal/quota"
+	"model-velo/internal/reliability"
 )
 
 type ReadinessChecker interface {
@@ -104,6 +105,9 @@ func requestSummaryMiddleware(
 			c.Header("request-id", requestIDFromContext(c.Request.Context()))
 		}
 		c.Set("model-velo.metrics", metrics)
+		c.Request = c.Request.WithContext(
+			reliability.WithQueueObserver(c.Request.Context(), metrics),
+		)
 		finishMetrics := metrics.BeginRequest()
 		c.Next()
 
@@ -116,6 +120,7 @@ func requestSummaryMiddleware(
 		status := c.Writer.Status()
 		duration := time.Since(startedAt)
 		finishMetrics(route, c.Request.Method, status, isStream, duration)
+		metrics.HTTPError(route, status, apiErrorCode(c))
 
 		attributes := []any{
 			"request_id", requestIDFromContext(c.Request.Context()),

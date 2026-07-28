@@ -140,17 +140,17 @@ redis_command() {
 
 drain_deadline=$((SECONDS + drain_timeout_seconds))
 drain_state=timeout
-unfinished_outbox=-1
+remaining_outbox=-1
 stream_length=-1
 while ((SECONDS < drain_deadline)); do
-  unfinished_outbox=$(docker compose -f "$compose_file" exec -T postgres \
+  remaining_outbox=$(docker compose -f "$compose_file" exec -T postgres \
     psql \
     -U "$postgres_user" \
     -d "$postgres_database" \
     -At \
-    -c "SELECT count(*) FROM usage_outbox WHERE left(request_id, $prefix_length) = '$request_prefix' AND state <> 'published';")
+    -c "SELECT count(*) FROM usage_outbox WHERE left(request_id, $prefix_length) = '$request_prefix';")
   stream_length=$(redis_command --raw XLEN "$usage_stream")
-  if [[ "$unfinished_outbox" == "0" && "$stream_length" == "0" ]]; then
+  if [[ "$remaining_outbox" == "0" ]]; then
     drain_state=complete
     break
   fi
@@ -159,7 +159,7 @@ done
 {
   printf 'state=%s\n' "$drain_state"
   printf 'timeout_seconds=%s\n' "$drain_timeout_seconds"
-  printf 'unfinished_outbox=%s\n' "$unfinished_outbox"
+  printf 'remaining_outbox=%s\n' "$remaining_outbox"
   printf 'stream_length=%s\n' "$stream_length"
 } >"$output_dir/usage-drain.txt"
 

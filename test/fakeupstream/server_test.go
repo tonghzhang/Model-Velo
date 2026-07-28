@@ -208,6 +208,42 @@ func TestUpstreamServerLoadScenariosAndStats(t *testing.T) {
 	}
 }
 
+func TestUpstreamServerScenarioOverrideCanRecover(t *testing.T) {
+	upstream, err := newUpstreamServer("recovering-provider", "mock/error-503")
+	if err != nil {
+		t.Fatalf("new upstream server: %v", err)
+	}
+	testServer := httptest.NewServer(upstream.handler())
+	defer testServer.Close()
+
+	failed := postChat(t, testServer.URL, "before-recovery", "mock/instant", false)
+	_, _ = io.Copy(io.Discard, failed.Body)
+	_ = failed.Body.Close()
+	if failed.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status before recovery = %d, want 503", failed.StatusCode)
+	}
+
+	response, err := http.Post(
+		testServer.URL+"/__admin/scenario",
+		"application/json",
+		strings.NewReader(`{"scenario":"mock/instant"}`),
+	)
+	if err != nil {
+		t.Fatalf("set scenario override: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("scenario update status = %d, want 204", response.StatusCode)
+	}
+
+	recovered := postChat(t, testServer.URL, "after-recovery", "mock/error-503", false)
+	defer recovered.Body.Close()
+	if recovered.StatusCode != http.StatusOK {
+		t.Fatalf("status after recovery = %d, want 200", recovered.StatusCode)
+	}
+}
+
 func requestIDWithFailureOutcome(fail bool) string {
 	for index := range 10_000 {
 		requestID := "failure-outcome-" + strconv.Itoa(index)

@@ -144,8 +144,9 @@ var scenarioCatalog = map[string]scenario{
 }
 
 type upstreamServer struct {
-	providerName     string
-	scenarioOverride string
+	providerName string
+	scenarioMu   sync.RWMutex
+	scenario     string
 
 	attemptsMu sync.Mutex
 	attempts   map[string]attemptState
@@ -169,9 +170,11 @@ type attemptState struct {
 }
 
 type scenarioStats struct {
-	Requests int64 `json:"requests"`
-	Errors   int64 `json:"errors"`
-	Streams  int64 `json:"streams"`
+	Requests       int64
+	Errors         int64
+	Streams        int64
+	FirstRequestAt time.Time
+	LastRequestAt  time.Time
 }
 
 func newUpstreamServer(providerName, scenarioOverride string) (*upstreamServer, error) {
@@ -189,10 +192,10 @@ func newUpstreamServer(providerName, scenarioOverride string) (*upstreamServer, 
 		}
 	}
 	server := &upstreamServer{
-		providerName:     providerName,
-		scenarioOverride: scenarioOverride,
-		attempts:         map[string]attemptState{},
-		scenarioStats:    map[string]scenarioStats{},
+		providerName:  providerName,
+		scenario:      scenarioOverride,
+		attempts:      map[string]attemptState{},
+		scenarioStats: map[string]scenarioStats{},
 	}
 	server.statsStartedAt.Store(time.Now().UnixNano())
 	return server, nil
@@ -204,6 +207,7 @@ func (s *upstreamServer) handler() http.Handler {
 	mux.HandleFunc("GET /__admin/scenarios", s.handleScenarios)
 	mux.HandleFunc("GET /__admin/stats", s.handleStats)
 	mux.HandleFunc("POST /__admin/reset", s.handleReset)
+	mux.HandleFunc("POST /__admin/scenario", s.handleScenario)
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("POST /chat/completions", s.handleChatCompletions)
 	return mux
@@ -213,7 +217,7 @@ func (s *upstreamServer) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, healthResponse{
 		Status:           "ok",
 		Provider:         s.providerName,
-		ScenarioOverride: s.scenarioOverride,
+		ScenarioOverride: s.forcedScenario(),
 	})
 }
 
@@ -234,7 +238,7 @@ func (s *upstreamServer) handleScenarios(w http.ResponseWriter, _ *http.Request)
 	}
 	writeJSON(w, http.StatusOK, scenariosResponse{
 		Default:   defaultScenarioName,
-		Override:  s.scenarioOverride,
+		Override:  s.forcedScenario(),
 		Scenarios: available,
 	})
 }
@@ -250,10 +254,12 @@ func (s *upstreamServer) handleStats(w http.ResponseWriter, _ *http.Request) {
 	for _, name := range names {
 		stats := s.scenarioStats[name]
 		scenarios = append(scenarios, scenarioStatsEntry{
-			Name:     name,
-			Requests: stats.Requests,
-			Errors:   stats.Errors,
-			Streams:  stats.Streams,
+			Name:           name,
+			Requests:       stats.Requests,
+			Errors:         stats.Errors,
+			Streams:        stats.Streams,
+			FirstRequestAt: stats.FirstRequestAt,
+			LastRequestAt:  stats.LastRequestAt,
 		})
 	}
 	s.statsMu.Unlock()
@@ -286,6 +292,31 @@ func (s *upstreamServer) handleReset(w http.ResponseWriter, _ *http.Request) {
 	s.statsMu.Lock()
 	s.scenarioStats = map[string]scenarioStats{}
 	s.statsMu.Unlock()
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *upstreamServer) handleScenario(w http.ResponseWriter, r *http.Request) {
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<10))
+	decoder.DisallowUnknownFields()
+	var request scenarioOverrideRequest
+	if err := decoder.Decode(&request); err != nil {
+		writeUpstreamError(w, http.StatusBadRequest, "invalid scenario override")
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeUpstreamError(w, http.StatusBadRequest, "invalid scenario override")
+		return
+	}
+	request.Scenario = strings.TrimSpace(request.Scenario)
+	if request.Scenario != "" {
+		if _, exists := scenarioCatalog[request.Scenario]; !exists {
+			writeUpstreamError(w, http.StatusBadRequest, "unknown scenario override")
+			return
+		}
+	}
+	s.scenarioMu.Lock()
+	s.scenario = request.Scenario
+	s.scenarioMu.Unlock()
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -388,6 +419,11 @@ func (s *upstreamServer) recordScenario(name string, stream bool) {
 	s.statsMu.Lock()
 	stats := s.scenarioStats[name]
 	stats.Requests++
+	now := time.Now().UTC()
+	if stats.FirstRequestAt.IsZero() {
+		stats.FirstRequestAt = now
+	}
+	stats.LastRequestAt = now
 	if stream {
 		stats.Streams++
 		s.streams.Add(1)
@@ -409,7 +445,7 @@ func (s *upstreamServer) recordError(name string) {
 }
 
 func (s *upstreamServer) selectScenario(model string) (scenario, error) {
-	name := s.scenarioOverride
+	name := s.forcedScenario()
 	if name == "" && strings.HasPrefix(model, "mock/") {
 		name = model
 	}
@@ -421,6 +457,12 @@ func (s *upstreamServer) selectScenario(model string) (scenario, error) {
 		return scenario{}, fmt.Errorf("unknown scenario %q", name)
 	}
 	return selected, nil
+}
+
+func (s *upstreamServer) forcedScenario() string {
+	s.scenarioMu.RLock()
+	defer s.scenarioMu.RUnlock()
+	return s.scenario
 }
 
 func (s *upstreamServer) beginAttempt(
@@ -836,6 +878,10 @@ type healthResponse struct {
 	ScenarioOverride string `json:"scenario_override,omitempty"`
 }
 
+type scenarioOverrideRequest struct {
+	Scenario string `json:"scenario"`
+}
+
 type scenarioDescription struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
@@ -848,10 +894,12 @@ type scenariosResponse struct {
 }
 
 type scenarioStatsEntry struct {
-	Name     string `json:"name"`
-	Requests int64  `json:"requests"`
-	Errors   int64  `json:"errors"`
-	Streams  int64  `json:"streams"`
+	Name           string    `json:"name"`
+	Requests       int64     `json:"requests"`
+	Errors         int64     `json:"errors"`
+	Streams        int64     `json:"streams"`
+	FirstRequestAt time.Time `json:"first_request_at"`
+	LastRequestAt  time.Time `json:"last_request_at"`
 }
 
 type upstreamStatsResponse struct {

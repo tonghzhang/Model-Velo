@@ -189,7 +189,7 @@ docker compose -f "$compose_file" exec -T postgres \
   -U "$postgres_user" \
   -d "$postgres_database" \
   --csv \
-  -c "SELECT requested_model, status, stream, cache_status, error_category, error_code, count(*) AS events, sum(attempts) AS attempts, sum(retries) AS retries, sum(fallbacks) AS fallbacks, round(avg(latency_ms)::numeric, 2) AS latency_avg_ms, percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms) AS latency_p95_ms, round(avg(first_token_ms)::numeric, 2) AS first_token_avg_ms FROM usage_events WHERE left(request_id, $prefix_length) = '$request_prefix' GROUP BY requested_model, status, stream, cache_status, error_category, error_code ORDER BY requested_model, status, stream, cache_status, error_category, error_code;" \
+  -c "SELECT requested_model, status, stream, cache_status, error_category, error_code, count(*) AS events, sum(attempts) AS attempts, sum(retries) AS retries, sum(fallbacks) AS fallbacks, round(avg(latency_ms)::numeric, 2) AS latency_avg_ms, percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms) AS latency_p95_ms, percentile_cont(0.99) WITHIN GROUP (ORDER BY latency_ms) AS latency_p99_ms, round(avg(first_token_ms)::numeric, 2) AS first_token_avg_ms, percentile_cont(0.95) WITHIN GROUP (ORDER BY first_token_ms) AS first_token_p95_ms, percentile_cont(0.99) WITHIN GROUP (ORDER BY first_token_ms) AS first_token_p99_ms FROM usage_events WHERE left(request_id, $prefix_length) = '$request_prefix' GROUP BY requested_model, status, stream, cache_status, error_category, error_code ORDER BY requested_model, status, stream, cache_status, error_category, error_code;" \
   >"$output_dir/usage-diagnostics.csv"
 
 {

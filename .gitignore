@@ -11,6 +11,8 @@
 *.out
 coverage.*
 *.bench
+__pycache__/
+*.pyc
 /test-results/
 /test/threehost/client.env
 /test/threehost/benchmark.env

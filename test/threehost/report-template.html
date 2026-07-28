@@ -459,12 +459,11 @@
         <a href="#stream">03 / SSE 流式</a>
         <a href="#reliability">04 / 可靠性与耐久</a>
         <a href="#hotpath">05 / 热路径诊断</a>
-        <a href="#resources">06 / 客户端资源</a>
+        <a href="#resources">06 / 资源与镜像</a>
         <a href="#evidence">07 / 证据完整性</a>
-        <a href="#comparison">08 / 其他网关对比</a>
-        <a href="#method">09 / 环境与口径</a>
-        <a href="#cases">10 / 全部 Case</a>
-        <a href="#artifacts">11 / 原始产物</a>
+        <a href="#method">08 / 环境与口径</a>
+        <a href="#cases">09 / 全部 Case</a>
+        <a href="#artifacts">10 / 原始产物</a>
       </nav>
       <div class="rail-note">本文件自包含，可离线打开。报告含私网地址与运行元数据，不建议直接公开部署。</div>
     </aside>
@@ -517,12 +516,12 @@
           <div class="grid-2" id="closed-loop-panels">
             <article class="panel panel-accent">
               <h3>闭环网关吞吐</h3>
-              <p>c=1…256，三次运行取中位数。吞吐非单调，c=128 后约 1.25k RPS；这不是稳定 SLO。</p>
+              <p>每档并发按重复运行取中位数；闭环峰值用于定位吞吐拐点，不等同于生产 SLO。</p>
               <div class="chart" id="capacity-chart"></div>
             </article>
             <article class="panel panel-warn">
               <h3>闭环 P99</h3>
-              <p>并发上升后排队长尾快速放大：c=256 的 P99 比直连多约 364 ms。</p>
+              <p>同时展示 P50 与 P99，便于识别并发上升后是否出现排队和尾延迟放大。</p>
               <div class="chart" id="capacity-latency-chart"></div>
             </article>
           </div>
@@ -550,7 +549,7 @@
         <section id="stream">
           <div class="section-head">
             <div><span class="kicker">03 / server-sent events</span><h2>SSE 回放与逐 Chunk 观测</h2></div>
-            <p>500 个流式请求、并发 20、三次重复。独立 stream loader 记录 headers、首事件、首内容、总耗时和 chunk 间隔，不只看 k6 的普通 HTTP duration。</p>
+            <p>独立 stream loader 记录 headers、首事件、首内容、总耗时和 chunk 间隔；请求数、并发和重复次数均取自本次运行元数据。</p>
           </div>
           <div class="ledger" id="stream-ledger"></div>
           <div class="grid-2">
@@ -560,16 +559,14 @@
             </article>
             <article class="panel">
               <h3>怎么解读</h3>
-              <p>首内容 P50 增量只有约 5.37 ms，说明正常路径的转发、SSE 解析与首 chunk 提交成本较小；但首内容 P99 增量约 50 ms，总耗时 P99 也多约 52 ms，尾部抖动值得继续用网关 CPU profile 和 per-stage timing 分解。</p>
-              <p>inter‑chunk P99 只增加约 0.60 ms，说明流一旦开始，持续转发没有明显积累性停顿。三轮 3,000 个直连/网关流请求全部完整成功。</p>
-              <div class="callout"><strong>边界已经测到。</strong>可靠性脚本同时覆盖首 chunk 前非法事件返回 502，以及首 chunk 已提交后断流不再 Fallback；这两条是 SSE 网关最容易写错的状态边界。</div>
+              <div id="stream-interpretation"></div>
             </article>
           </div>
         </section>
 
         <section id="reliability">
           <div class="section-head">
-            <div><span class="kicker">04 / failure semantics</span><h2>缓存、故障、队列与 30 分钟耐久</h2></div>
+            <div><span class="kicker">04 / failure semantics</span><h2>缓存、故障恢复、队列与耐久</h2></div>
             <p>这一组不是单纯追求成功率：error10 和 queue overload 会有意制造可接受错误。报告将“测试断言成功”和“业务 HTTP 2xx”分开。</p>
           </div>
           <div class="grid-3" id="diagnostic-cards"></div>
@@ -579,10 +576,8 @@
               <ol id="reliability-checks"></ol>
             </article>
             <article class="panel panel-warn">
-              <h3>三条最重要的诊断</h3>
-              <p><b>重试放大：</b>error10 的上游调用约为客户端请求的 1.20×。由于错误由 request ID 确定，重试不会“治愈”这 10%，只会增加上游压力。</p>
-              <p><b>Queue 边界：</b>1,000 RPS 过载 case 中约一半请求成功，上游最大 active 恰为 256；被拒请求没有继续打到上游，边界有效，但 P99 已接近 3 秒。</p>
-              <p><b>耐久错误：</b>500 RPS、30 分钟共 900,001 请求，518 个 5xx，业务成功率 99.942%。它通过 99.9%，但没有达到 99.99%。</p>
+              <h3>本次可靠性诊断</h3>
+              <div id="reliability-findings"></div>
             </article>
           </div>
         </section>
@@ -619,8 +614,8 @@
 
         <section id="resources">
           <div class="section-head">
-            <div><span class="kicker">06 / load generator</span><h2>客户端资源：峰值属于谁</h2></div>
-            <p>客户端有 5,835 个约 1 秒采样。服务器文件也已收到，但它们分别止于主运行前或始于主运行后，必须先做时间窗口审计。</p>
+            <div><span class="kicker">06 / runtime envelope</span><h2>客户端、网关容器与镜像</h2></div>
+            <p>资源数据只使用与 case 时间窗重叠的采样；同时展示客户端负载生成器、网关容器内存和最终镜像体积。</p>
           </div>
           <div class="ledger" id="resource-ledger"></div>
           <div class="grid-2">
@@ -660,7 +655,7 @@
           </div>
         </section>
 
-        <section id="comparison">
+        <section id="comparison" hidden>
           <div class="section-head">
             <div><span class="kicker">08 / external reference</span><h2>和其他网关怎么比</h2></div>
             <p>唯一公平的排名来自同一硬件、同一客户端、同一假上游、同一功能开关。本节只提供公开结果的方向性坐标，不宣布跨环境“胜负”。</p>
@@ -718,7 +713,7 @@
         <section id="cases">
           <div class="section-head">
             <div><span class="kicker">10 / complete case ledger</span><h2>全部测试 Case</h2></div>
-            <p>包含 smoke、warmup、54 个闭环容量、21 个开环 rate、payload、cache、ramp、burst、fault、queue、endurance、reliability 和 6 个 SSE detail。数值保留到足以回查原始 JSON。</p>
+            <p>这里列出本次实际生成的全部 case；数值保留到足以回查同目录原始 JSON 和日志。</p>
           </div>
           <div class="toolbar">
             <input id="case-search" type="search" placeholder="搜索 case / phase / target / model…" aria-label="搜索 case">
@@ -814,6 +809,9 @@
     const lowOverhead = (S.comparisons || []).find(x => x.phase === "capacity" && String(x.load) === "1") || {};
     const streamPair = (S.stream_comparisons || [])[0] || {};
     const performanceDiagnostics = S.performance_diagnostics || [];
+    const usageReconciliation = S.usage_reconciliation || {};
+    const gatewayResource = (S.resources || []).find(x => String(x.container || "").toLowerCase().includes("gateway")) || {};
+    const gatewayImage = (S.images || []).find(x => x.repository === "model-velo") || {};
 
     $("strict-rps").textContent = int(strict.load);
     $("strict-p99").textContent = fmt(strict.p99_ms, 2);
@@ -849,6 +847,9 @@
       gatewayCapacityValues.length ? ["闭环峰值", `${fmt(Math.max(...gatewayCapacityValues.map(x=>n(x.throughput_rps))),1)} RPS`, `${gatewayCapacityValues.length} 个并发点`, "warn"] : null,
       Object.keys(cacheShared).length ? ["共享缓存卸载", `${fmt((1-n(cacheShared.upstream?.requests)/Math.max(1,n(cacheShared.requests)))*100,2)}%`, `${int(cacheShared.requests)} gateway → ${int(cacheShared.upstream?.requests)} upstream`, "ok"] : null,
       Object.keys(endurance).length ? ["耐久", pct(endurance.success_rate), `${int(endurance.load)} RPS · ${int(statusCount(endurance,"5xx"))} × 5xx`, n(statusCount(endurance,"5xx"))?"warn":"ok"] : null,
+      n(usageReconciliation.expected_gateway_requests) ? ["Usage 对账", pct(usageReconciliation.observed_ratio), `${int(usageReconciliation.observed_usage_events)} / ${int(usageReconciliation.expected_gateway_requests)}`, n(usageReconciliation.difference)===0?"ok":"bad"] : null,
+      Object.keys(gatewayResource).length ? ["网关内存峰值", `${fmt(gatewayResource.memory_max_mb,1)} MB`, `${int(gatewayResource.samples)} 个重叠采样`, "info"] : null,
+      Object.keys(gatewayImage).length ? ["网关镜像", `${fmt(n(gatewayImage.size_bytes)/1e6,2)} MB`, `${gatewayImage.repository}:${gatewayImage.tag}`, "info"] : null,
       performanceDiagnostics.some(item=>item.stages?.length) ? ["阶段证据", `${performanceDiagnostics.filter(item=>item.stages?.length).length} cases`, "Histogram + pool + runtime", "ok"] : ["阶段证据", "缺失", "检查镜像与监控窗口", "bad"]
     ].filter(Boolean);
     $("top-ledger").innerHTML = ledger.map(([label,value,note,kind]) => `<div class="ledger-item"><span class="status ${kind}">${esc(label)}</span><span class="value">${esc(value)}</span><span class="label">${esc(note)}</span></div>`).join("");
@@ -920,8 +921,13 @@
     const directStream = streamRows.filter(x=>x.target==="direct");
     const gatewayStream = streamRows.filter(x=>x.target==="gateway");
     const streamMedian = (items,key,field) => median(items.map(x=>n((x[key]||{})[field])));
+    const gatewayStreamRequests = gatewayStream.reduce((a,x)=>a+n(x.requests),0);
+    const gatewayStreamSuccesses = gatewayStream.reduce((a,x)=>a+n(x.successes),0);
+    const gatewayStreamSuccessRate = gatewayStreamSuccesses / Math.max(1,gatewayStreamRequests);
+    const gatewayTTFTP99 = streamMedian(gatewayStream,"first_content","p99_ms");
     $("stream-ledger").innerHTML = [
-      ["完整请求", `${int(streamRows.reduce((a,x)=>a+n(x.requests),0))}`, "6 case · 100% complete", "ok"],
+      ["网关流请求", `${int(gatewayStreamRequests)}`, `${pct(gatewayStreamSuccessRate)} 正常结束`, gatewayStreamSuccessRate>=.999?"ok":"bad"],
+      ["网关 TTFT P99", `${fmt(gatewayTTFTP99,2)} ms`, `c=${esc(meta.stream_concurrency || "unknown")}`, "info"],
       ["TTFT P50 增量", `${fmt(streamPair.first_content_p50_delta_ms,2)} ms`, "gateway − direct", "info"],
       ["TTFT P99 增量", `${fmt(streamPair.first_content_p99_delta_ms,2)} ms`, "尾部抖动", "warn"],
       ["Chunk gap P99", `+${fmt(streamPair.gap_p99_delta_ms,2)} ms`, "持续转发稳定", "ok"]
@@ -940,20 +946,45 @@
         streamMedian(gatewayStream,"inter_chunk","p99_ms")
       ]}
     ], ["TTFT P50","TTFT P99","Total P99","Gap P99"], {label:"SSE直连与网关延迟",tooltip:v=>`${fmt(v,2)} ms`});
+    $("stream-interpretation").innerHTML = `<p><b>网关 TTFT P99：</b>${fmt(gatewayTTFTP99,2)} ms；正常结束 ${pct(gatewayStreamSuccessRate)}，共 ${int(gatewayStreamRequests)} 个网关 SSE 请求。</p>
+      <p><b>相对直连：</b>TTFT P50 增量 ${fmt(streamPair.first_content_p50_delta_ms,2)} ms，TTFT P99 增量 ${fmt(streamPair.first_content_p99_delta_ms,2)} ms，总耗时 P99 增量 ${fmt(streamPair.total_p99_delta_ms,2)} ms，inter-chunk P99 增量 ${fmt(streamPair.gap_p99_delta_ms,2)} ms。</p>
+      <div class="callout"><strong>提交边界也在可靠性用例中验证：</strong>首 chunk 前非法事件保持 HTTP 错误；首 chunk 已提交后断流不再切换 Provider。</div>`;
 
     const diagNames = [
       ["cache-shared-gateway-r1","共享缓存", row => `${int(row.requests)} → ${int(row.upstream?.requests)} upstream`, "ok"],
       ["ramp-gateway","阶梯负载", row => `${pct(row.success_rate)} · P99 ${fmt(row.latency?.p99_ms,1)}ms`, "warn"],
       ["burst-gateway","突发负载", row => `${pct(row.success_rate)} · ${int(statusCount(row,"5xx"))} 5xx`, "warn"],
       ["fault-error10-gateway","10% 确定性错误", row => `${fmt(n(row.upstream?.requests)/Math.max(1,n(row.requests)),2)}× upstream`, "warn"],
+      ["fault-fallback-5xx-gateway","全量 5xx Fallback", row => `${pct(row.success_rate)} · ${int(row.upstreams?.fail?.requests)} failed calls`, "ok"],
+      ["fault-provider-recovery-gateway","Provider 恢复", row => `${pct(row.success_rate)} · ${int(row.upstreams?.fail?.requests)} primary calls`, "ok"],
       ["queue-overload-r01000-gateway-r1","Queue 过载", row => `${pct(n(statusCount(row,"2xx"))/Math.max(1,n(row.requests)))} HTTP 2xx`, "bad"],
       ["endurance-r00500-gateway-r1","30 分钟耐久", row => `${pct(row.success_rate)} · ${int(statusCount(row,"5xx"))} 5xx`, "warn"]
-    ];
+    ].filter(([name]) => k6Rows.some(x=>x.case===name));
     $("diagnostic-cards").innerHTML = diagNames.map(([name,label,render,kind]) => {
       const row = k6Rows.find(x=>x.case===name) || {};
       return `<article class="panel"><span class="status ${kind}">${esc(label)}</span><h3 style="margin-top:14px">${esc(render(row))}</h3><p>${esc(name)}</p></article>`;
     }).join("");
     $("reliability-checks").innerHTML = (data.reliability_checks || []).map(x=>`<li>${esc(x)}</li>`).join("");
+    const fallbackFailure = k6Rows.find(x=>x.case==="fault-fallback-5xx-gateway") || {};
+    const providerRecovery = k6Rows.find(x=>x.case==="fault-provider-recovery-gateway") || {};
+    const failScenario = providerRecovery.upstreams?.fail?.scenarios?.[0] || {};
+    const recoveryInjectedAt = Date.parse(providerRecovery.started_at || "");
+    const recoveryFirstAt = Date.parse(failScenario.first_request_at || "");
+    const recoverySeconds = Number.isFinite(recoveryInjectedAt) && Number.isFinite(recoveryFirstAt)
+      ? Math.max(0,(recoveryFirstAt-recoveryInjectedAt)/1000)
+      : null;
+    const usageChaos = S.usage_chaos || [];
+    $("reliability-findings").innerHTML = [
+      Object.keys(fallbackFailure).length
+        ? `<p><b>全量 5xx：</b>${int(fallbackFailure.requests)} 个请求成功率 ${pct(fallbackFailure.success_rate)}；故障 Provider ${int(fallbackFailure.upstreams?.fail?.requests)} 次调用，备用 Provider ${int(fallbackFailure.upstreams?.fallback?.requests)} 次调用。</p>`
+        : `<p><b>全量 5xx：</b>本次未运行可量化 Fallback case。</p>`,
+      Object.keys(providerRecovery).length
+        ? `<p><b>恢复放量：</b>${recoverySeconds===null?"恢复时间不可用":`${fmt(recoverySeconds,2)} 秒后首次重新打到主 Provider`}；主 Provider ${int(providerRecovery.upstreams?.fail?.requests)} 次，备用 ${int(providerRecovery.upstreams?.fallback?.requests)} 次，客户端成功率 ${pct(providerRecovery.success_rate)}。</p>`
+        : `<p><b>恢复放量：</b>本次未运行 Provider recovery case。</p>`,
+      usageChaos.length
+        ? `<p><b>Usage chaos：</b>${usageChaos.map(x=>`${esc(x.phase)} ${esc(x.stored_after_recovery)}`).join("；")}；完整 CSV 已随报告归档。</p>`
+        : `<p><b>Usage chaos：</b>未收到 Worker/Redis 中断、重复投递和毒消息证据。</p>`
+    ].join("");
 
     const hotpath = S.performance_diagnostics || [];
     const hotpathCase = $("hotpath-case");
@@ -1017,9 +1048,10 @@
     const cr = S.client_resource || {};
     $("resource-ledger").innerHTML = [
       ["采样点", int(cr.samples), "≈ 1 秒间隔", "info"],
-      ["CPU 全局峰值", `${fmt(cr.cpu_max_pct,1)}%`, "来自直连容量基线", "warn"],
-      ["内存 used 峰值", `${fmt(cr.memory_used_max_mb,0)} MB`, "queue loadgen 扩 VU", "warn"],
-      ["k6 RSS 峰值", `${fmt(cr.loadgen_rss_max_mb,0)} MB`, "queue overload", "warn"]
+      ["客户端 CPU 峰值", `${fmt(cr.cpu_max_pct,1)}%`, "按 case 时间窗归属", n(cr.cpu_max_pct)>=90?"warn":"info"],
+      ["k6 RSS 峰值", `${fmt(cr.loadgen_rss_max_mb,0)} MB`, "负载生成器", "info"],
+      Object.keys(gatewayResource).length ? ["网关容器内存峰值", `${fmt(gatewayResource.memory_max_mb,1)} MB`, `${int(gatewayResource.samples)} samples`, "ok"] : ["网关容器内存峰值", "证据缺失", "需要重叠 Docker stats", "bad"],
+      Object.keys(gatewayImage).length ? ["Model‑Velo 镜像", `${fmt(n(gatewayImage.size_bytes)/1e6,2)} MB`, `${gatewayImage.repository}:${gatewayImage.tag}`, "ok"] : ["Model‑Velo 镜像", "证据缺失", "需要 compose-images.json", "bad"]
     ].map(([label,value,note,kind]) => `<div class="ledger-item"><span class="status ${kind}">${esc(label)}</span><span class="value">${esc(value)}</span><span class="label">${esc(note)}</span></div>`).join("");
     lineChart("resource-chart", [{name:"CPU max %",color:"#d5683d",values:phaseResource.map(x=>x.cpu_max)}], phaseResource.map(x=>x.phase), {label:"各阶段客户端CPU峰值",max:105,tooltip:v=>`${fmt(v,1)}%`});
     $("resource-table").innerHTML = phaseResource.map(x=>`<tr><td>${esc(x.phase)}</td><td class="num">${int(x.samples)}</td><td class="num">${fmt(x.cpu_avg,1)}%</td><td class="num">${fmt(x.cpu_max,1)}%</td><td class="num">${fmt(x.memory_max,0)} MB</td><td class="num">${fmt(x.rss_max,0)} MB</td></tr>`).join("");
@@ -1033,11 +1065,14 @@
       return `${name.replace("model-velo-","").replace("-1","")}: ${fmt(value.cpu_max_pct,1)}% CPU / ${fmt(value.memory_max_mb,0)} MB`;
     };
     $("server-capture-table").innerHTML = captures.map(capture => `<tr><td class="mono"><a href="${encodeURI(capture.path)}">${esc(capture.path)}</a></td><td>${esc(capture.kind)}</td><td><span class="status ${capture.relation==="overlap"?"ok":capture.relation==="unknown"?"warn":"bad"}">${esc(relationLabels[capture.relation]||capture.relation)}</span></td><td class="num">${int(capture.samples)}</td><td class="mono">${esc(capture.first||"—")}</td><td class="mono">${esc(capture.last||"—")}</td><td>${esc(capturePeak(capture))}</td></tr>`).join("");
+    const alignedCapture = captures.find(x=>x.kind==="docker-stats"&&x.relation==="overlap");
     const postCapture = captures.find(x=>x.kind==="docker-stats"&&x.relation==="after");
     const postPeak = postCapture ? capturePeak(postCapture) : "";
-    $("server-capture-note").innerHTML = postCapture
-      ? `<strong>服务器文件与主运行零重叠，不能用于解释容量曲线。</strong>主运行结束于 ${esc(meta.ended_at)}；前置 stats/Prometheus 最晚约 15:05Z 结束，后置网关 stats 到 16:52Z 才开始。后置窗口观测到 ${esc(postPeak)}，它可能反映测试后的 Usage/数据库处理，只能作为排查线索，不能归因到某个负载 case。`
-      : `<strong>服务器文件与主运行零重叠，不能用于解释容量曲线。</strong>请让三个采集器覆盖客户端从第一个 smoke 到最后一个 reliability case 的完整 UTC 窗口。`;
+    $("server-capture-note").innerHTML = alignedCapture
+      ? `<strong>服务器采集与客户端主运行有时间重叠。</strong>容器 CPU、内存和 Prometheus 阶段数据可以按 case 窗口用于解释容量曲线。`
+      : postCapture
+        ? `<strong>服务器文件与主运行零重叠，不能用于解释容量曲线。</strong>后置窗口观测到 ${esc(postPeak)}，只能作为测试后状态线索。`
+        : `<strong>服务器采集没有覆盖主运行。</strong>容器资源与阶段数据不能用于解释容量曲线。`;
 
     const gatewayCaptures = captures.filter(x=>x.kind==="docker-stats"&&x.path.includes("gateway-stats"));
     const upstreamCaptures = captures.filter(x=>x.kind==="docker-stats"&&x.path.includes("upstream-stats"));
@@ -1051,6 +1086,8 @@
     const upstreamEvidence = captureEvidence(upstreamCaptures);
     const prometheusEvidence = captureEvidence(prometheusCaptures);
     const hasUsage = data.artifacts.some(x=>x.path.startsWith("gateway-evidence/") || /usage-(overview|status|diagnostics)/.test(x.path));
+    const usageExact = n(usageReconciliation.expected_gateway_requests)>0 && n(usageReconciliation.difference)===0;
+    const hasUsageChaos = (S.usage_chaos || []).length >= 4;
     const evidence = [
       ["k6 case summaries","完整",`${rows.length} cases；HTTP 分位数、成功率、状态族和 dropped iterations`,"ok"],
       ["SSE chunk timing","完整",`${streamRows.length} cases；headers / first event / first content / total / inter-chunk`,"ok"],
@@ -1059,7 +1096,8 @@
       ["网关容器资源",...gatewayEvidence],
       ["上游容器资源",...upstreamEvidence],
       ["Prometheus",...prometheusEvidence],
-      ["Usage / PostgreSQL / Redis",hasUsage?"存在":"缺失",hasUsage?"可做事件对账":"observed=0 仅表示未采集，不能解释为零落库","bad"]
+      ["Usage 请求对账",hasUsage?(usageExact?"一致":"不一致"):"缺失",hasUsage?`${int(usageReconciliation.observed_usage_events)} stored / ${int(usageReconciliation.expected_gateway_requests)} expected`:"没有收到 PostgreSQL/Redis 证据",usageExact?"ok":"bad"],
+      ["Usage 故障恢复",hasUsageChaos?"完整":"缺失",hasUsageChaos?"Worker/Redis outage、重复投递、毒消息":"需要 usage-chaos/summary.csv",hasUsageChaos?"ok":"bad"]
     ];
     $("evidence-list").innerHTML = evidence.map(([name,state,note,kind])=>`<div class="evidence-row"><b>${esc(name)}</b><span class="status ${kind}">${esc(state)}</span><span>${esc(note)}</span></div>`).join("");
     const serverAligned = gatewayEvidence[0] === "覆盖" && upstreamEvidence[0] === "覆盖" && prometheusEvidence[0] === "覆盖";
@@ -1097,13 +1135,12 @@
       ["SSE",`${meta.stream_requests} requests @ c=${meta.stream_concurrency}`],
       ["Ramp",meta.ramp_stages],
       ["Burst",meta.burst_stages],
+      ["Fault recovery",`${meta.fault_recovery_rate || "—"} RPS · ${meta.fault_recovery_failure_duration || "—"} failure + ${meta.fault_recovery_healthy_duration || "—"} recovery`],
       ["Queue",`${meta.queue_rate} RPS · VUs ${meta.queue_pre_allocated_vus}/${meta.queue_max_vus}`],
       ["Endurance",`${meta.endurance_rate} RPS · ${meta.endurance_duration}`]
     ]);
     $("environment-table").innerHTML = keyValueTable([
-      ["客户端","Ubuntu 22.04.5 · Linux 5.15"],
-      ["CPU","4 vCPU · AMD EPYC 9K65 · KVM"],
-      ["内存","8 GB · no swap"],
+      ["客户端",meta.host || "详见 client-metadata.txt"],
       ["k6",meta.k6_version],
       ["Python",meta.python_version],
       ["Gateway",meta.gateway_url],

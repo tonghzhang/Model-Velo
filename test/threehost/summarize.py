@@ -111,10 +111,17 @@ def read_k6_case(result_dir, case):
             success = metric_value(metrics, name)
             break
     upstream = read_json(result_dir / f"{case['case']}-upstream.json")
+    upstreams = {
+        label: read_json(result_dir / f"{case['case']}-{label}-upstream.json")
+        for label in ("main", "fail", "fallback")
+    }
     return {
         **case,
         "exit_code": int(number(case.get("exit_code"))),
         "requests": int(metric_value(metrics, "http_reqs", "count")),
+        "gateway_requests": int(
+            metric_value(metrics, "gateway_chat_requests", "count")
+        ),
         "iterations": int(metric_value(metrics, "iterations", "count")),
         "throughput_rps": metric_value(metrics, "iterations", "rate"),
         "success_rate": success,
@@ -129,6 +136,7 @@ def read_k6_case(result_dir, case):
             "other": int(metric_value(metrics, "chat_responses_other", "count")),
         },
         "upstream": upstream,
+        "upstreams": upstreams,
     }
 
 
@@ -302,6 +310,11 @@ def stream_comparisons(rows):
                 - number(direct["total"].get("p99_ms")),
                 "gap_p99_delta_ms": number(gateway["inter_chunk"].get("p99_ms"))
                 - number(direct["inter_chunk"].get("p99_ms")),
+                "gateway_first_content_p99_ms": number(
+                    gateway["first_content"].get("p99_ms")
+                ),
+                "gateway_success_rate": number(gateway.get("success_rate")),
+                "gateway_requests": int(number(gateway.get("requests"))),
             }
         )
     comparisons = []
@@ -437,6 +450,50 @@ def read_client_resource(result_dir):
             max(number(sample.get("loadgen_processes")) for sample in samples)
         ),
     }
+
+
+def read_images(result_dir):
+    paths = list(result_dir.rglob("compose-images.json"))
+    if not paths:
+        return []
+    payload = read_json(paths[0])
+    if not isinstance(payload, list):
+        return []
+    images = {}
+    for row in payload:
+        if not isinstance(row, dict):
+            continue
+        key = (
+            str(row.get("Repository", "")),
+            str(row.get("Tag", "")),
+            str(row.get("ID", "")),
+        )
+        current = images.setdefault(
+            key,
+            {
+                "repository": key[0],
+                "tag": key[1],
+                "id": key[2],
+                "platform": row.get("Platform", ""),
+                "size_bytes": int(number(row.get("Size"))),
+                "containers": [],
+            },
+        )
+        container = str(row.get("ContainerName", ""))
+        if container and container not in current["containers"]:
+            current["containers"].append(container)
+    return sorted(images.values(), key=lambda row: (row["repository"], row["tag"]))
+
+
+def read_usage_chaos(result_dir):
+    paths = list(result_dir.rglob("usage-chaos/summary.csv"))
+    if not paths:
+        return []
+    try:
+        with paths[0].open(encoding="utf-8", newline="") as handle:
+            return list(csv.DictReader(handle))
+    except OSError:
+        return []
 
 
 PROMETHEUS_LINE = re.compile(
@@ -870,12 +927,21 @@ def find_series(prometheus, prefix):
 
 
 def reconcile_usage(k6_rows, stream_rows, usage):
-    excluded_phases = {"smoke", "reliability", "rate-limit"}
-    expected = sum(
+    measured_gateway_requests = sum(
+        int(number(row.get("gateway_requests"))) for row in k6_rows
+    )
+    if measured_gateway_requests == 0:
+        excluded_phases = {"smoke", "reliability", "rate-limit"}
+        measured_gateway_requests = sum(
+            int(number(row.get("requests")))
+            for row in k6_rows
+            if row.get("target") == "gateway"
+            and row.get("phase") not in excluded_phases
+        )
+    expected = measured_gateway_requests + sum(
         int(number(row.get("requests")))
-        for row in k6_rows + stream_rows
+        for row in stream_rows
         if row.get("target") == "gateway"
-        and row.get("phase") not in excluded_phases
     )
     observed = int(number(usage.get("overview", {}).get("events")))
     ratio = float(observed) / expected if expected > 0 else 0.0
@@ -928,9 +994,64 @@ def capacity_findings(capacity, rate, comparisons, stream_pairs):
         )
     if stream_pairs:
         findings.append(
-            f"SSE first-content P50 overhead: "
+            f"SSE gateway TTFT P99: "
+            f"{stream_pairs[0]['gateway_first_content_p99_ms']:.2f} ms across "
+            f"{stream_pairs[0]['gateway_requests']} requests with "
+            f"{stream_pairs[0]['gateway_success_rate'] * 100:.3f}% success; "
+            f"first-content P50 overhead: "
             f"{stream_pairs[0]['first_content_p50_delta_ms']:.2f} ms; "
             f"inter-chunk P99 overhead: {stream_pairs[0]['gap_p99_delta_ms']:.2f} ms."
+        )
+    return findings
+
+
+def fault_recovery_findings(rows):
+    findings = []
+    by_case = {row.get("case"): row for row in rows}
+    failure = by_case.get("fault-fallback-5xx-gateway")
+    if failure:
+        fail_calls = int(
+            number(failure.get("upstreams", {}).get("fail", {}).get("requests"))
+        )
+        fallback_calls = int(
+            number(failure.get("upstreams", {}).get("fallback", {}).get("requests"))
+        )
+        requests = max(1, int(number(failure.get("requests"))))
+        amplification = (fail_calls + fallback_calls) / requests
+        findings.append(
+            f"Full-503 fallback success: {failure['success_rate'] * 100:.3f}% "
+            f"across {requests} requests; failed provider calls {fail_calls}, "
+            f"fallback calls {fallback_calls}, upstream amplification "
+            f"{amplification:.3f}x."
+        )
+
+    recovery = by_case.get("fault-provider-recovery-gateway")
+    if recovery:
+        fail_stats = recovery.get("upstreams", {}).get("fail", {})
+        first_request = None
+        scenarios = fail_stats.get("scenarios", [])
+        if scenarios:
+            first_request = parse_timestamp(scenarios[0].get("first_request_at"))
+        case_start = parse_timestamp(recovery.get("started_at"))
+        recovery_seconds = (
+            max(0.0, (first_request - case_start).total_seconds())
+            if first_request is not None and case_start is not None
+            else None
+        )
+        fail_calls = int(number(fail_stats.get("requests")))
+        fallback_calls = int(
+            number(recovery.get("upstreams", {}).get("fallback", {}).get("requests"))
+        )
+        timing = (
+            f"{recovery_seconds:.2f} s after recovery injection"
+            if recovery_seconds is not None
+            else "timing unavailable"
+        )
+        findings.append(
+            f"Provider recovery: first half-open traffic reached the restored "
+            f"primary {timing}; primary handled {fail_calls} calls and fallback "
+            f"handled {fallback_calls}, with "
+            f"{recovery['success_rate'] * 100:.3f}% client success."
         )
     return findings
 
@@ -1212,7 +1333,9 @@ def write_markdown(path, summary):
                         "200",
                         "429",
                         "5xx",
-                        "upstream calls",
+                        "main calls",
+                        "failed-provider calls",
+                        "fallback calls",
                     ],
                     [
                         [
@@ -1225,6 +1348,20 @@ def write_markdown(path, summary):
                             row["status_counts"]["429"],
                             row["status_counts"]["5xx"],
                             int(number(row.get("upstream", {}).get("requests"))),
+                            int(
+                                number(
+                                    row.get("upstreams", {})
+                                    .get("fail", {})
+                                    .get("requests")
+                                )
+                            ),
+                            int(
+                                number(
+                                    row.get("upstreams", {})
+                                    .get("fallback", {})
+                                    .get("requests")
+                                )
+                            ),
                         ]
                         for row in diagnostics
                     ],
@@ -1336,6 +1473,28 @@ def write_markdown(path, summary):
             ]
         )
 
+    images = summary.get("images", [])
+    if images:
+        lines.extend(
+            [
+                "## Container images",
+                "",
+                markdown_table(
+                    ["image", "platform", "size MB", "containers"],
+                    [
+                        [
+                            f"{row['repository']}:{row['tag']}",
+                            row["platform"],
+                            fmt(row["size_bytes"] / 1_000_000, 2),
+                            ", ".join(row["containers"]),
+                        ]
+                        for row in images
+                    ],
+                ),
+                "",
+            ]
+        )
+
     client = summary["client_resource"]
     if client:
         lines.extend(
@@ -1391,6 +1550,33 @@ def write_markdown(path, summary):
             ]
         )
 
+    usage_chaos = summary.get("usage_chaos", [])
+    if usage_chaos:
+        lines.extend(
+            [
+                "## Usage failure recovery",
+                "",
+                markdown_table(
+                    [
+                        "phase",
+                        "requests/deliveries",
+                        "outbox while down",
+                        "stored/recovered",
+                    ],
+                    [
+                        [
+                            row.get("phase", ""),
+                            row.get("requests", ""),
+                            row.get("outbox_while_dependency_down", ""),
+                            row.get("stored_after_recovery", ""),
+                        ]
+                        for row in usage_chaos
+                    ],
+                ),
+                "",
+            ]
+        )
+
     lines.extend(["## Evidence", ""])
     for warning in summary["warnings"]:
         lines.append(f"- {warning}")
@@ -1439,6 +1625,7 @@ def main():
     started_at, ended_at = case_window(cases)
     resources = read_resources(result_dir, started_at, ended_at)
     client_resource = read_client_resource(result_dir)
+    images = read_images(result_dir)
     prometheus, prometheus_points = read_prometheus(
         result_dir, started_at, ended_at
     )
@@ -1447,6 +1634,7 @@ def main():
     )
     usage = read_usage_evidence(result_dir)
     usage_reconciliation = reconcile_usage(k6_rows, stream_rows, usage)
+    usage_chaos = read_usage_chaos(result_dir)
 
     warnings = []
     stats_paths = [
@@ -1462,6 +1650,8 @@ def main():
         )
     elif not resources:
         warnings.append("Missing gateway/upstream Docker stats JSONL files.")
+    if not images:
+        warnings.append("Missing Docker image-size evidence.")
     if not client_resource:
         warnings.append("Missing client host resource samples.")
     if prometheus_paths and not prometheus:
@@ -1486,7 +1676,11 @@ def main():
     ):
         warnings.append(
             "Stored Usage event count does not match measured gateway requests "
-            "after excluding smoke, reliability, and rate-limit cases."
+            "after the Usage stream and outbox drained."
+        )
+    if not usage_chaos:
+        warnings.append(
+            "Missing Usage worker/Redis outage, duplicate, and dead-letter evidence."
         )
     metadata = (result_dir / "client-metadata.txt").read_text(
         encoding="utf-8", errors="replace"
@@ -1502,6 +1696,7 @@ def main():
         warnings.append("Fewer than three trials were recorded.")
 
     findings = capacity_findings(capacity, rate_sweep, comparisons, stream_pairs)
+    findings.extend(fault_recovery_findings(k6_rows))
     findings.extend(
         actionable_findings(
             resources,
@@ -1533,10 +1728,12 @@ def main():
         "rate_sweep": rate_sweep,
         "resources": resources,
         "client_resource": client_resource,
+        "images": images,
         "prometheus": prometheus,
         "performance_diagnostics": performance_diagnostics,
         "usage_evidence": usage,
         "usage_reconciliation": usage_reconciliation,
+        "usage_chaos": usage_chaos,
         "findings": findings,
         "warnings": warnings,
     }

@@ -98,10 +98,14 @@ func TestPostgresAPIKeyLifecycle(t *testing.T) {
 	if identity.TenantID != issued.TenantID || identity.APIKeyID != issued.ID || identity.KeyPrefix != issued.Prefix {
 		t.Errorf("Authenticate(valid key) identity = %+v, want tenant %q key %q prefix %q", identity, issued.TenantID, issued.ID, issued.Prefix)
 	}
-	if err := manager.AuthorizeModel(ctx, issued.TenantID, "model-a"); err != nil {
+	if err := manager.AuthorizeModel(ctx, identity, "model-a"); err != nil {
 		t.Fatalf("AuthorizeModel(allowed) error = %v", err)
 	}
-	requireErrorIs(t, manager.AuthorizeModel(ctx, issued.TenantID, "model-denied"), ErrModelNotAllowed)
+	requireErrorIs(
+		t,
+		manager.AuthorizeModel(ctx, identity, "model-denied"),
+		ErrModelNotAllowed,
+	)
 
 	unknown, err := generateToken(pepper)
 	if err != nil {

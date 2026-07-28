@@ -18,8 +18,8 @@ const identityGinKey = "model-velo.identity" // 身份在 Gin Context 中的存�
 type identityContextKey struct{} // 身份在标准 context.Context 中使用的专用键类型。
 
 type AccessController interface { // 认证与模型授权服务接口。
-	Authenticate(ctx context.Context, plaintext string) (apikey.Identity, error) // 验证网关 API Key 并返回租户身份。
-	AuthorizeModel(ctx context.Context, tenantID, model string) error            // 检查租户是否允许使用指定模型。
+	Authenticate(ctx context.Context, plaintext string) (apikey.Identity, error)      // 验证网关 API Key 并返回租户身份。
+	AuthorizeModel(ctx context.Context, identity apikey.Identity, model string) error // 使用认证快照检查模型权限。
 }
 
 type RateLimiter interface { // 租户限流服务接口。

@@ -16,21 +16,27 @@ import (
 )
 
 type Metrics struct {
-	registry         *prometheus.Registry
-	requests         *prometheus.CounterVec
-	requestDuration  *prometheus.HistogramVec
-	requestErrors    *prometheus.CounterVec
-	stageDuration    *prometheus.HistogramVec
-	inFlight         prometheus.Gauge
-	providerAttempts *prometheus.CounterVec
-	providerDuration *prometheus.HistogramVec
-	retries          *prometheus.CounterVec
-	fallbacks        *prometheus.CounterVec
-	cache            *prometheus.CounterVec
-	rateLimit        *prometheus.CounterVec
-	auth             *prometheus.CounterVec
-	usageDelivery    *prometheus.CounterVec
-	quota            *prometheus.CounterVec
+	registry          *prometheus.Registry
+	requests          *prometheus.CounterVec
+	requestDuration   *prometheus.HistogramVec
+	requestErrors     *prometheus.CounterVec
+	stageDuration     *prometheus.HistogramVec
+	inFlight          prometheus.Gauge
+	providerAttempts  *prometheus.CounterVec
+	providerDuration  *prometheus.HistogramVec
+	retries           *prometheus.CounterVec
+	fallbacks         *prometheus.CounterVec
+	cache             *prometheus.CounterVec
+	rateLimit         *prometheus.CounterVec
+	auth              *prometheus.CounterVec
+	authCache         *prometheus.CounterVec
+	authCacheDuration *prometheus.HistogramVec
+	authCacheEvents   *prometheus.CounterVec
+	authFallback      *prometheus.CounterVec
+	authDBQueries     prometheus.Histogram
+	authorization     *prometheus.CounterVec
+	usageDelivery     *prometheus.CounterVec
+	quota             *prometheus.CounterVec
 }
 
 func NewMetrics() *Metrics {
@@ -90,6 +96,35 @@ func NewMetrics() *Metrics {
 			Name: "model_velo_authentication_total",
 			Help: "Gateway authentication outcomes.",
 		}, []string{"result"}),
+		authCache: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "model_velo_auth_cache_lookups_total",
+			Help: "Authentication cache lookups by bounded layer and outcome.",
+		}, []string{"layer", "result"}),
+		authCacheDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "model_velo_auth_cache_lookup_duration_seconds",
+			Help: "Authentication cache lookup duration by bounded layer and outcome.",
+			Buckets: []float64{
+				0.00001, 0.000025, 0.00005, 0.0001, 0.00025,
+				0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025,
+			},
+		}, []string{"layer", "result"}),
+		authCacheEvents: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "model_velo_auth_cache_events_total",
+			Help: "Authentication cache writes, invalidations, evictions, and subscription outcomes.",
+		}, []string{"event", "result"}),
+		authFallback: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "model_velo_auth_postgres_fallback_total",
+			Help: "Authentication snapshot PostgreSQL fallback outcomes.",
+		}, []string{"result"}),
+		authDBQueries: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "model_velo_auth_postgres_queries",
+			Help:    "Physical PostgreSQL queries performed by one authentication request.",
+			Buckets: []float64{0, 1, 2, 3, 4, 5},
+		}),
+		authorization: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "model_velo_model_authorization_total",
+			Help: "Model authorization decisions made from authentication snapshots.",
+		}, []string{"result"}),
 		usageDelivery: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "model_velo_usage_delivery_total",
 			Help: "Usage delivery outcomes.",
@@ -112,6 +147,12 @@ func NewMetrics() *Metrics {
 		metrics.cache,
 		metrics.rateLimit,
 		metrics.auth,
+		metrics.authCache,
+		metrics.authCacheDuration,
+		metrics.authCacheEvents,
+		metrics.authFallback,
+		metrics.authDBQueries,
+		metrics.authorization,
 		metrics.usageDelivery,
 		metrics.quota,
 		prometheus.NewGoCollector(),
@@ -178,6 +219,43 @@ func (metrics *Metrics) BeginRequest() func(route, method string, status int, st
 func (metrics *Metrics) Authentication(result string) {
 	if metrics != nil {
 		metrics.auth.WithLabelValues(result).Inc()
+	}
+}
+
+func (metrics *Metrics) AuthCacheLookup(
+	layer string,
+	result string,
+	duration time.Duration,
+) {
+	if metrics == nil {
+		return
+	}
+	metrics.authCache.WithLabelValues(layer, result).Inc()
+	metrics.authCacheDuration.WithLabelValues(layer, result).
+		Observe(duration.Seconds())
+}
+
+func (metrics *Metrics) AuthCacheEvent(event, result string) {
+	if metrics != nil {
+		metrics.authCacheEvents.WithLabelValues(event, result).Inc()
+	}
+}
+
+func (metrics *Metrics) AuthPostgresFallback(result string) {
+	if metrics != nil {
+		metrics.authFallback.WithLabelValues(result).Inc()
+	}
+}
+
+func (metrics *Metrics) AuthDatabaseQueries(count int) {
+	if metrics != nil {
+		metrics.authDBQueries.Observe(float64(count))
+	}
+}
+
+func (metrics *Metrics) ModelAuthorization(result string) {
+	if metrics != nil {
+		metrics.authorization.WithLabelValues(result).Inc()
 	}
 }
 

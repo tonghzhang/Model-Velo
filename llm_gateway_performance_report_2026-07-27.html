@@ -1,0 +1,1100 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>LLM 网关性能公开证据报告｜2026-07-27</title>
+<style>
+  :root{
+    --bg:#f4f6f8;
+    --panel:#ffffff;
+    --panel-2:#f8fafc;
+    --ink:#17202a;
+    --muted:#5f6b78;
+    --line:#dce2e8;
+    --line-strong:#bcc6d0;
+    --accent:#1f6f78;
+    --accent-soft:#dff1f2;
+    --warn:#8a5b13;
+    --warn-bg:#fff7df;
+    --danger:#9b3030;
+    --danger-bg:#fff0ef;
+    --good:#276749;
+    --good-bg:#e9f7ef;
+    --shadow:0 10px 32px rgba(20,35,50,.08);
+    --radius:18px;
+    --gomodel:#0f766e;
+    --bifrost:#2563eb;
+    --portkey:#7c3aed;
+    --litellm-python:#d97706;
+    --litellm-rust:#ea580c;
+    --kong:#1d4ed8;
+    --ferro:#475569;
+    --agentgateway:#be123c;
+    --baseline:#64748b;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0;
+    background:
+      radial-gradient(circle at 10% 0%, rgba(31,111,120,.08), transparent 28rem),
+      linear-gradient(180deg,#f8fafb 0,#f4f6f8 20rem);
+    color:var(--ink);
+    font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+    line-height:1.62;
+    -webkit-font-smoothing:antialiased;
+  }
+  a{color:#0b6470;text-decoration-thickness:1px;text-underline-offset:3px}
+  a:hover{color:#083f47}
+  .shell{width:min(1440px,calc(100% - 36px));margin:0 auto}
+  header.hero{
+    padding:56px 0 34px;
+    border-bottom:1px solid var(--line);
+  }
+  .eyebrow{
+    display:inline-flex;gap:8px;align-items:center;
+    color:var(--accent);font-weight:800;letter-spacing:.12em;
+    font-size:12px;text-transform:uppercase;
+  }
+  .eyebrow::before{content:"";width:28px;height:2px;background:var(--accent)}
+  h1{font-size:clamp(34px,5vw,68px);line-height:1.02;margin:16px 0 18px;letter-spacing:-.045em;max-width:1000px}
+  .deck{max-width:980px;font-size:19px;color:#465361;margin:0}
+  .scope-strip{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:30px}
+  .scope-stat{
+    background:rgba(255,255,255,.78);border:1px solid var(--line);
+    border-radius:14px;padding:15px 17px;backdrop-filter:blur(8px);
+  }
+  .scope-stat strong{display:block;font-size:26px;line-height:1.1}
+  .scope-stat span{display:block;color:var(--muted);font-size:13px;margin-top:5px}
+  nav.report-nav{
+    position:sticky;top:0;z-index:40;
+    border-bottom:1px solid var(--line);
+    background:rgba(248,250,251,.93);
+    backdrop-filter:blur(12px);
+  }
+  .nav-inner{display:flex;align-items:center;gap:10px;min-height:58px;overflow-x:auto}
+  .nav-links{display:flex;gap:4px;align-items:center;white-space:nowrap}
+  .nav-links a{
+    color:#475569;text-decoration:none;padding:9px 11px;border-radius:9px;font-size:13px;font-weight:700;
+  }
+  .nav-links a:hover,.nav-links a.active{background:#e6eef0;color:#0e5962}
+  .nav-tools{margin-left:auto;display:flex;gap:8px;align-items:center;white-space:nowrap}
+  select,button{
+    font:inherit;border:1px solid var(--line-strong);background:#fff;color:var(--ink);
+    border-radius:9px;padding:8px 10px;
+  }
+  button{cursor:pointer;font-weight:700}
+  button:hover{background:#f1f5f7}
+  main{padding:30px 0 80px}
+  section{scroll-margin-top:74px;margin:0 0 38px}
+  .section-head{display:flex;align-items:flex-end;justify-content:space-between;gap:24px;margin-bottom:16px}
+  .section-head h2{font-size:clamp(26px,3vw,38px);line-height:1.12;margin:0;letter-spacing:-.025em}
+  .section-head p{margin:0;max-width:740px;color:var(--muted)}
+  .panel{
+    background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+    box-shadow:var(--shadow);padding:24px;margin:0 0 16px;
+  }
+  .panel.flat{box-shadow:none}
+  .panel h3{font-size:21px;line-height:1.25;margin:0 0 12px}
+  .panel h4{font-size:16px;margin:18px 0 8px}
+  .grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
+  .grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}
+  .grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}
+  .note{
+    border-left:4px solid var(--accent);background:var(--accent-soft);
+    padding:13px 15px;border-radius:0 12px 12px 0;color:#274b50;margin:12px 0;
+  }
+  .note.warn{border-left-color:#c68a21;background:var(--warn-bg);color:#67460f}
+  .note.danger{border-left-color:#c94545;background:var(--danger-bg);color:#742727}
+  .note.neutral{border-left-color:#94a3b8;background:#f1f5f9;color:#475569}
+  .mini{font-size:13px;color:var(--muted)}
+  .tag-row{display:flex;flex-wrap:wrap;gap:7px;margin:10px 0 0}
+  .tag{
+    display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);
+    background:#f8fafc;border-radius:999px;padding:4px 9px;font-size:12px;font-weight:750;color:#52606d;
+  }
+  .tag.vendor{background:#fff7df;border-color:#efd59a;color:#805815}
+  .tag.raw{background:#e9f7ef;border-color:#b9dfca;color:#276749}
+  .tag.limit{background:#fff0ef;border-color:#efc6c2;color:#8b3434}
+  .metric-def{padding:15px;border:1px solid var(--line);border-radius:13px;background:var(--panel-2)}
+  .metric-def strong{display:block;margin-bottom:4px}
+  .metric-def span{font-size:13px;color:var(--muted)}
+  .table-wrap{overflow:auto;border:1px solid var(--line);border-radius:13px;background:#fff}
+  table{width:100%;border-collapse:collapse;font-size:13.5px;min-width:760px}
+  caption{text-align:left;padding:13px 14px;background:#f8fafc;border-bottom:1px solid var(--line);font-weight:800;color:#344150}
+  th,td{padding:11px 12px;border-bottom:1px solid #e7ebef;text-align:right;vertical-align:top}
+  th{background:#f8fafc;color:#495666;font-size:12px;letter-spacing:.02em;position:sticky;top:0;z-index:2}
+  th:first-child,td:first-child{text-align:left;position:sticky;left:0;background:inherit;z-index:1}
+  thead th:first-child{z-index:3}
+  tbody tr:nth-child(even){background:#fbfcfd}
+  tbody tr:hover{background:#f1f6f7}
+  .num{font-variant-numeric:tabular-nums}
+  .na{color:#94a3b8}
+  .failed{color:var(--danger);font-weight:800}
+  .source-pill{
+    display:inline-flex;align-items:center;justify-content:center;
+    min-width:30px;padding:2px 7px;border-radius:999px;
+    background:#e8f1f3;color:#0d6470;font-size:11px;font-weight:900;text-decoration:none;
+  }
+  .suite-header{
+    display:grid;grid-template-columns:1fr auto;gap:18px;align-items:start;margin-bottom:18px;
+  }
+  .suite-header h3{font-size:28px;margin:0 0 8px;letter-spacing:-.02em}
+  .suite-meta{display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end}
+  .fact-strip{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;margin:16px 0}
+  .fact{
+    border:1px solid var(--line);background:#fafcfd;border-radius:12px;padding:12px;
+  }
+  .fact b{display:block;font-size:13px}
+  .fact span{display:block;color:var(--muted);font-size:12px;margin-top:4px}
+  .chart{
+    border:1px solid var(--line);border-radius:14px;padding:16px;background:linear-gradient(180deg,#fff,#fbfcfd);
+    min-height:220px;
+  }
+  .chart-head{display:flex;justify-content:space-between;gap:12px;align-items:start;margin-bottom:14px}
+  .chart h4{margin:0;font-size:15px}
+  .axis-note{font-size:11px;color:var(--muted);white-space:nowrap}
+  .bar-row{
+    display:grid;grid-template-columns:132px minmax(130px,1fr) 95px;gap:10px;align-items:center;
+    margin:10px 0;transition:opacity .2s,filter .2s;
+  }
+  .bar-label{font-size:12px;font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .bar-track{height:18px;background:#edf1f4;border-radius:999px;overflow:hidden;position:relative}
+  .bar-fill{height:100%;border-radius:999px;min-width:3px;transition:width .45s ease}
+  .bar-value{text-align:right;font-size:12px;font-weight:800;font-variant-numeric:tabular-nums}
+  .gateway-dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:7px;vertical-align:1px}
+  .coverage{min-width:1040px}
+  .coverage td,.coverage th{text-align:center}
+  .coverage td:first-child,.coverage th:first-child{text-align:left}
+  .cov-yes{font-weight:900;color:#176b4a}
+  .cov-part{font-weight:900;color:#996515}
+  .cov-no{color:#9aa5b1}
+  details{
+    border:1px solid var(--line);border-radius:13px;background:#fff;margin-top:12px;overflow:hidden;
+  }
+  details summary{cursor:pointer;padding:12px 14px;font-weight:800;background:#f8fafc}
+  details > div{padding:14px}
+  .profile-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
+  .profile{
+    border:1px solid var(--line);border-radius:16px;background:#fff;padding:19px;position:relative;
+    transition:opacity .2s,filter .2s,transform .2s;
+  }
+  .profile::before{content:"";position:absolute;left:0;top:0;bottom:0;width:5px;border-radius:16px 0 0 16px;background:var(--gateway-color,#64748b)}
+  .profile-head{display:flex;justify-content:space-between;gap:12px;align-items:start}
+  .profile h3{font-size:21px;margin:0}
+  .profile ul{margin:12px 0 0;padding-left:20px}
+  .profile li{margin:7px 0}
+  .evidence-table td:nth-child(3),.evidence-table td:nth-child(4),.evidence-table td:nth-child(5){text-align:center}
+  .callout-number{font-size:30px;font-weight:900;letter-spacing:-.04em;line-height:1}
+  .callout-label{font-size:12px;color:var(--muted);margin-top:6px}
+  .comparison-cards{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+  .compare-card{border:1px solid var(--line);border-radius:13px;padding:14px;background:#fbfcfd}
+  .compare-card .value{font-size:25px;font-weight:900;font-variant-numeric:tabular-nums}
+  .compare-card .label{font-size:12px;color:var(--muted)}
+  .final-summary{border:2px solid #174f57;background:linear-gradient(145deg,#f7ffff,#eaf5f6);box-shadow:0 18px 55px rgba(21,75,82,.13)}
+  .final-summary h2{font-size:38px;margin:0 0 18px;letter-spacing:-.03em}
+  .summary-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+  .summary-item{background:rgba(255,255,255,.78);border:1px solid #bfd4d7;border-radius:14px;padding:16px}
+  .summary-item strong{display:block;margin-bottom:6px}
+  .sources{counter-reset:source}
+  .source-item{
+    display:grid;grid-template-columns:44px 1fr;gap:10px;padding:12px 0;border-bottom:1px solid var(--line);
+    word-break:break-word;
+  }
+  .source-id{font-weight:900;color:#0d6470}
+  .source-item p{margin:0;color:#455261}
+  .source-item small{display:block;color:var(--muted);margin-top:4px}
+  .dim{opacity:.16!important;filter:grayscale(1)}
+  .highlight{outline:2px solid rgba(31,111,120,.5);outline-offset:2px}
+  footer{padding:24px 0 42px;border-top:1px solid var(--line);color:var(--muted);font-size:12px}
+  .print-only{display:none}
+  @media(max-width:1000px){
+    .scope-strip,.grid-4{grid-template-columns:repeat(2,minmax(0,1fr))}
+    .grid-3,.fact-strip{grid-template-columns:repeat(2,minmax(0,1fr))}
+    .grid-2,.profile-grid,.summary-grid{grid-template-columns:1fr}
+    .suite-header{grid-template-columns:1fr}
+    .suite-meta{justify-content:flex-start}
+    .nav-tools select{display:none}
+  }
+  @media(max-width:680px){
+    .shell{width:min(100% - 22px,1440px)}
+    header.hero{padding-top:34px}
+    .scope-strip,.grid-4,.grid-3,.fact-strip,.comparison-cards{grid-template-columns:1fr}
+    .panel{padding:17px}
+    .bar-row{grid-template-columns:104px minmax(95px,1fr) 76px;gap:7px}
+    .nav-tools button{display:none}
+    .section-head{display:block}
+    .section-head p{margin-top:8px}
+  }
+  @media print{
+    :root{--bg:#fff;--panel:#fff;--ink:#111;--muted:#444;--line:#bbb}
+    body{background:#fff;font-size:10.5pt}
+    nav.report-nav,.nav-tools{display:none!important}
+    .shell{width:100%;max-width:none;padding:0 8mm}
+    header.hero{padding:8mm 0 5mm}
+    h1{font-size:31pt}
+    section{break-inside:auto;margin-bottom:8mm}
+    .panel,.profile,.chart,details{box-shadow:none;break-inside:avoid}
+    details > div{display:block!important}
+    details summary{list-style:none}
+    .print-only{display:block}
+    a{color:#111;text-decoration:none}
+    .source-pill{border:1px solid #999;background:#fff;color:#111}
+  }
+</style>
+</head>
+<body>
+<header class="hero">
+  <div class="shell">
+    <div class="eyebrow">公开数据审阅 · 截止 2026-07-27 JST</div>
+    <h1>LLM 网关性能<br>公开证据报告</h1>
+    <p class="deck">
+      覆盖 GoModel、Bifrost、LiteLLM、Portkey、Kong AI Gateway、Ferro Labs AI Gateway 与 agentgateway。
+      本报告保留测试硬件、并发方式、上游模型、功能开关、版本与作者关系；不同测试套件的数据不合并成一张“总排名”。
+    </p>
+    <div class="scope-strip">
+      <div class="scope-stat"><strong>7</strong><span>网关产品</span></div>
+      <div class="scope-stat"><strong>8</strong><span>运行时路径（LiteLLM Python / Rust 分开）</span></div>
+      <div class="scope-stat"><strong>7</strong><span>公开基准组</span></div>
+      <div class="scope-stat"><strong>16</strong><span>核心原始来源与复现实物</span></div>
+    </div>
+  </div>
+</header>
+
+<nav class="report-nav">
+  <div class="shell nav-inner">
+    <div class="nav-links">
+      <a href="#method">读法</a>
+      <a href="#coverage">证据覆盖</a>
+      <a href="#gomodel-suite">GoModel 套件</a>
+      <a href="#aigatewaybench">AIGatewayBench</a>
+      <a href="#ferro-suite">Ferro 套件</a>
+      <a href="#official-suites">其他官方测试</a>
+      <a href="#profiles">网关事实卡</a>
+      <a href="#gaps">数据缺口</a>
+      <a href="#sources">来源</a>
+      <a href="#summary">最后总结</a>
+    </div>
+    <div class="nav-tools">
+      <label class="mini" for="gatewayFilter">高亮：</label>
+      <select id="gatewayFilter" aria-label="按网关高亮">
+        <option value="all">全部网关</option>
+        <option value="gomodel">GoModel</option>
+        <option value="bifrost">Bifrost</option>
+        <option value="litellm-python">LiteLLM Python</option>
+        <option value="litellm-rust">LiteLLM Rust beta</option>
+        <option value="portkey">Portkey</option>
+        <option value="kong">Kong</option>
+        <option value="ferro">Ferro</option>
+        <option value="agentgateway">agentgateway</option>
+      </select>
+      <button type="button" onclick="window.print()">打印 / PDF</button>
+    </div>
+  </div>
+</nav>
+
+<main class="shell">
+<section id="method">
+  <div class="section-head">
+    <h2>范围与阅读规则</h2>
+    <p>先看测试条件，再看数字。报告正文在结尾之前不做产品推荐，也不把不同硬件和不同功能开关下的结果混算。</p>
+  </div>
+
+  <div class="panel">
+    <div class="grid-3">
+      <div class="metric-def">
+        <strong>同一测试组内可横向比较</strong>
+        <span>同一主机、同一 mock 上游、同一负载生成器、相同功能开关时，网关之间的差异才有直接意义。</span>
+      </div>
+      <div class="metric-def">
+        <strong>跨测试组只看量级与一致性</strong>
+        <span>2 vCPU、8 vCPU、Kubernetes 集群、18 worker 本地容器的数据不能直接按 RPS 排队。</span>
+      </div>
+      <div class="metric-def">
+        <strong>“纯转发快”不等于“生产配置快”</strong>
+        <span>多数公开测试关闭了鉴权、数据库写入、预算、缓存、重试、Guardrail、详细日志或持久化。</span>
+      </div>
+    </div>
+    <div class="note warn">
+      公开基准几乎都由某个被测产品的项目方、供应商或相关贡献者发布。报告因此把“作者关系”和“可复现材料”放在数字旁边；没有把供应商自测包装成独立实验室结论。
+    </div>
+  </div>
+
+  <div class="grid-4">
+    <div class="metric-def"><strong>RPS / QPS</strong><span>每秒完成请求数。必须同时看错误率、并发数、响应体大小和上游延迟。</span></div>
+    <div class="metric-def"><strong>p50 / p95 / p99</strong><span>50%、95%、99% 请求不超过该延迟。p99 更能暴露排队和长尾。</span></div>
+    <div class="metric-def"><strong>Added latency</strong><span>网关路径延迟减去直连 mock 的延迟，试图隔离网关自身开销。</span></div>
+    <div class="metric-def"><strong>TTFT</strong><span>流式响应收到首个事件/首字节的时间；与总响应时间不是同一指标。</span></div>
+    <div class="metric-def"><strong>Peak RSS</strong><span>进程峰值常驻内存。多 worker / 多实例时通常近似随进程数放大。</span></div>
+    <div class="metric-def"><strong>Cold start</strong><span>容器或进程启动至可服务的时间。受镜像、依赖、迁移和健康检查影响。</span></div>
+    <div class="metric-def"><strong>Mock upstream</strong><span>固定、快速的假 LLM。适合隔离代理开销，但不覆盖真实模型波动与网络。</span></div>
+    <div class="metric-def"><strong>Feature parity</strong><span>相同端点并不保证相同鉴权、记账、重试、缓存、路由或协议转换工作量。</span></div>
+  </div>
+</section>
+
+<section id="coverage">
+  <div class="section-head">
+    <h2>公开证据覆盖矩阵</h2>
+    <p>“出现”表示该产品在该套件中有可识别数字；不代表套件作者独立，也不代表启用了完整生产功能。</p>
+  </div>
+
+  <div class="panel">
+    <div class="table-wrap">
+      <table class="coverage">
+        <caption>网关 × 测试套件覆盖（版本写在对应章节）</caption>
+        <thead>
+          <tr>
+            <th>产品 / 路径</th>
+            <th>GoModel AWS<br>统一测试</th>
+            <th>AIGatewayBench<br>统一测试</th>
+            <th>Ferro<br>统一测试</th>
+            <th>Kong EKS<br>统一测试</th>
+            <th>项目方单项<br>性能测试</th>
+            <th>公开流式<br>数据</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr data-gateway="gomodel"><td><span class="gateway-dot" style="background:var(--gomodel)"></span>GoModel</td><td class="cov-yes">●</td><td class="cov-no">—</td><td class="cov-no">—</td><td class="cov-no">—</td><td class="cov-yes">同一套件</td><td class="cov-yes">●</td></tr>
+          <tr data-gateway="bifrost"><td><span class="gateway-dot" style="background:var(--bifrost)"></span>Bifrost</td><td class="cov-yes">●</td><td class="cov-yes">●</td><td class="cov-yes">●</td><td class="cov-no">—</td><td class="cov-yes">●</td><td class="cov-part">部分</td></tr>
+          <tr data-gateway="litellm-python"><td><span class="gateway-dot" style="background:var(--litellm-python)"></span>LiteLLM Python</td><td class="cov-yes">●</td><td class="cov-yes">●</td><td class="cov-yes">●</td><td class="cov-yes">●</td><td class="cov-yes">●</td><td class="cov-yes">●</td></tr>
+          <tr data-gateway="litellm-rust"><td><span class="gateway-dot" style="background:var(--litellm-rust)"></span>LiteLLM Rust beta</td><td class="cov-no">—</td><td class="cov-yes">●</td><td class="cov-no">—</td><td class="cov-no">—</td><td class="cov-yes">●</td><td class="cov-part">仍在补齐</td></tr>
+          <tr data-gateway="portkey"><td><span class="gateway-dot" style="background:var(--portkey)"></span>Portkey OSS</td><td class="cov-yes">●</td><td class="cov-yes">●</td><td class="cov-yes">●</td><td class="cov-yes">●</td><td class="cov-no">未找到同级公开表</td><td class="cov-part">部分</td></tr>
+          <tr data-gateway="kong"><td><span class="gateway-dot" style="background:var(--kong)"></span>Kong AI Gateway</td><td class="cov-no">—</td><td class="cov-no">—</td><td class="cov-yes">●</td><td class="cov-yes">●</td><td class="cov-yes">同一套件</td><td class="cov-no">未见统一表</td></tr>
+          <tr data-gateway="ferro"><td><span class="gateway-dot" style="background:var(--ferro)"></span>Ferro Labs</td><td class="cov-no">—</td><td class="cov-no">—</td><td class="cov-yes">●</td><td class="cov-no">—</td><td class="cov-yes">同一套件</td><td class="cov-part">套件声称覆盖</td></tr>
+          <tr data-gateway="agentgateway"><td><span class="gateway-dot" style="background:var(--agentgateway)"></span>agentgateway</td><td class="cov-no">—</td><td class="cov-no">—</td><td class="cov-no">—</td><td class="cov-no">—</td><td class="cov-yes">●</td><td class="cov-no">该文未测</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="panel flat">
+    <h3>测试套件的证据元数据</h3>
+    <div class="table-wrap">
+      <table class="evidence-table">
+        <thead>
+          <tr><th>套件</th><th>发布方与关系</th><th>脚本</th><th>原始结果</th><th>硬件 / 版本</th><th>主要限制</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>GoModel AWS 2026-06-25</td><td>GoModel 项目方；被测产品作者</td><td>有</td><td>有</td><td>披露；镜像摘要留档</td><td>仅 2 vCPU；多数生产功能关闭；GoModel 尚无外部复测</td></tr>
+          <tr><td>AIGatewayBench 2026-07</td><td>LiteLLM 项目方；Rust 路径作者</td><td>有</td><td>CSV 已提交</td><td>版本披露；单主机</td><td>无重复试验误差条；只测转发路径；Rust 为 early beta</td></tr>
+          <tr><td>Ferro 多网关套件</td><td>Ferro Labs；被测产品作者</td><td>有</td><td>有报告</td><td>披露</td><td>Portkey 以 Docker 运行，其余原生；Bifrost 默认池配置成为瓶颈</td></tr>
+          <tr><td>Kong EKS 2025-07</td><td>Kong；被测产品作者</td><td>有</td><td>图表 / 基础设施材料</td><td>披露</td><td>版本较旧；仅代理，无鉴权、缓存等策略；精确结果主要在图片</td></tr>
+          <tr><td>Bifrost 官方</td><td>Maxim / Bifrost；被测产品作者</td><td>有独立 benchmark 文档</td><td>汇总表</td><td>披露</td><td>500 RPS 对比与 5k 调优压力测试不是同一场景</td></tr>
+          <tr><td>LiteLLM 官方</td><td>LiteLLM；被测产品作者</td><td>部分公开</td><td>汇总表 / CSV</td><td>披露</td><td>稳定 Python 与 Rust beta 必须分开看</td></tr>
+          <tr><td>agentgateway 2026-06</td><td>项目贡献者；agentgateway 相关方</td><td>有</td><td>文章粘贴原始输出</td><td>镜像版本披露；发布机器规格未披露</td><td>18 个 LiteLLM worker；3 秒跑满测试很短；资源结果强依赖进程数</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section id="gomodel-suite">
+  <div class="section-head">
+    <h2>GoModel AWS 统一测试</h2>
+    <p>四个网关在同一台 2 vCPU / 4 GiB AWS 实例上连接同一即时 mock；这一节中的数字可在本节内比较。</p>
+  </div>
+
+  <div class="panel">
+    <div class="suite-header">
+      <div>
+        <h3>2026-06-25 · AWS c7i.large</h3>
+        <p>
+          每个协议变体 8,000 请求、并发 10、两次随机顺序试验；容量扫描并发为 1 / 16 / 128。
+          全部关闭重试，GoModel 关闭熔断，LiteLLM Python 使用 2 个 worker（每个 CPU 核一个）。
+        </p>
+      </div>
+      <div class="suite-meta">
+        <span class="tag vendor">作者：GoModel 项目方</span>
+        <span class="tag raw">原始 JSON / CSV / 脚本</span>
+        <a class="source-pill" href="#s1">S1</a><a class="source-pill" href="#s2">S2</a>
+      </div>
+    </div>
+
+    <div class="fact-strip">
+      <div class="fact"><b>主机</b><span>AWS c7i.large<br>2 vCPU / 4 GiB</span></div>
+      <div class="fact"><b>上游</b><span>共享即时 mock<br>隔离代理开销</span></div>
+      <div class="fact"><b>协议</b><span>Chat / Responses / Messages<br>流式与非流式</span></div>
+      <div class="fact"><b>延迟样本</b><span>8,000 × 2 次 / 变体<br>取两次中位结果</span></div>
+      <div class="fact"><b>功能开关</b><span>重试关闭<br>无完整生产插件栈</span></div>
+    </div>
+
+    <div class="grid-2">
+      <div class="chart bar-chart" data-max="40" data-unit=" ms" data-scale="linear">
+        <div class="chart-head"><h4>Chat 非流式 p99</h4><span class="axis-note">越短越好 · 同套件</span></div>
+        <div class="bar-row" data-gateway="gomodel" data-value="6.88"><div class="bar-label"><span class="gateway-dot" style="background:var(--gomodel)"></span>GoModel</div><div class="bar-track"><div class="bar-fill"></div></div><div class="bar-value"></div></div>
+        <div class="bar-row" data-gateway="bifrost" data-value="18.27"><div class="bar-label"><span class="gateway-dot" style="background:var(--bifrost)"></span>Bifrost</div><div class="bar-track"><div class="bar-fill"></div></div><div class="bar-value"></div></div>
+        <div class="bar-row" data-gateway="portkey" data-value="30.54"><div class="bar-label"><span class="gateway-dot" style="background:var(--portkey)"></span>Portkey</div><div class="bar-track"><div class="bar-fill"></div></div><div class="bar-value"></div></div>
+        <div class="bar-row" data-gateway="litellm-python" data-value="39.26"><div class="bar-label"><span class="gateway-dot" style="background:var(--litellm-python)"></span>LiteLLM Python</div><div class="bar-track"><div class="bar-fill"></div></div><div class="bar-value"></div></div>
+      </div>
+
+      <div class="chart bar-chart" data-max="5000" data-unit=" req/s" data-scale="linear">
+        <div class="chart-head"><h4>Chat 非流式峰值持续吞吐</h4><span class="axis-note">越长越高 · 同套件</span></div>
+        <div class="bar-row" data-gateway="gomodel" data-value="4928"><div class="bar-label"><span class="gateway-dot" style="background:var(--gomodel)"></span>GoModel</div><div class="bar-track"><div class="bar-fill"></div></div><div class="bar-value"></div></div>
+        <div class="bar-row" data-gateway="bifrost" data-value="3088"><div class="bar-label"><span class="gateway-dot" style="background:var(--bifrost)"></span>Bifrost</div><div class="bar-track"><div class="bar-fill"></div></div><div class="bar-value"></div></div>
+        <div class="bar-row" data-gateway="portkey" data-value="946"><div class="bar-label"><span class="gateway-dot" style="background:var(--portkey)"></span>Portkey</div><div class="bar-track"><div class="bar-fill"></div></div><div class="bar-value"></div></div>
+        <div class="bar-row" data-gateway="litellm-python" data-value="324"><div class="bar-label"><span class="gateway-dot" style="background:var(--litellm-python)"></span>LiteLLM Python</div><div class="bar-track"><div class="bar-fill"></div></div><div class="bar-value"></div></div>
+      </div>
+
+      <div class="chart bar-chart" data-max="2300" data-unit=" MB" data-scale="log">
+        <div class="chart-head"><h4>负载下峰值 RSS</h4><span class="axis-note">对数长度 · 数字为原值</span></div>
+        <div class="bar-row" data-gateway="gomodel" data-value="37"><div class="bar-label"><span class="gateway-dot" style="background:var(--gomodel)"></span>GoModel</div><div class="bar-track"><div class="bar-fill"></div></div><div class="bar-value"></div></div>
+        <div class="bar-row" data-gateway="portkey" data-value="112"><div class="bar-label"><span class="gateway-dot" style="background:var(--portkey)"></span>Portkey</div><div class="bar-track"><div class="bar-fill"></div></div><div class="bar-value"></div></div>
+        <div class="bar-row" data-gateway="bifrost" data-value="143"><div class="bar-label"><span class="gateway-dot" style="background:var(--bifrost)"></span>Bifrost</div><div class="bar-track"><div class="bar-fill"></div></div><div class="bar-value"></div></div>
+        <div class="bar-row" data-gateway="litellm-python" data-value="2272.3"><div class="bar-label"><span class="gateway-dot" style="background:var(--litellm-python)"></span>LiteLLM Python</div><div class="bar-track"><div class="bar-fill"></div></div><div class="bar-value"></div></div>
+      </div>
+
+      <div class="chart bar-chart" data-max="160" data-unit=" ms" data-scale="linear">
+        <div class="chart-head"><h4>Chat 流式 TTFT p50</h4><span class="axis-note">越短越好 · 同套件</span></div>
+        <div class="bar-row" data-gateway="gomodel" data-value="4.71"><div class="bar-label"><span class="gateway-dot" style="background:var(--gomodel)"></span>GoModel</div><div class="bar-track"><div class="bar-fill"></div></div><div class="bar-value"></div></div>
+        <div class="bar-row" data-gateway="bifrost" data-value="9.02"><div class="bar-label"><span class="gateway-dot" style="background:var(--bifrost)"></span>Bifrost</div><div class="bar-track"><div class="bar-fill"></div></div><div class="bar-value"></div></div>
+        <div class="bar-row" data-gateway="portkey" data-value="27.97"><div class="bar-label"><span class="gateway-dot" style="background:var(--portkey)"></span>Portkey</div><div class="bar-track"><div class="bar-fill"></div></div><div class="bar-value"></div></div>
+        <div class="bar-row" data-gateway="litellm-python" data-value="151.94"><div class="bar-label"><span class="gateway-dot" style="background:var(--litellm-python)"></span>LiteLLM Python</div><div class="bar-track"><div class="bar-fill"></div></div><div class="bar-value"></div></div>
+      </div>
+    </div>
+
+    <details open>
+      <summary>完整延迟、吞吐和资源表</summary>
+      <div>
+        <div class="table-wrap">
+          <table>
+            <caption>非流式延迟（ms；两次试验结果的中位数）</caption>
+            <thead><tr><th>工作负载 / 指标</th><th>直连 baseline</th><th>GoModel</th><th>Bifrost</th><th>Portkey</th><th>LiteLLM Python</th></tr></thead>
+            <tbody>
+              <tr><td>Chat p50</td><td>0.23</td><td data-gateway="gomodel">1.81</td><td data-gateway="bifrost">2.51</td><td data-gateway="portkey">9.70</td><td data-gateway="litellm-python">30.56</td></tr>
+              <tr><td>Chat p99</td><td>2.77</td><td data-gateway="gomodel">6.88</td><td data-gateway="bifrost">18.27</td><td data-gateway="portkey">30.54</td><td data-gateway="litellm-python">39.26</td></tr>
+              <tr><td>Responses p50</td><td>0.26</td><td data-gateway="gomodel">2.01</td><td data-gateway="bifrost">2.73</td><td data-gateway="portkey">9.07</td><td data-gateway="litellm-python">39.12</td></tr>
+              <tr><td>Responses p99</td><td>2.33</td><td data-gateway="gomodel">7.28</td><td data-gateway="bifrost">16.55</td><td data-gateway="portkey">26.92</td><td data-gateway="litellm-python">48.60</td></tr>
+              <tr><td>Anthropic Messages p50</td><td>0.26</td><td data-gateway="gomodel">1.76</td><td data-gateway="bifrost">2.65</td><td data-gateway="portkey" class="na">此设置不支持</td><td data-gateway="litellm-python">61.06</td></tr>
+              <tr><td>Anthropic Messages p99</td><td>2.23</td><td data-gateway="gomodel">6.59</td><td data-gateway="bifrost">19.08</td><td data-gateway="portkey" class="na">此设置不支持</td><td data-gateway="litellm-python">98.12</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <br>
+        <div class="table-wrap">
+          <table>
+            <caption>流式延迟 p50（ms）</caption>
+            <thead><tr><th>工作负载 / 指标</th><th>GoModel</th><th>Bifrost</th><th>Portkey</th><th>LiteLLM Python</th></tr></thead>
+            <tbody>
+              <tr><td>Chat TTFT</td><td data-gateway="gomodel">4.71</td><td data-gateway="bifrost">9.02</td><td data-gateway="portkey">27.97</td><td data-gateway="litellm-python">151.94</td></tr>
+              <tr><td>Chat total</td><td data-gateway="gomodel">4.95</td><td data-gateway="bifrost">11.89</td><td data-gateway="portkey">27.98</td><td data-gateway="litellm-python">151.95</td></tr>
+              <tr><td>Responses TTFT</td><td data-gateway="gomodel">4.69</td><td data-gateway="bifrost">12.87</td><td data-gateway="portkey">27.90</td><td data-gateway="litellm-python">47.53</td></tr>
+              <tr><td>Responses total</td><td data-gateway="gomodel">5.00</td><td data-gateway="bifrost">14.94</td><td data-gateway="portkey">27.93</td><td data-gateway="litellm-python">47.55</td></tr>
+              <tr><td>Messages TTFT</td><td data-gateway="gomodel">7.50</td><td data-gateway="bifrost" class="na">无终止事件，10s 内 0 完成</td><td data-gateway="portkey" class="na">此设置不支持</td><td data-gateway="litellm-python">48.86</td></tr>
+              <tr><td>Messages total</td><td data-gateway="gomodel">8.38</td><td data-gateway="bifrost" class="na">同上</td><td data-gateway="portkey" class="na">此设置不支持</td><td data-gateway="litellm-python">48.89</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <br>
+        <div class="table-wrap">
+          <table>
+            <caption>Chat 非流式容量扫描（req/s）</caption>
+            <thead><tr><th>网关</th><th>并发 1</th><th>并发 16</th><th>并发 128</th><th>峰值</th></tr></thead>
+            <tbody>
+              <tr><td>直连 baseline</td><td>15,510</td><td>29,701</td><td>30,015</td><td>30,015</td></tr>
+              <tr data-gateway="gomodel"><td>GoModel</td><td>2,745</td><td>4,928</td><td>4,567</td><td>4,928</td></tr>
+              <tr data-gateway="bifrost"><td>Bifrost</td><td>1,885</td><td>3,088</td><td>2,904</td><td>3,088</td></tr>
+              <tr data-gateway="portkey"><td>Portkey</td><td>636</td><td>946</td><td>900</td><td>946</td></tr>
+              <tr data-gateway="litellm-python"><td>LiteLLM Python</td><td>227</td><td>324</td><td>254</td><td>324</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <br>
+        <div class="table-wrap">
+          <table>
+            <caption>镜像、启动与资源</caption>
+            <thead><tr><th>指标</th><th>GoModel</th><th>Portkey</th><th>Bifrost</th><th>LiteLLM Python</th></tr></thead>
+            <tbody>
+              <tr><td>压缩镜像（MB）</td><td data-gateway="gomodel">16</td><td data-gateway="portkey">59</td><td data-gateway="bifrost">77</td><td data-gateway="litellm-python">372</td></tr>
+              <tr><td>磁盘镜像（MB）</td><td data-gateway="gomodel">47.2</td><td data-gateway="portkey">177.4</td><td data-gateway="bifrost">230.7</td><td data-gateway="litellm-python">1,159.9</td></tr>
+              <tr><td>Cold start（s）</td><td data-gateway="gomodel">0.56</td><td data-gateway="portkey">1.05</td><td data-gateway="bifrost">7.07</td><td data-gateway="litellm-python">25.49</td></tr>
+              <tr><td>峰值 RSS（MB）</td><td data-gateway="gomodel">37.0</td><td data-gateway="portkey">112.0</td><td data-gateway="bifrost">143.0</td><td data-gateway="litellm-python">2,272.3</td></tr>
+              <tr><td>平均 CPU（%）</td><td data-gateway="gomodel">92.6</td><td data-gateway="portkey">116.9</td><td data-gateway="bifrost">117.6</td><td data-gateway="litellm-python">101.1</td></tr>
+              <tr><td>资源窗口持续 RPS</td><td data-gateway="gomodel">4,824</td><td data-gateway="portkey">960</td><td data-gateway="bifrost">2,977</td><td data-gateway="litellm-python">261</td></tr>
+              <tr><td>RPS / CPU%</td><td data-gateway="gomodel">52.1</td><td data-gateway="portkey">8.2</td><td data-gateway="bifrost">25.3</td><td data-gateway="litellm-python">2.6</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </details>
+
+    <div class="note neutral">
+      范围限制：GoModel、Bifrost、Portkey 使用当时镜像，LiteLLM 为 <code>main-stable</code> 且 2 worker；测试记录了镜像摘要。
+      Portkey 的 Messages 缺失是该单 Provider → OpenAI mock 配置限制，不应外推为产品绝对不支持 Anthropic Messages。
+    </div>
+  </div>
+</section>
+
+<section id="aigatewaybench">
+  <div class="section-head">
+    <h2>AIGatewayBench</h2>
+    <p>LiteLLM 项目方在 2026 年 7 月发布的可复现套件，比较 Rust early beta、Python v1、Bifrost v1.6.4 与当前 Portkey OSS。</p>
+  </div>
+
+  <div class="panel">
+    <div class="suite-header">
+      <div>
+        <h3>单主机确定性 Rust mock · Anthropic Messages 转发路径</h3>
+        <p>
+          通过“网关路径 p99 − 直连 mock p99”计算 added latency；关闭日志 callback、支出追踪和持久化。
+          原始 CSV、负载驱动器与每个网关的启动说明均已公开。
+        </p>
+      </div>
+      <div class="suite-meta">
+        <span class="tag vendor">作者：LiteLLM 项目方</span>
+        <span class="tag raw">CSV 已提交</span>
+        <span class="tag limit">Rust：early beta</span>
+        <a class="source-pill" href="#s3">S3</a><a class="source-pill" href="#s4">S4</a><a class="source-pill" href="#s5">S5</a><a class="source-pill" href="#s6">S6</a>
+      </div>
+    </div>
+
+    <div class="grid-2">
+      <div class="chart bar-chart" data-max="260" data-unit=" ms" data-scale="log">
+        <div class="chart-head"><h4>p99 Added latency</h4><span class="axis-note">对数长度 · 数字为原值</span></div>
+        <div class="bar-row" data-gateway="litellm-rust" data-value="0.66"><div class="bar-label"><span class="gateway-dot" style="background:var(--litellm-rust)"></span>LiteLLM Rust</div><div class="bar-track"><div class="bar-fill"></div></div><div class="bar-value"></div></div>
+        <div class="bar-row" data-gateway="litellm-python" data-value="257.734"><div class="bar-label"><span class="gateway-dot" style="background:var(--litellm-python)"></span>LiteLLM Python</div><div class="bar-track"><div class="bar-fill"></div></div><div class="bar-value"></div></div>
+        <div class="bar-row" data-gateway="bifrost" data-value="4.544"><div class="bar-label"><span class="gateway-dot" style="background:var(--bifrost)"></span>Bifrost</div><div class="bar-track"><div class="bar-fill"></div></div><div class="bar-value"></div></div>
+        <div class="bar-row" data-gateway="portkey" data-value="2.289"><div class="bar-label"><span class="gateway-dot" style="background:var(--portkey)"></span>Portkey</div><div class="bar-track"><div class="bar-fill"></div></div><div class="bar-value"></div></div>
+      </div>
+
+      <div class="chart bar-chart" data-max="340" data-unit=" MB" data-scale="linear">
+        <div class="chart-head"><h4>峰值 RSS</h4><span class="axis-note">越短越低 · 同套件</span></div>
+        <div class="bar-row" data-gateway="litellm-rust" data-value="21.848"><div class="bar-label"><span class="gateway-dot" style="background:var(--litellm-rust)"></span>LiteLLM Rust</div><div class="bar-track"><div class="bar-fill"></div></div><div class="bar-value"></div></div>
+        <div class="bar-row" data-gateway="litellm-python" data-value="329.454"><div class="bar-label"><span class="gateway-dot" style="background:var(--litellm-python)"></span>LiteLLM Python</div><div class="bar-track"><div class="bar-fill"></div></div><div class="bar-value"></div></div>
+        <div class="bar-row" data-gateway="bifrost" data-value="199.074"><div class="bar-label"><span class="gateway-dot" style="background:var(--bifrost)"></span>Bifrost</div><div class="bar-track"><div class="bar-fill"></div></div><div class="bar-value"></div></div>
+        <div class="bar-row" data-gateway="portkey" data-value="90.44"><div class="bar-label"><span class="gateway-dot" style="background:var(--portkey)"></span>Portkey</div><div class="bar-track"><div class="bar-fill"></div></div><div class="bar-value"></div></div>
+      </div>
+    </div>
+
+    <h4>并发 64 的同一测点</h4>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>路径</th><th>直连 p99</th><th>网关 p99</th><th>Added p99</th><th>网关 RPS</th><th>错误</th></tr></thead>
+        <tbody>
+          <tr data-gateway="litellm-rust"><td>LiteLLM Rust beta</td><td>24.015 ms</td><td>64.299 ms</td><td>40.284 ms</td><td>2,722.17</td><td>0</td></tr>
+          <tr data-gateway="litellm-python"><td>LiteLLM Python v1</td><td>24.015 ms</td><td>570.058 ms</td><td>546.043 ms</td><td>179.75</td><td>0</td></tr>
+          <tr data-gateway="bifrost"><td>Bifrost v1.6.4</td><td>24.015 ms</td><td>52.699 ms</td><td>28.683 ms</td><td>2,719.08</td><td>0</td></tr>
+          <tr data-gateway="portkey"><td>Portkey OSS</td><td>24.015 ms</td><td>132.434 ms</td><td>108.419 ms</td><td>1,360.26</td><td>0</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <details>
+      <summary>查看并发 1 / 4 / 16 / 64 全表</summary>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>路径</th><th>并发</th><th>网关 p99（ms）</th><th>Added p99（ms）</th><th>网关 RPS</th><th>错误</th></tr></thead>
+          <tbody>
+            <tr data-gateway="litellm-rust"><td>LiteLLM Rust</td><td>1</td><td>22.869</td><td>0.887</td><td>45.25</td><td>0</td></tr>
+            <tr data-gateway="litellm-python"><td>LiteLLM Python</td><td>1</td><td>31.767</td><td>9.785</td><td>34.38</td><td>0</td></tr>
+            <tr data-gateway="bifrost"><td>Bifrost</td><td>1</td><td>22.730</td><td>0.749</td><td>44.82</td><td>0</td></tr>
+            <tr data-gateway="portkey"><td>Portkey</td><td>1</td><td>24.763</td><td>2.781</td><td>43.16</td><td>0</td></tr>
+            <tr data-gateway="litellm-rust"><td>LiteLLM Rust</td><td>4</td><td>23.034</td><td>0.610</td><td>181.24</td><td>0</td></tr>
+            <tr data-gateway="litellm-python"><td>LiteLLM Python</td><td>4</td><td>49.374</td><td>26.950</td><td>92.71</td><td>0</td></tr>
+            <tr data-gateway="bifrost"><td>Bifrost</td><td>4</td><td>23.053</td><td>0.629</td><td>180.23</td><td>0</td></tr>
+            <tr data-gateway="portkey"><td>Portkey</td><td>4</td><td>25.200</td><td>2.776</td><td>174.04</td><td>0</td></tr>
+            <tr data-gateway="litellm-rust"><td>LiteLLM Rust</td><td>16</td><td>23.001</td><td>0.327</td><td>721.79</td><td>0</td></tr>
+            <tr data-gateway="litellm-python"><td>LiteLLM Python</td><td>16</td><td>274.018</td><td>251.345</td><td>158.39</td><td>0</td></tr>
+            <tr data-gateway="bifrost"><td>Bifrost</td><td>16</td><td>23.564</td><td>0.891</td><td>722.67</td><td>0</td></tr>
+            <tr data-gateway="portkey"><td>Portkey</td><td>16</td><td>30.912</td><td>8.238</td><td>673.60</td><td>0</td></tr>
+            <tr data-gateway="litellm-rust"><td>LiteLLM Rust</td><td>64</td><td>64.299</td><td>40.284</td><td>2,722.17</td><td>0</td></tr>
+            <tr data-gateway="litellm-python"><td>LiteLLM Python</td><td>64</td><td>570.058</td><td>546.043</td><td>179.75</td><td>0</td></tr>
+            <tr data-gateway="bifrost"><td>Bifrost</td><td>64</td><td>52.699</td><td>28.683</td><td>2,719.08</td><td>0</td></tr>
+            <tr data-gateway="portkey"><td>Portkey</td><td>64</td><td>132.434</td><td>108.419</td><td>1,360.26</td><td>0</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </details>
+
+    <h4>套件给出的资源成本模型（不是云账单）</h4>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>路径</th><th>保留测点持续 RPS</th><th>估算小时资源成本</th><th>RPS / 美元·小时</th><th>测点 p99</th></tr></thead>
+        <tbody>
+          <tr data-gateway="litellm-rust"><td>LiteLLM Rust beta</td><td>2,814.35</td><td>$0.00992</td><td>283,833</td><td>26.945 ms</td></tr>
+          <tr data-gateway="litellm-python"><td>LiteLLM Python</td><td>177.48</td><td>$0.04131</td><td>4,296</td><td>557.356 ms</td></tr>
+          <tr data-gateway="bifrost"><td>Bifrost</td><td>2,744.12</td><td>$0.04339</td><td>63,246</td><td>32.212 ms</td></tr>
+          <tr data-gateway="portkey"><td>Portkey</td><td>1,095.53</td><td>$0.06098</td><td>17,964</td><td>299.744 ms</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="note warn">
+      成本模型使用固定单价（vCPU 与 GB·小时）把本地 CPU、RSS 和吞吐换算成美元，不含模型 token 费用、数据库、Redis、日志、网络、控制平面与冗余副本。它适合比较该套件内的资源量级，不是采购报价。
+    </div>
+  </div>
+</section>
+
+<section id="ferro-suite">
+  <div class="section-head">
+    <h2>Ferro 多网关统一测试</h2>
+    <p>GCP n2-standard-8（8 vCPU / 32 GB）、Debian 12、固定 60ms mock。该套件把 Ferro、Kong、Bifrost、LiteLLM 与 Portkey 放在同一负载配置下。</p>
+  </div>
+
+  <div class="panel">
+    <div class="suite-header">
+      <div>
+        <h3>150 → 1,000 并发用户的吞吐与资源</h3>
+        <p>Ferro、Kong、Bifrost、LiteLLM 以原生进程运行；Portkey 以 Docker host network 运行。版本与设置由套件记录。</p>
+      </div>
+      <div class="suite-meta">
+        <span class="tag vendor">作者：Ferro Labs</span>
+        <span class="tag raw">脚本 / 配置 / 报告</span>
+        <a class="source-pill" href="#s7">S7</a>
+      </div>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <caption>吞吐（RPS）与内存；“失败/未测”不按 0 吞吐参与比较</caption>
+        <thead><tr><th>网关 / 版本</th><th>150 VU</th><th>300 VU</th><th>500 VU</th><th>1,000 VU</th><th>报告内存</th></tr></thead>
+        <tbody>
+          <tr data-gateway="ferro"><td>Ferro Labs v1.0.0</td><td>2,447</td><td>4,890</td><td>8,014</td><td>13,925</td><td>32–135 MB</td></tr>
+          <tr data-gateway="kong"><td>Kong OSS 3.9.1</td><td>2,443</td><td>4,885</td><td>8,133</td><td>15,891</td><td>43 MB（报告称近似平坦）</td></tr>
+          <tr data-gateway="bifrost"><td>Bifrost v1.0.0</td><td>2,441</td><td class="failed">连接池饥饿</td><td class="failed">连接池饥饿</td><td class="failed">连接池饥饿</td><td>107–333 MB</td></tr>
+          <tr data-gateway="litellm-python"><td>LiteLLM 1.82.6</td><td>175</td><td class="na">未继续测</td><td class="na">未继续测</td><td class="na">未继续测</td><td>335–1,124 MB</td></tr>
+          <tr data-gateway="portkey"><td>Portkey latest</td><td>851</td><td>843</td><td>855</td><td>891</td><td>67 MB</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="grid-2" style="margin-top:16px">
+      <div class="chart bar-chart" data-max="2500" data-unit=" req/s" data-scale="linear">
+        <div class="chart-head"><h4>150 VU：所有五个网关均有测点</h4><span class="axis-note">同套件</span></div>
+        <div class="bar-row" data-gateway="ferro" data-value="2447"><div class="bar-label"><span class="gateway-dot" style="background:var(--ferro)"></span>Ferro</div><div class="bar-track"><div class="bar-fill"></div></div><div class="bar-value"></div></div>
+        <div class="bar-row" data-gateway="kong" data-value="2443"><div class="bar-label"><span class="gateway-dot" style="background:var(--kong)"></span>Kong</div><div class="bar-track"><div class="bar-fill"></div></div><div class="bar-value"></div></div>
+        <div class="bar-row" data-gateway="bifrost" data-value="2441"><div class="bar-label"><span class="gateway-dot" style="background:var(--bifrost)"></span>Bifrost</div><div class="bar-track"><div class="bar-fill"></div></div><div class="bar-value"></div></div>
+        <div class="bar-row" data-gateway="litellm-python" data-value="175"><div class="bar-label"><span class="gateway-dot" style="background:var(--litellm-python)"></span>LiteLLM</div><div class="bar-track"><div class="bar-fill"></div></div><div class="bar-value"></div></div>
+        <div class="bar-row" data-gateway="portkey" data-value="851"><div class="bar-label"><span class="gateway-dot" style="background:var(--portkey)"></span>Portkey</div><div class="bar-track"><div class="bar-fill"></div></div><div class="bar-value"></div></div>
+      </div>
+      <div class="chart bar-chart" data-max="16000" data-unit=" req/s" data-scale="linear">
+        <div class="chart-head"><h4>1,000 VU：仅三个网关有有效测点</h4><span class="axis-note">缺失值不绘制</span></div>
+        <div class="bar-row" data-gateway="ferro" data-value="13925"><div class="bar-label"><span class="gateway-dot" style="background:var(--ferro)"></span>Ferro</div><div class="bar-track"><div class="bar-fill"></div></div><div class="bar-value"></div></div>
+        <div class="bar-row" data-gateway="kong" data-value="15891"><div class="bar-label"><span class="gateway-dot" style="background:var(--kong)"></span>Kong</div><div class="bar-track"><div class="bar-fill"></div></div><div class="bar-value"></div></div>
+        <div class="bar-row" data-gateway="portkey" data-value="891"><div class="bar-label"><span class="gateway-dot" style="background:var(--portkey)"></span>Portkey</div><div class="bar-track"><div class="bar-fill"></div></div><div class="bar-value"></div></div>
+      </div>
+    </div>
+
+    <h4>Ferro 自身在同一套件中的延迟曲线</h4>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>VU</th><th>RPS</th><th>p50</th><th>p99</th><th>内存</th><th>相对 60ms mock 的 p50 开销</th></tr></thead>
+        <tbody data-gateway="ferro">
+          <tr><td>50</td><td>813</td><td>61.3 ms</td><td>64.1 ms</td><td>36 MB</td><td>约 1.3 ms</td></tr>
+          <tr><td>150</td><td>2,447</td><td>61.2 ms</td><td>63.4 ms</td><td>47 MB</td><td>约 1.2 ms</td></tr>
+          <tr><td>300</td><td>4,890</td><td>61.2 ms</td><td>64.4 ms</td><td>72 MB</td><td>约 1.2 ms</td></tr>
+          <tr><td>500</td><td>8,014</td><td>61.5 ms</td><td>72.9 ms</td><td>89 MB</td><td>1.5 ms</td></tr>
+          <tr><td>1,000</td><td>13,925</td><td>68.1 ms</td><td>111.9 ms</td><td>135 MB</td><td>8.1 ms</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="note warn">
+      该结果同时说明了“默认配置”对结论的影响：Bifrost 在 150 VU 有 2,441 RPS，但套件报告其在 ≥300 VU 因连接池饥饿出现大量失败；
+      Bifrost 自家 5,000 RPS 测试则显式把 buffer 与 initial pool 调得很大。两组结果应并列阅读，而不是任选一组外推。
+    </div>
+  </div>
+</section>
+
+<section id="official-suites">
+  <div class="section-head">
+    <h2>其他官方 / 项目相关方测试</h2>
+    <p>这些测试补充了扩容、固定吞吐、Kubernetes 上限和调优后压力场景，但不能与前面的统一测试直接合并。</p>
+  </div>
+
+  <div class="panel" id="agentgateway-suite">
+    <div class="suite-header">
+      <div>
+        <h3>agentgateway v1.3.1 vs LiteLLM main-latest</h3>
+        <p>Fortio + 本地固定响应 mock。发布文先做 3 秒跑满测试，再做 30 秒固定目标 3,000 QPS 测试；LiteLLM 使用 18 个 worker。</p>
+      </div>
+      <div class="suite-meta">
+        <span class="tag vendor">项目相关方发布</span>
+        <span class="tag raw">脚本公开</span>
+        <span class="tag limit">发布主机规格未写明</span>
+        <a class="source-pill" href="#s13">S13</a><a class="source-pill" href="#s14">S14</a><a class="source-pill" href="#s15">S15</a>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <caption>固定目标 3,000 QPS；32 连接、1 KB 请求、30 秒</caption>
+        <thead><tr><th>网关</th><th>实际 QPS</th><th>p50</th><th>p90</th><th>p99</th><th>平均 CPU</th><th>峰值内存</th></tr></thead>
+        <tbody>
+          <tr data-gateway="agentgateway"><td>agentgateway</td><td>2,998.94</td><td>0.227 ms</td><td>0.249 ms</td><td>0.436 ms</td><td>13.4%</td><td>17.07 MiB</td></tr>
+          <tr data-gateway="litellm-python"><td>LiteLLM Python（18 worker）</td><td>2,465.89</td><td>12.318 ms</td><td>19.739 ms</td><td>30.626 ms</td><td>345.5%</td><td>11.69 GiB</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <br>
+    <div class="table-wrap">
+      <table>
+        <caption>各自跑满；32 连接、1 KB 请求、3 秒</caption>
+        <thead><tr><th>网关</th><th>QPS</th><th>p50</th><th>p99</th><th>平均 CPU</th><th>峰值内存</th></tr></thead>
+        <tbody>
+          <tr data-gateway="agentgateway"><td>agentgateway</td><td>36,933.62</td><td>0.831 ms</td><td>1.970 ms</td><td>104.8%</td><td>28.79 MiB</td></tr>
+          <tr data-gateway="litellm-python"><td>LiteLLM Python（18 worker）</td><td>3,198.48</td><td>7.076 ms</td><td>32.192 ms</td><td>330.8%</td><td>11.81 GiB</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="note warn">
+      11.7 GiB 是 18 个 Python worker 共同产生的容器结果，不应当描述成“一个 LiteLLM 进程需要 11.7 GiB”。
+      同时，文章未列出发布机器的 CPU / RAM，3 秒跑满窗口也较短，因此这组数据最适合说明该特定配置下的代理开销，不适合做跨硬件容量规划。
+    </div>
+  </div>
+
+  <div class="panel" id="kong-suite">
+    <div class="suite-header">
+      <div>
+        <h3>Kong EKS：Kong 3.10、Portkey 1.9.19、LiteLLM 1.63.7</h3>
+        <p>每个网关上限 12 CPU，400 VU、每轮 3 分钟、1,000 prompt token；WireMock 与网关分置于 c5.4xlarge 节点。</p>
+      </div>
+      <div class="suite-meta">
+        <span class="tag vendor">作者：Kong</span>
+        <span class="tag raw">基础设施仓库公开</span>
+        <span class="tag limit">2025 版本；仅 proxy</span>
+        <a class="source-pill" href="#s8">S8</a><a class="source-pill" href="#s9">S9</a>
+      </div>
+    </div>
+    <div class="comparison-cards">
+      <div class="compare-card" data-gateway="kong"><div class="value">29,005.51 RPS</div><div class="label">WireMock 直连 baseline；p95 24.07ms，p99 30.35ms</div></div>
+      <div class="compare-card" data-gateway="kong"><div class="value">+228%</div><div class="label">Kong 文章给出的 Konnect Data Plane 相对 Portkey 吞吐差异</div></div>
+      <div class="compare-card" data-gateway="kong"><div class="value">+859%</div><div class="label">Kong 文章给出的 Konnect Data Plane 相对 LiteLLM 吞吐差异</div></div>
+      <div class="compare-card" data-gateway="kong"><div class="value">−65% / −86%</div><div class="label">文章给出的 Kong 相对 Portkey / LiteLLM 延迟差异</div></div>
+    </div>
+    <div class="note neutral">
+      Kong 的公开正文把精确网关 RPS 和延迟放在图片中，文本提供的是相对百分比；测试明确关闭缓存、API Key 鉴权等策略。
+      因此该组数字证明的是“纯代理、旧版本、固定 EKS 配额”下的相对关系，不是完整 AI policy 栈的开销。
+    </div>
+  </div>
+
+  <div class="grid-2">
+    <div class="panel" id="bifrost-suite">
+      <div class="suite-header">
+        <div>
+          <h3>Bifrost 官方：500 RPS 对比</h3>
+          <p>AWS t3.medium（2 vCPU / 4 GB）、60 秒、500 VU；真实 OpenAI Tier 5 场景与单独 60ms mock overhead 场景。</p>
+        </div>
+        <div class="suite-meta"><span class="tag vendor">作者：Bifrost</span><a class="source-pill" href="#s10">S10</a></div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>指标</th><th>Bifrost</th><th>LiteLLM Python</th></tr></thead>
+          <tbody>
+            <tr><td>成功率</td><td data-gateway="bifrost">100%</td><td data-gateway="litellm-python">88.78%</td></tr>
+            <tr><td>p50</td><td data-gateway="bifrost">804 ms</td><td data-gateway="litellm-python">38.65 s</td></tr>
+            <tr><td>p99</td><td data-gateway="bifrost">1.68 s</td><td data-gateway="litellm-python">90.72 s</td></tr>
+            <tr><td>实际吞吐</td><td data-gateway="bifrost">424 req/s</td><td data-gateway="litellm-python">44.84 req/s</td></tr>
+            <tr><td>峰值内存</td><td data-gateway="bifrost">120 MB</td><td data-gateway="litellm-python">372 MB</td></tr>
+            <tr><td>60ms mock 中位总延迟</td><td data-gateway="bifrost">60.99 ms</td><td data-gateway="litellm-python">100 ms</td></tr>
+            <tr><td>由此计算的 overhead</td><td data-gateway="bifrost">0.99 ms</td><td data-gateway="litellm-python">40 ms</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="panel" id="bifrost-stress">
+      <div class="suite-header">
+        <div>
+          <h3>Bifrost 官方：5,000 RPS 调优压力测试</h3>
+          <p>仅 Bifrost；两个 AWS 规格均使用 mock。显式扩大 buffer 与 initial pool。</p>
+        </div>
+        <div class="suite-meta"><span class="tag vendor">作者：Bifrost</span><a class="source-pill" href="#s11">S11</a></div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>指标</th><th>t3.medium<br>2 vCPU / 4GB</th><th>t3.xlarge<br>4 vCPU / 16GB</th></tr></thead>
+          <tbody data-gateway="bifrost">
+            <tr><td>成功率 @ 5k RPS</td><td>100%</td><td>100%</td></tr>
+            <tr><td>报告的 Bifrost overhead</td><td>59 µs</td><td>11 µs</td></tr>
+            <tr><td>平均总延迟</td><td>2.12 s</td><td>1.61 s</td></tr>
+            <tr><td>队列等待</td><td>47.13 µs</td><td>1.67 µs</td></tr>
+            <tr><td>响应解析</td><td>11.30 ms</td><td>2.11 ms</td></tr>
+            <tr><td>峰值内存</td><td>1,312.79 MB</td><td>3,340.44 MB</td></tr>
+            <tr><td>Buffer / initial pool</td><td>15,000 / 10,000</td><td>20,000 / 15,000</td></tr>
+            <tr><td>响应体备注</td><td>约 1 KB</td><td>约 10 KB</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="grid-2">
+    <div class="panel" id="litellm-python-suite">
+      <div class="suite-header">
+        <div>
+          <h3>LiteLLM Python 官方扩容表</h3>
+          <p>每台 4 CPU / 8 GB，PostgreSQL，未使用 Redis，对 fake OpenAI endpoint。</p>
+        </div>
+        <div class="suite-meta"><span class="tag vendor">作者：LiteLLM</span><a class="source-pill" href="#s12">S12</a></div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>配置 / 指标</th><th>中位</th><th>p95</th><th>p99</th><th>Current RPS</th></tr></thead>
+          <tbody data-gateway="litellm-python">
+            <tr><td>2 实例：/chat/completions</td><td>200 ms</td><td>630 ms</td><td>1,200 ms</td><td>1,035.7</td></tr>
+            <tr><td>2 实例：LiteLLM overhead</td><td>12 ms</td><td>29 ms</td><td>43 ms</td><td>1,035.7</td></tr>
+            <tr><td>2 实例：官方 Aggregated</td><td>100 ms</td><td>430 ms</td><td>930 ms</td><td>2,071.4</td></tr>
+            <tr><td>4 实例：/chat/completions</td><td>100 ms</td><td>150 ms</td><td>240 ms</td><td>1,170</td></tr>
+            <tr><td>4 实例：LiteLLM overhead</td><td>2 ms</td><td>8 ms</td><td>13 ms</td><td>1,170</td></tr>
+            <tr><td>4 实例：官方 Aggregated</td><td>77 ms</td><td>130 ms</td><td>180 ms</td><td>2,340</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="note neutral">这是横向扩容后的整体测试，不应与单容器 2 vCPU 测试的 324 RPS直接比较；官方建议 worker 数等于 CPU 核数。</div>
+    </div>
+
+    <div class="panel" id="litellm-rust-suite">
+      <div class="suite-header">
+        <div>
+          <h3>LiteLLM Rust 迁移微基准</h3>
+          <p>同一 mock；10 并发测 overhead，50 并发测吞吐与内存。2026-07-22 官方仍称 early beta，完整流式与功能面仍在补齐。</p>
+        </div>
+        <div class="suite-meta"><span class="tag vendor">作者：LiteLLM</span><span class="tag limit">early beta</span><a class="source-pill" href="#s6">S6</a><a class="source-pill" href="#s16">S16</a></div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>路径</th><th>每请求 overhead</th><th>持续吞吐</th><th>峰值内存</th></tr></thead>
+          <tbody>
+            <tr data-gateway="litellm-rust"><td>Rust forwarding path</td><td>约 0.05 ms</td><td>6,782 req/s</td><td>31.7 MB</td></tr>
+            <tr data-gateway="litellm-python"><td>当前 Python path</td><td>约 7.5 ms</td><td>453 req/s</td><td>358.9 MB</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="note warn">这是转发 hot path 微基准，不是带完整鉴权、数据库、预算、日志与路由策略的生产 workload。</div>
+    </div>
+  </div>
+</section>
+
+<section id="profiles">
+  <div class="section-head">
+    <h2>七个网关的公开事实卡</h2>
+    <p>只列数字出现在哪些公开测试、测试间有哪些差异、目前缺什么证据；解释和选择结论留到报告末尾。</p>
+  </div>
+
+  <div class="profile-grid">
+    <article class="profile" data-gateway="gomodel" style="--gateway-color:var(--gomodel)">
+      <div class="profile-head"><h3>GoModel</h3><span class="tag">Go</span></div>
+      <ul>
+        <li>GoModel AWS 2 vCPU：Chat p50 1.81ms、p99 6.88ms；容量峰值 4,928 req/s；峰值 RSS 37MB；cold start 0.56s。</li>
+        <li>同一套件覆盖 Chat、Responses、Anthropic Messages 的流式和非流式 6 个变体。</li>
+        <li>目前找到的核心性能数字来自 GoModel 自己发布的统一套件；本报告未找到 Ferro、BerriAI、Kong 等外部套件对 GoModel 的复测。</li>
+      </ul>
+    </article>
+
+    <article class="profile" data-gateway="bifrost" style="--gateway-color:var(--bifrost)">
+      <div class="profile-head"><h3>Bifrost</h3><span class="tag">Go</span></div>
+      <ul>
+        <li>GoModel 套件：3,088 req/s、Chat p99 18.27ms、143MB RSS。</li>
+        <li>AIGatewayBench：保留测点 2,744 req/s、199.1MB；并发 64 的 p99 为 52.70ms。</li>
+        <li>Ferro 套件：150 VU 为 2,441 RPS，但 ≥300 VU 报告连接池饥饿；Bifrost 官方调大 pool/buffer 后报告 5,000 RPS、100% 成功。</li>
+        <li>不同测试之间最明显的变量是连接池、buffer、响应体大小与内存换吞吐。</li>
+      </ul>
+    </article>
+
+    <article class="profile" data-gateway="litellm-python" style="--gateway-color:var(--litellm-python)">
+      <div class="profile-head"><h3>LiteLLM Python</h3><span class="tag">稳定主路径</span></div>
+      <ul>
+        <li>GoModel 2 worker / 2 vCPU：324 req/s、2.27GB RSS、25.49s cold start。</li>
+        <li>AIGatewayBench：约 177–180 req/s、329MB RSS；Ferro：约 175 RPS、335–1,124MB。</li>
+        <li>agentgateway 对比使用 18 worker：固定目标下 2,466 QPS、11.69GiB 峰值内存。</li>
+        <li>LiteLLM 官方多实例表：4 实例配置给出 Aggregated 2,340 RPS，p95 overhead 8ms。</li>
+      </ul>
+    </article>
+
+    <article class="profile" data-gateway="litellm-rust" style="--gateway-color:var(--litellm-rust)">
+      <div class="profile-head"><h3>LiteLLM Rust</h3><span class="tag limit">2026-07：early beta</span></div>
+      <ul>
+        <li>AIGatewayBench：p99 added latency 0.66ms、21.85MB；保留测点约 2,814 req/s。</li>
+        <li>LiteLLM forwarding-path 微基准：约 0.05ms overhead、6,782 req/s、31.7MB。</li>
+        <li>官方在 2026-07-22 仍明确表示 streaming 与完整功能面尚在落地，不应与稳定 Python 网关按“同功能产品”直接替换。</li>
+      </ul>
+    </article>
+
+    <article class="profile" data-gateway="portkey" style="--gateway-color:var(--portkey)">
+      <div class="profile-head"><h3>Portkey OSS</h3><span class="tag">Node / JS 路径</span></div>
+      <ul>
+        <li>GoModel 2 vCPU：峰值 946 req/s、Chat p99 30.54ms、112MB RSS、1.05s cold start。</li>
+        <li>AIGatewayBench：保留测点约 1,096 req/s、90.44MB；并发 64 的网关 RPS 为 1,360。</li>
+        <li>Ferro 8 vCPU：150–1,000 VU 约 843–891 RPS，报告称出现 event-loop 拥塞与高并发错误。</li>
+        <li>Kong 2025 EKS 测试包含 Portkey 1.9.19，但正文主要给相对百分比。</li>
+      </ul>
+    </article>
+
+    <article class="profile" data-gateway="kong" style="--gateway-color:var(--kong)">
+      <div class="profile-head"><h3>Kong AI Gateway</h3><span class="tag">API Gateway 路径</span></div>
+      <ul>
+        <li>Ferro 8 vCPU 套件：150 / 300 / 500 / 1,000 VU 分别 2,443 / 4,885 / 8,133 / 15,891 RPS；报告内存约 43MB。</li>
+        <li>Kong 自己的 EKS 测试声称 Konnect Data Plane 相对 Portkey +228%、相对 LiteLLM +859% 吞吐。</li>
+        <li>两组测试均以纯代理或极轻策略为主；公开材料没有给出同一压力下开启完整 AI 鉴权、token quota、缓存、日志后的精确增量。</li>
+      </ul>
+    </article>
+
+    <article class="profile" data-gateway="ferro" style="--gateway-color:var(--ferro)">
+      <div class="profile-head"><h3>Ferro Labs AI Gateway</h3><span class="tag">v1.0.0 测点</span></div>
+      <ul>
+        <li>自家 8 vCPU 统一套件：150–1,000 VU 为 2,447 → 13,925 RPS；内存 32–135MB。</li>
+        <li>60ms mock 下，1,000 VU 时 p50 68.1ms、p99 111.9ms。</li>
+        <li>公开性能证据主要由 Ferro 自己的套件提供；本报告未找到另一套主流多网关基准对 Ferro 的复测。</li>
+      </ul>
+    </article>
+
+    <article class="profile" data-gateway="agentgateway" style="--gateway-color:var(--agentgateway)">
+      <div class="profile-head"><h3>agentgateway</h3><span class="tag">Rust</span></div>
+      <ul>
+        <li>固定 3,000 QPS 测试：实际 2,998.94 QPS、p99 0.436ms、17.07MiB 峰值内存。</li>
+        <li>3 秒跑满测试：36,933.62 QPS、p99 1.970ms、28.79MiB。</li>
+        <li>镜像固定为 v1.3.1，但文章未写发布主机规格；对手 LiteLLM 为 main-latest、18 worker，因此资源差异高度依赖该配置。</li>
+      </ul>
+    </article>
+  </div>
+</section>
+
+<section id="gaps">
+  <div class="section-head">
+    <h2>公开数据仍未回答的问题</h2>
+    <p>这些缺口决定了“公开最高 RPS”不能直接变成生产容量承诺。</p>
+  </div>
+  <div class="grid-3">
+    <div class="panel flat"><h3>完整功能开销</h3><p>缺少一套同时开启租户鉴权、RBAC、Redis 限流、数据库记账、预算、审计、可观测性、缓存、Guardrail 与动态路由的跨产品测试。</p></div>
+    <div class="panel flat"><h3>长流与背压</h3><p>公开结果多用立即完成的短响应。真实 SSE 可能持续几十秒，需要测慢客户端、断连、缓冲、首事件和尾部资源释放。</p></div>
+    <div class="panel flat"><h3>失败路径</h3><p>大多数吞吐表没有统一测 429、5xx、超时、重试、熔断、跨供应商 fallback、Key 冷却和排队上限。</p></div>
+    <div class="panel flat"><h3>混合协议与大请求体</h3><p>Chat、Responses、Messages、embeddings、audio、批处理与 100k context 的解析成本不同；多数测试只取一个端点。</p></div>
+    <div class="panel flat"><h3>水平扩展效率</h3><p>很少有相同 Kubernetes 配额下从 1 → 2 → 4 → 8 副本的线性度、负载均衡、共享数据库与 Redis 瓶颈数据。</p></div>
+    <div class="panel flat"><h3>稳定性窗口</h3><p>3 秒、30 秒、3 分钟和短时容量扫描无法替代 6–24 小时 soak test，也难以暴露内存增长、连接泄漏和长尾漂移。</p></div>
+    <div class="panel flat"><h3>版本漂移</h3><p>LiteLLM 正在迁移 Rust，其他项目也快速发布。使用 <code>latest</code> 或 <code>main-latest</code> 的结果必须保留镜像摘要才能复现。</p></div>
+    <div class="panel flat"><h3>SaaS 边缘网络</h3><p>自托管 OSS 进程与供应商托管边缘服务的 TLS、跨区网络、WAF、控制平面和多租户隔离不是同一个性能对象。</p></div>
+    <div class="panel flat"><h3>独立复核</h3><p>本轮检索未发现一个与所有七个产品无利益关系、同时公开脚本和原始数据的统一实验室测试。</p></div>
+  </div>
+</section>
+
+<section id="sources">
+  <div class="section-head">
+    <h2>来源与数据追溯</h2>
+    <p>均为官方文档、官方或项目相关 GitHub 仓库、原始 CSV。检索日期：2026-07-27（JST）。</p>
+  </div>
+  <div class="panel sources">
+    <div class="source-item" id="s1"><div class="source-id">S1</div><p><a href="https://gomodel.enterpilot.io/docs/about/benchmarks">GoModel Benchmarks and AI Gateway Performance Results</a><small>测试条件与摘要；AWS c7i.large、8,000 请求、两次试验、功能开关。</small></p></div>
+    <div class="source-item" id="s2"><div class="source-id">S2</div><p><a href="https://github.com/ENTERPILOT/GoModel/blob/main/docs/2026-06-25_aws_gateway_benchmark/RESULTS.md">GoModel AWS Benchmark — RESULTS.md</a><small>完整非流式、流式、容量、镜像、冷启动、RSS 与 CPU 表。</small></p></div>
+    <div class="source-item" id="s3"><div class="source-id">S3</div><p><a href="https://github.com/BerriAI/ai-gateway-bench">BerriAI / AIGatewayBench</a><small>场景、负载驱动、网关启动说明、复现步骤与限制。</small></p></div>
+    <div class="source-item" id="s4"><div class="source-id">S4</div><p><a href="https://raw.githubusercontent.com/BerriAI/ai-gateway-bench/refs/heads/main/results/overhead_comparison.csv">AIGatewayBench — overhead_comparison.csv</a><small>p99 added latency 与 peak RSS 原始汇总。</small></p></div>
+    <div class="source-item" id="s5"><div class="source-id">S5</div><p><a href="https://raw.githubusercontent.com/BerriAI/ai-gateway-bench/refs/heads/main/results/latency_vs_concurrency.csv">AIGatewayBench — latency_vs_concurrency.csv</a><small>并发 1 / 4 / 16 / 64 的 direct p99、gateway p99、added p99、RPS、错误。</small></p></div>
+    <div class="source-item" id="s6"><div class="source-id">S6</div><p><a href="https://docs.litellm.ai/blog/rust-ai-gateway-benchmarks">LiteLLM Rust AI Gateway Benchmark（2026-07-22）</a><small>版本、测试边界、early beta 状态、成本模型与供应商自测声明。</small></p></div>
+    <div class="source-item" id="s7"><div class="source-id">S7</div><p><a href="https://github.com/ferro-labs/ai-gateway-performance-benchmarks">Ferro Labs AI Gateway Performance Benchmarks</a><small>GCP 统一套件、版本、吞吐、内存、Ferro 延迟曲线与复现说明。</small></p></div>
+    <div class="source-item" id="s8"><div class="source-id">S8</div><p><a href="https://konghq.com/blog/engineering/ai-gateway-benchmark-kong-ai-gateway-portkey-litellm">Kong AI Gateway vs Portkey vs LiteLLM</a><small>EKS 架构、版本、baseline、相对吞吐与延迟。</small></p></div>
+    <div class="source-item" id="s9"><div class="source-id">S9</div><p><a href="https://github.com/Kong/kong_ai_gateway-portkey-litellm-benchmark">Kong benchmark repository</a><small>EKS 1.32、WireMock、400 VU、3 分钟、资源上限与部署材料。</small></p></div>
+    <div class="source-item" id="s10"><div class="source-id">S10</div><p><a href="https://www.getmaxim.ai/bifrost/resources/benchmarks">Bifrost vs LiteLLM Benchmarks</a><small>500 RPS 对比、60ms mock overhead、成功率、延迟、实际吞吐和内存。</small></p></div>
+    <div class="source-item" id="s11"><div class="source-id">S11</div><p><a href="https://docs.getbifrost.ai/benchmarking/getting-started">Bifrost 5,000 RPS Benchmarking Guide</a><small>两种 EC2 规格、buffer / pool、队列、解析、内存和响应体说明。</small></p></div>
+    <div class="source-item" id="s12"><div class="source-id">S12</div><p><a href="https://docs.litellm.ai/docs/benchmarks">LiteLLM Gateway Benchmarks</a><small>2 / 4 实例 Python 网关、机器规格、PostgreSQL、overhead 与 RPS。</small></p></div>
+    <div class="source-item" id="s13"><div class="source-id">S13</div><p><a href="https://agentgateway.dev/blog/2026-06-26-benchmarking-agentgateway-vs-litellm/">agentgateway vs LiteLLM — maximum throughput</a><small>3 秒跑满、32 连接、1KB、QPS、延迟、CPU、内存与原始输出。</small></p></div>
+    <div class="source-item" id="s14"><div class="source-id">S14</div><p><a href="https://agentgateway.dev/blog/2026-06-26-benchmarking-agentgateway-vs-litellm-part-2/">agentgateway vs LiteLLM — fixed 3,000 QPS</a><small>30 秒固定目标测试与原始输出。</small></p></div>
+    <div class="source-item" id="s15"><div class="source-id">S15</div><p><a href="https://github.com/linsun/litellm-agw-perf">litellm-agw-perf repository</a><small>复现脚本；agentgateway v1.3.1、LiteLLM main-latest 与 worker 配置。</small></p></div>
+    <div class="source-item" id="s16"><div class="source-id">S16</div><p><a href="https://docs.litellm.ai/blog/litellm-rust-launch">Migrating LiteLLM to Rust</a><small>Rust forwarding path 微基准、迁移阶段、目标与“非完整生产 workload”限制。</small></p></div>
+  </div>
+</section>
+
+<section id="summary">
+  <div class="panel final-summary">
+    <h2>最后总结</h2>
+    <div class="summary-grid">
+      <div class="summary-item">
+        <strong>GoModel：公开数字很强，但证据来源集中</strong>
+        在自己的 2 vCPU 统一套件中，GoModel同时给出较低延迟、4,928 req/s、37MB RSS和0.56s冷启动；脚本与原始结果透明。当前缺口是没有进入其他主流多网关套件，外部复核不足。
+      </div>
+      <div class="summary-item">
+        <strong>Bifrost：跨多个套件都处于高吞吐组，但对配置敏感</strong>
+        GoModel与AIGatewayBench均给出约2.7k–3.1k req/s量级；Ferro默认测试出现连接池饥饿，而Bifrost调大池与buffer后报告5k RPS。它的生产容量不能脱离连接池、buffer和内存预算谈。
+      </div>
+      <div class="summary-item">
+        <strong>LiteLLM：必须把 Python 稳定路径与 Rust beta 分开</strong>
+        Python路径在多个统一开销测试中普遍表现为更高内存、更低单实例吞吐和更明显长尾，但官方多实例扩容可达到约2.3k aggregate RPS。Rust beta把开销与内存降到另一量级，不过2026-07仍未达到完整功能与流式面等价。
+      </div>
+      <div class="summary-item">
+        <strong>Portkey：多个统一套件中的结果相对一致</strong>
+        GoModel、AIGatewayBench和Ferro给出的吞吐大致在0.85k–1.36k req/s范围、内存约67–112MB；高并发下的event-loop拥塞与平台配置需要自行验证。
+      </div>
+      <div class="summary-item">
+        <strong>Kong：纯代理容量上限高，完整 AI 策略开销未量化</strong>
+        Ferro套件中Kong在8 vCPU和1,000 VU达到15,891 RPS；Kong自家EKS测试也给出明显相对优势。但公开对比关闭了鉴权、缓存和其他策略，不能直接代表完整LLM治理路径。
+      </div>
+      <div class="summary-item">
+        <strong>Ferro 与 agentgateway：自家结果突出，跨来源验证不足</strong>
+        Ferro在自家8 vCPU套件达到13,925 RPS；agentgateway在相关方测试中固定3k QPS时p99低于0.5ms。两者目前都更需要无利益关系的复测，agentgateway报告还缺发布机器规格。
+      </div>
+      <div class="summary-item">
+        <strong>公开数据能支持的判断</strong>
+        编译型 / Rust / Go / 高性能代理路径在“快速 mock + 纯转发”条件下通常能显著降低每请求开销、内存和冷启动；Python多进程可以横向换吞吐，但资源会随worker和实例放大。
+      </div>
+      <div class="summary-item">
+        <strong>公开数据不能支持的判断</strong>
+        现有证据不足以选出一个对所有业务都最快的网关。真正采购或项目定位前，应在相同硬件上开启你需要的鉴权、限流、记账、缓存、重试、流式和观测，用真实请求体与失败比例复跑至少30分钟并做长时间稳定性测试。
+      </div>
+    </div>
+  </div>
+</section>
+</main>
+
+<footer>
+  <div class="shell">
+    本报告是公开证据整理，不是对任何供应商的背书，也没有代替用户在同一环境中重新执行基准。数值保留来源上下文；跨套件图表未做归一化排名。
+  </div>
+</footer>
+
+<script>
+(function(){
+  const colors = {
+    "gomodel":"var(--gomodel)",
+    "bifrost":"var(--bifrost)",
+    "portkey":"var(--portkey)",
+    "litellm-python":"var(--litellm-python)",
+    "litellm-rust":"var(--litellm-rust)",
+    "kong":"var(--kong)",
+    "ferro":"var(--ferro)",
+    "agentgateway":"var(--agentgateway)",
+    "baseline":"var(--baseline)"
+  };
+
+  document.querySelectorAll(".bar-chart").forEach(chart=>{
+    const max = Number(chart.dataset.max || 1);
+    const unit = chart.dataset.unit || "";
+    const scale = chart.dataset.scale || "linear";
+    chart.querySelectorAll(".bar-row").forEach(row=>{
+      const value = Number(row.dataset.value || 0);
+      let pct = scale === "log"
+        ? (Math.log10(value + 1) / Math.log10(max + 1)) * 100
+        : (value / max) * 100;
+      pct = Math.max(1.5, Math.min(100, pct));
+      const gateway = row.dataset.gateway || "baseline";
+      row.querySelector(".bar-fill").style.width = pct + "%";
+      row.querySelector(".bar-fill").style.background = colors[gateway] || "var(--baseline)";
+      const display = value >= 1000
+        ? value.toLocaleString("en-US", {maximumFractionDigits:2})
+        : value.toLocaleString("en-US", {maximumFractionDigits:3});
+      row.querySelector(".bar-value").textContent = display + unit;
+    });
+  });
+
+  const filter = document.getElementById("gatewayFilter");
+  const applyFilter = ()=>{
+    const value = filter.value;
+    document.querySelectorAll("[data-gateway]").forEach(el=>{
+      const match = value === "all" || el.dataset.gateway === value;
+      el.classList.toggle("dim", !match && value !== "all");
+      el.classList.toggle("highlight", match && value !== "all" && (el.classList.contains("profile") || el.classList.contains("compare-card")));
+    });
+  };
+  filter.addEventListener("change", applyFilter);
+
+  const links = [...document.querySelectorAll(".nav-links a")];
+  const targets = links.map(a=>document.querySelector(a.getAttribute("href"))).filter(Boolean);
+  const observer = new IntersectionObserver(entries=>{
+    entries.forEach(entry=>{
+      if(entry.isIntersecting){
+        links.forEach(a=>a.classList.toggle("active", a.getAttribute("href") === "#" + entry.target.id));
+      }
+    });
+  },{rootMargin:"-20% 0px -72% 0px",threshold:0});
+  targets.forEach(t=>observer.observe(t));
+})();
+</script>
+</body>
+</html>

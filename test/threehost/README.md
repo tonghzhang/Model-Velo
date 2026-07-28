@@ -315,10 +315,11 @@ bash test/threehost/collect-run-evidence.sh 20260725T120000Z
 
 它保存四个服务的末尾日志、容器/镜像、最终指标、Redis Stream/PENDING/Dead Letter，
 并按 `bench-<RUN_ID>` 查询 Usage 的事件数、状态、模型、缓存、Attempts、Retries、
-Fallbacks、平均/P95 延迟和 TTFT。查询前最多等待 240 秒，让本次 Outbox 和 Redis
-Stream 排空，并把是否超时写入 `usage-drain.txt`。脚本不会输出 `.env` 或数据库/Redis
-密码；`runtime-settings.txt` 只记录连接池、限流、Cache、Breaker、Queue、Retry、
-Timeout 和 Worker 等安全标量，便于将结果对应回实际参数。
+Fallbacks、平均/P95 延迟和 TTFT。查询前最多等待 240 秒，让本次 RUN_ID 对应的
+Outbox 排空；全局 Redis Stream 长度只作为状态记录，不参与本次运行是否排空的判断。
+结果写入 `usage-drain.txt`。脚本不会输出 `.env` 或数据库/Redis 密码；
+`runtime-settings.txt` 只记录连接池、限流、Cache、Breaker、Queue、Retry、Timeout
+和 Worker 等安全标量，便于将结果对应回实际参数。
 
 三个采集进程不必精确和客户端同时结束；`9000` 秒覆盖默认完整套件，多余的空闲采样不影响
 按 case 时间戳分析。如果自定义套件超过 2.5 小时，相应增大 `DURATION_SECONDS`。

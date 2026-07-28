@@ -84,11 +84,6 @@ func run() error { // 装配基础设施、启动 HTTP 服务并等待关闭。
 		return err // 表结构同步失败时终止启动。
 	}
 
-	access, err := apikey.NewManager(database.ORM(), startup.apiKeySecurity.Pepper) // 创建基于数据库的 API Key 认证授权服务。
-	if err != nil {                                                                 // API Key 管理器创建失败。
-		return fmt.Errorf("configure API key manager: %w", err) // 返回认证组件配置错误。
-	}
-
 	redisClient, err := redisstore.Open(ctx, startup.infrastructure.Redis) // 使用配置连接 Redis。
 	if err != nil {                                                        // Redis 客户端创建失败。
 		return fmt.Errorf("connect Redis: %w", err) // 终止启动并返回 Redis 错误。
@@ -97,6 +92,26 @@ func run() error { // 装配基础设施、启动 HTTP 服务并等待关闭。
 	if !redisClient.AvailableAtStartup() { // 启动时 Redis Ping 未成功。
 		slog.Warn("Redis startup ping failed; continuing with configured degradation policy")
 	}
+	metrics := observability.NewMetrics()
+	var access *apikey.Manager
+	if startup.authCache.Enabled {
+		access, err = apikey.NewCachedManager(
+			database.ORM(),
+			startup.apiKeySecurity.Pepper,
+			redisClient.Native(),
+			startup.authCache,
+			metrics,
+		)
+	} else {
+		access, err = apikey.NewManager(
+			database.ORM(),
+			startup.apiKeySecurity.Pepper,
+		)
+	}
+	if err != nil {
+		return fmt.Errorf("configure API key manager: %w", err)
+	}
+	access.StartInvalidationListener(ctx)
 	limiter, err := ratelimit.New(redisClient.Native(), startup.rateLimit) // 基于原生 Redis 客户端创建限流器。
 	if err != nil {                                                        // 限流器配置无效。
 		return fmt.Errorf("configure rate limiter: %w", err) // 返回限流组件配置错误。
@@ -175,9 +190,15 @@ func run() error { // 装配基础设施、启动 HTTP 服务并等待关闭。
 	if err != nil {
 		return fmt.Errorf("configure quota manager: %w", err)
 	}
+	if err := quotaManager.LoadPolicyIndex(ctx); err != nil {
+		return fmt.Errorf("load quota policy index: %w", err)
+	}
+	go quotaManager.RunPolicyIndexRefresh(
+		ctx,
+		startup.controlPlane.RefreshInterval,
+	)
 	go quotaManager.RunReaper(ctx)
 
-	metrics := observability.NewMetrics()
 	if err := metrics.RegisterRuntime(runtimeManager); err != nil {
 		return fmt.Errorf("register runtime metrics: %w", err)
 	}
@@ -225,8 +246,9 @@ func run() error { // 装配基础设施、启动 HTTP 服务并等待关闭。
 type startupConfig struct { // 保存启动后续步骤需要的全部配置和已创建组件。
 	infrastructure   config.Infrastructure // PostgreSQL、Redis 等基础设施配置。
 	apiKeySecurity   config.APIKeySecurity // API Key 哈希 Pepper 等安全配置。
-	rateLimit        config.RateLimit      // 租户限流配置。
-	responseCache    config.ResponseCache  // 响应缓存配置。
+	authCache        config.AuthCache
+	rateLimit        config.RateLimit     // 租户限流配置。
+	responseCache    config.ResponseCache // 响应缓存配置。
 	usage            config.Usage
 	observability    config.Observability
 	controlPlane     config.ControlPlane
@@ -249,6 +271,10 @@ func loadStartupConfig() (startupConfig, error) { // 加载所有启动配置并
 
 	apiKeySecurity, err := config.LoadAPIKeySecurity() // 读取 API Key 安全配置。
 	if err != nil {                                    // API Key 安全配置不合法。
+		return startupConfig{}, err
+	}
+	authCache, err := config.LoadAuthCache()
+	if err != nil {
 		return startupConfig{}, err
 	}
 	rateLimit, err := config.LoadRateLimit() // 读取租户限流配置。
@@ -357,8 +383,9 @@ func loadStartupConfig() (startupConfig, error) { // 加载所有启动配置并
 	return startupConfig{ // 返回启动后续阶段所需的完整配置和组件。
 		infrastructure:   infrastructure, // 保存基础设施配置。
 		apiKeySecurity:   apiKeySecurity, // 保存 API Key 安全配置。
-		rateLimit:        rateLimit,      // 保存限流配置。
-		responseCache:    responseCache,  // 保存缓存配置。
+		authCache:        authCache,
+		rateLimit:        rateLimit,     // 保存限流配置。
+		responseCache:    responseCache, // 保存缓存配置。
 		usage:            usageConfig,
 		observability:    observabilityConfig,
 		controlPlane:     controlPlaneConfig,

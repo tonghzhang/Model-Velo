@@ -33,8 +33,10 @@ import (
 	"time"
 	"unicode/utf8"
 
+	goredis "github.com/redis/go-redis/v9"
 	"gorm.io/gorm"
 
+	"model-velo/internal/config"
 	"model-velo/internal/postgres"
 )
 
@@ -54,9 +56,11 @@ var (
 var tenantSlugPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{1,78}[a-z0-9]$`)
 
 type Manager struct {
-	database *gorm.DB
-	pepper   []byte
-	now      func() time.Time
+	database    *gorm.DB
+	pepper      []byte
+	now         func() time.Time
+	credentials *credentialStore
+	observer    CacheObserver
 }
 
 // BootstrapTenantInput 表示“创建一个新租户”需要提供的参数。
@@ -100,6 +104,12 @@ type Identity struct {
 	//
 	// 它不会暴露完整 secret。
 	KeyPrefix string
+
+	authorization *authorizationSnapshot
+}
+
+type authorizationSnapshot struct {
+	models []string
 }
 
 func NewManager(database *gorm.DB, pepper []byte) (*Manager, error) {
@@ -110,11 +120,55 @@ func NewManager(database *gorm.DB, pepper []byte) (*Manager, error) {
 		return nil, errors.New("API key manager requires at least 32 pepper bytes")
 	}
 
-	return &Manager{
+	manager := &Manager{
 		database: database,
 		pepper:   append([]byte(nil), pepper...),
 		now:      time.Now,
-	}, nil
+	}
+	manager.credentials = newCredentialStore(
+		postgresSnapshotSource{database: database},
+		config.AuthCache{},
+		nil,
+		nil,
+	)
+	manager.credentials.now = func() time.Time {
+		return manager.now()
+	}
+	return manager, nil
+}
+
+func NewCachedManager(
+	database *gorm.DB,
+	pepper []byte,
+	client *goredis.Client,
+	settings config.AuthCache,
+	observer CacheObserver,
+) (*Manager, error) {
+	manager, err := NewManager(database, pepper)
+	if err != nil {
+		return nil, err
+	}
+	credentials, err := newRedisCredentialStore(
+		postgresSnapshotSource{database: database},
+		client,
+		settings,
+		observer,
+	)
+	if err != nil {
+		return nil, err
+	}
+	credentials.now = func() time.Time {
+		return manager.now()
+	}
+	manager.credentials = credentials
+	manager.observer = observer
+	return manager, nil
+}
+
+func (manager *Manager) StartInvalidationListener(ctx context.Context) {
+	if manager != nil && manager.credentials != nil {
+		manager.credentials.Start(ctx)
+	}
 }
 
 func (manager *Manager) BootstrapTenant(ctx context.Context, input BootstrapTenantInput) (IssuedKey, error) {
@@ -204,98 +258,107 @@ func (manager *Manager) Authenticate(ctx context.Context, plaintext string) (Ide
 	token, err := parseToken(plaintext)
 	if err != nil {
 		manager.consumeDummyHash()
+		manager.observeDatabaseQueries(0)
 		return Identity{}, ErrInvalidCredential
 	}
 
-	var key postgres.APIKey
-	err = manager.database.WithContext(ctx).
-		Preload("Tenant").
-		Where("lookup_digest = ?", digestPrefix(token.prefix)).
-		First(&key).Error
-	if err != nil {
+	lookupDigest := digestPrefix(token.prefix)
+	load, leader := manager.credentials.Lookup(ctx, lookupDigest)
+	queries := 0
+	if leader {
+		queries = load.queries
+	}
+	defer func() {
+		manager.observeDatabaseQueries(queries)
+	}()
+	if load.err != nil {
 		manager.consumeDummyHash()
-		if errors.Is(err, gorm.ErrRecordNotFound) {
+		if errors.Is(load.err, errSnapshotNotFound) {
 			return Identity{}, ErrInvalidCredential
+		}
+		if ctx.Err() != nil {
+			return Identity{}, ctx.Err()
 		}
 		return Identity{}, errors.New("read API key")
 	}
-	if !verifyToken(token, key.KeyHash, key.HashVersion, manager.pepper) {
+	snapshot := load.snapshot
+	if !verifyToken(
+		token,
+		snapshot.KeyHash,
+		snapshot.HashVersion,
+		manager.pepper,
+	) || snapshot.KeyPrefix != token.prefix {
 		return Identity{}, ErrInvalidCredential
 	}
-	if key.Status == postgres.APIKeyRevoked {
+	manager.credentials.Promote(
+		ctx,
+		manager.credentials.cacheKey(lookupDigest),
+		load,
+	)
+	if snapshot.KeyStatus == postgres.APIKeyRevoked {
 		return Identity{}, ErrKeyRevoked
 	}
-	if key.Status != postgres.APIKeyActive {
+	if snapshot.KeyStatus != postgres.APIKeyActive {
 		return Identity{}, ErrKeyInactive
 	}
-	if key.Tenant.Status != postgres.TenantActive {
+	if snapshot.TenantStatus != postgres.TenantActive {
 		return Identity{}, ErrTenantInactive
 	}
-	if expirationReached(key.ExpiresAt, manager.now().UTC()) {
+	now := manager.now().UTC()
+	if expirationReached(snapshot.KeyExpiresAt, now) {
 		return Identity{}, ErrKeyExpired
 	}
-	now := manager.now().UTC()
-	if key.LastUsedAt == nil || now.Sub(*key.LastUsedAt) >= 5*time.Minute {
-		_ = manager.database.WithContext(ctx).
-			Model(&postgres.APIKey{}).
-			Where("id = ?", key.ID).
-			Update("last_used_at", now).Error
+	if snapshot.LastUsedAt == nil ||
+		now.Sub(*snapshot.LastUsedAt) >= 5*time.Minute {
+		queries += manager.credentials.Touch(ctx, load, now)
 	}
 
-	return Identity{
-		TenantID:  key.TenantID,
-		APIKeyID:  key.ID,
-		KeyPrefix: key.KeyPrefix,
-	}, nil
+	return snapshot.identity(), nil
 }
 
-func (manager *Manager) AuthorizeModel(ctx context.Context, tenantID, model string) error {
-	tenantID = strings.TrimSpace(tenantID)
+func (manager *Manager) AuthorizeModel(
+	ctx context.Context,
+	identity Identity,
+	model string,
+) error {
+	tenantID := strings.TrimSpace(identity.TenantID)
 	model = strings.TrimSpace(model)
 	if tenantID == "" || model == "" {
+		manager.observeAuthorization("denied")
 		return ErrModelNotAllowed
 	}
-
-	var count int64
-	err := manager.database.WithContext(ctx).
-		Model(&postgres.TenantModelGrant{}).
-		Where(
-			"tenant_id = ? AND gateway_model IN ?",
-			tenantID, []string{model, "*"},
-		).
-		Count(&count).Error
-	if err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
+	if err := ctx.Err(); err != nil {
+		manager.observeAuthorization("canceled")
+		return err
+	}
+	if identity.authorization == nil {
+		manager.observeAuthorization("denied")
+		return ErrModelNotAllowed
+	}
+	for _, allowed := range identity.authorization.models {
+		if allowed == "*" || allowed == model {
+			manager.observeAuthorization("allowed")
+			return nil
 		}
-		return errors.New("read tenant model grant")
 	}
-	if count == 0 {
-		return ErrModelNotAllowed
-	}
-	return nil
+	manager.observeAuthorization("denied")
+	return ErrModelNotAllowed
 }
 
 func (manager *Manager) AuthorizedModels(
 	ctx context.Context,
-	tenantID string,
+	identity Identity,
 ) ([]string, error) {
-	tenantID = strings.TrimSpace(tenantID)
-	if tenantID == "" {
+	if strings.TrimSpace(identity.TenantID) == "" {
 		return nil, ErrModelNotAllowed
 	}
-	var models []string
-	if err := manager.database.WithContext(ctx).
-		Model(&postgres.TenantModelGrant{}).
-		Where("tenant_id = ?", tenantID).
-		Order("gateway_model ASC").
-		Pluck("gateway_model", &models).Error; err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		return nil, errors.New("read tenant model grants")
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	return models, nil
+	if identity.authorization == nil {
+		return nil, nil
+	}
+	return append([]string(nil), identity.authorization.models...), nil
 }
 
 func (manager *Manager) Revoke(ctx context.Context, keyID string) error {
@@ -325,10 +388,12 @@ func (manager *Manager) Revoke(ctx context.Context, keyID string) error {
 			return errors.New("check API key status")
 		}
 		if count > 0 {
+			manager.invalidateKey(ctx, keyID)
 			return ErrKeyRevoked
 		}
 		return ErrKeyNotFound
 	}
+	manager.invalidateKey(ctx, keyID)
 	return nil
 }
 
@@ -358,11 +423,40 @@ func (manager *Manager) Disable(ctx context.Context, keyID string) error {
 			return errors.New("check API key status")
 		}
 		if count > 0 {
+			manager.invalidateKey(ctx, keyID)
 			return ErrKeyRevoked
 		}
 		return ErrKeyNotFound
 	}
+	manager.invalidateKey(ctx, keyID)
 	return nil
+}
+
+func (manager *Manager) invalidateKey(ctx context.Context, keyID string) {
+	if manager.credentials != nil {
+		manager.credentials.InvalidateKey(ctx, keyID)
+	}
+}
+
+func (manager *Manager) invalidateTenant(
+	ctx context.Context,
+	tenantID string,
+) {
+	if manager.credentials != nil {
+		manager.credentials.InvalidateTenant(ctx, tenantID)
+	}
+}
+
+func (manager *Manager) observeDatabaseQueries(count int) {
+	if manager.observer != nil {
+		manager.observer.AuthDatabaseQueries(count)
+	}
+}
+
+func (manager *Manager) observeAuthorization(result string) {
+	if manager.observer != nil {
+		manager.observer.ModelAuthorization(result)
+	}
 }
 
 func (manager *Manager) createKey(transaction *gorm.DB, input CreateKeyInput) (IssuedKey, error) {

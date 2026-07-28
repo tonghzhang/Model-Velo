@@ -150,7 +150,11 @@ func (access *middlewareAccessController) Authenticate(context.Context, string) 
 	return access.identity, access.authenticateErr
 }
 
-func (*middlewareAccessController) AuthorizeModel(context.Context, string, string) error {
+func (*middlewareAccessController) AuthorizeModel(
+	context.Context,
+	apikey.Identity,
+	string,
+) error {
 	return nil
 }
 

@@ -166,7 +166,7 @@ func (h chatHandler) complete(c *gin.Context) {
 	startedAt := time.Now()
 	authorizationErr := h.access.AuthorizeModel( // 检查该租户是否允许使用当前模型。
 		c.Request.Context(),
-		identity.TenantID,
+		identity,
 		model,
 	)
 	authorizationResult := "allowed"
@@ -493,6 +493,11 @@ func (h chatHandler) reserveQuota(
 	plan routing.Plan,
 ) bool {
 	if h.quota == nil {
+		return true
+	}
+	if !h.quota.HasPolicy(tenantID, model) {
+		h.metrics.RequestStage("quota_reserve", "no_policy", "", 0)
+		h.metrics.Quota("no_policy")
 		return true
 	}
 	output := h.quota.DefaultMaxOutputTokens()

@@ -383,9 +383,13 @@ func (access testAccessController) Authenticate(context.Context, string) (apikey
 	return apikey.Identity{TenantID: "tenant-test-id", APIKeyID: "api-key-test-id", KeyPrefix: "mvl_test"}, nil
 }
 
-func (access testAccessController) AuthorizeModel(_ context.Context, tenantID, model string) error {
+func (access testAccessController) AuthorizeModel(
+	_ context.Context,
+	identity apikey.Identity,
+	model string,
+) error {
 	if access.onAuthorize != nil {
-		access.onAuthorize(tenantID, model)
+		access.onAuthorize(identity.TenantID, model)
 	}
 	return access.authorizeErr
 }

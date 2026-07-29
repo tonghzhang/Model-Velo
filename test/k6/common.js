@@ -8,6 +8,7 @@ export const responses200 = new Counter('chat_responses_200');
 export const responses429 = new Counter('chat_responses_429');
 export const responses5xx = new Counter('chat_responses_5xx');
 export const responsesOther = new Counter('chat_responses_other');
+export const gatewayChatRequests = new Counter('gateway_chat_requests');
 export const requestTimeout = __ENV.REQUEST_TIMEOUT || '20s';
 
 export const expected200 = http.expectedStatuses(200);
@@ -125,6 +126,9 @@ export function sendChat({
     stream,
   });
 
+  if (target === 'gateway') {
+    gatewayChatRequests.add(1, { model, stream: String(stream) });
+  }
   return http.post(chatURL(targetURL), body, {
     headers,
     responseCallback,

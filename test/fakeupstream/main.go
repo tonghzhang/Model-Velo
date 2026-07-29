@@ -95,7 +95,7 @@ func run(config commandConfig) error {
 		"name",
 		upstream.providerName,
 		"scenario",
-		upstream.scenarioOverride,
+		upstream.forcedScenario(),
 	)
 
 	select {

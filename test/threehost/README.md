@@ -154,6 +154,26 @@ bash test/threehost/run-client.sh
 结果写入 `test-results/threehost/<RUN_ID>/`。每个 case 都有 k6 summary JSON 和文本日志；
 `SAVE_RAW_METRICS=true` 时还会保存逐指标 JSON，文件会明显变大。
 
+### 第一轮热路径诊断
+
+先不要运行完整矩阵。准备好 `benchmark.env` 后执行约 19 分钟的固定诊断轮：
+
+```bash
+cp test/threehost/benchmark.env.example test/threehost/benchmark.env
+editor test/threehost/benchmark.env
+bash test/threehost/run-diagnostic-client.sh
+```
+
+该入口复用完整 runner，只运行 smoke、100 RPS 预热、`500/750/1000/1500 RPS × 2m`
+和 `500 RPS × 10m` 耐久。它不会修改网关 Queue、Redis、PostgreSQL 或限流参数。客户端
+最大 VU 提高到 4096，避免把 1500 RPS 过载点过早归因于默认 2048 VU 上限。
+
+诊断轮必须与网关机的 Prometheus 和容器采集同时运行；两台服务器的
+`DURATION_SECONDS=1800` 即可覆盖测试和余量。最终 HTML 的“热路径诊断”可以逐 case
+切换，显示认证、Usage Begin、授权、Redis 限流、Quota、Provider Queue/调用、Usage
+Finalize 的 P50/P95/P99，以及 PostgreSQL/Redis pool wait、Go CPU/RSS/heap/goroutine/GC
+和稳定内部错误码。缺少重叠监控时这些字段不会被当成 0，而会给出证据警告。
+
 ### 完整性能与故障套件
 
 `run-client.sh` 适合先验证三机连通性。正式测试改用完整配置：
@@ -215,11 +235,44 @@ PRE_ALLOCATED_VUS >= RATE × 直连 p95 秒数 × 1.2
 在客户端开始前，在另外两台服务器的终端中运行采集器。`DURATION_SECONDS` 应覆盖预热、
 所有 repetitions、冷却间隔和可靠性测试。
 
+采集器现在每 10 秒输出一次进度，例如：
+
+```text
+[2026-07-26T15:20:00Z] docker-stats state=collecting elapsed=00:10:00 remaining=02:20:00 snapshots=297 records=1188 errors=0 last=2026-07-26T15:19:59.842Z
+```
+
+`state=collecting` 表示正在采样，`remaining` 是离计划结束的剩余时间，`last` 是最后一个成功
+样本。对应的 `*-status.json` 会在每轮采样后原子更新；正常结束记为 `completed`，收到
+Ctrl+C、TERM 或 HUP 记为 `interrupted`，其他异常记为 `failed` 并保留原因。用
+`PROGRESS_SECONDS` 可以调整终端刷新间隔。
+
+如果状态仍是 `collecting`，但 `updated_at` 已超过两个实际采样周期没有变化，应视为
+采集器已经失联或卡住，不要继续启动正式压测。可以在另一个终端持续查看状态：
+
+```bash
+watch -n 2 'python3 -m json.tool test-results/threehost/<RUN_ID>/gateway-stats-status.json'
+```
+
+不要让采集器依附于可能关闭的普通 SSH 会话。推荐先进入一个持久的 `tmux` 会话，再执行
+下面的前台命令；这样既能直接看到进度，又能在 SSH 断开后继续采集：
+
+```bash
+tmux new -s model-velo-monitor
+# 在 tmux 中执行本机对应的采集命令。
+# 按 Ctrl+B，再按 D，退出但不停止采集。
+tmux attach -t model-velo-monitor
+```
+
+如果一次客户端运行 smoke 失败或被中断，不要停止采集器后沿用同一批文件假装正式运行。
+修好问题后应使用新的 `RUN_ID`（或新的 attempt 目录），确认三台监控仍显示
+`state=collecting`，再启动正式客户端。
+
 网关机：
 
 ```bash
 RUN_ID=20260725T120000Z
 DURATION_SECONDS=9000 \
+PROGRESS_SECONDS=10 \
 OUTPUT_FILE="test-results/threehost/$RUN_ID/gateway-stats.jsonl" \
 bash test/threehost/collect-compose-stats.sh
 ```
@@ -229,6 +282,7 @@ bash test/threehost/collect-compose-stats.sh
 ```bash
 RUN_ID=20260725T120000Z
 DURATION_SECONDS=9000 \
+PROGRESS_SECONDS=10 \
 OUTPUT_DIR="test-results/threehost/$RUN_ID/prometheus" \
 bash test/threehost/collect-prometheus.sh
 ```
@@ -238,6 +292,7 @@ bash test/threehost/collect-prometheus.sh
 ```bash
 RUN_ID=20260725T120000Z
 DURATION_SECONDS=9000 \
+PROGRESS_SECONDS=10 \
 COMPOSE_FILE=test/threehost/upstream.compose.yaml \
 SERVICES=main,fail,fallback \
 OUTPUT_FILE="test-results/threehost/$RUN_ID/upstream-stats.jsonl" \
@@ -247,6 +302,10 @@ bash test/threehost/collect-compose-stats.sh
 采集器按 `INTERVAL_SECONDS` 使用一次 `docker stats --no-stream` 批量记录所有目标容器的
 CPU、内存、网络和块 I/O，同时单独记录服务到容器 ID 的映射、镜像 ID、Docker 版本和
 宿主机信息；它不会执行 `docker compose config`，避免把 `.env` 密钥写入结果。
+`INTERVAL_SECONDS` 是最小采样周期：如果一次 `docker stats` 本身超过该时间，下一轮会
+立即开始，不会再额外 sleep；因此 1 秒配置在当前 Docker 环境中通常得到约 2 秒而不是
+原先的约 3 秒实际间隔。Docker 短暂失败时会刷新容器 ID 并继续；默认连续失败 30 次才
+将监控标记为 `failed`。
 
 客户端套件结束后，在网关机保存一次可直接诊断的最终证据：
 
@@ -256,10 +315,11 @@ bash test/threehost/collect-run-evidence.sh 20260725T120000Z
 
 它保存四个服务的末尾日志、容器/镜像、最终指标、Redis Stream/PENDING/Dead Letter，
 并按 `bench-<RUN_ID>` 查询 Usage 的事件数、状态、模型、缓存、Attempts、Retries、
-Fallbacks、平均/P95 延迟和 TTFT。查询前最多等待 240 秒，让本次 Outbox 和 Redis
-Stream 排空，并把是否超时写入 `usage-drain.txt`。脚本不会输出 `.env` 或数据库/Redis
-密码；`runtime-settings.txt` 只记录连接池、限流、Cache、Breaker、Queue、Retry、
-Timeout 和 Worker 等安全标量，便于将结果对应回实际参数。
+Fallbacks、平均/P95 延迟和 TTFT。查询前最多等待 240 秒，让本次 RUN_ID 对应的
+Outbox 排空；全局 Redis Stream 长度只作为状态记录，不参与本次运行是否排空的判断。
+结果写入 `usage-drain.txt`。脚本不会输出 `.env` 或数据库/Redis 密码；
+`runtime-settings.txt` 只记录连接池、限流、Cache、Breaker、Queue、Retry、Timeout
+和 Worker 等安全标量，便于将结果对应回实际参数。
 
 三个采集进程不必精确和客户端同时结束；`9000` 秒覆盖默认完整套件，多余的空闲采样不影响
 按 case 时间戳分析。如果自定义套件超过 2.5 小时，相应增大 `DURATION_SECONDS`。
@@ -277,6 +337,8 @@ scp -r gateway-host:"~/model-velo/$RESULT_DIR/gateway-stats.jsonl" \
   "$RESULT_DIR/"
 scp -r gateway-host:"~/model-velo/$RESULT_DIR/gateway-stats-metadata.txt" \
   "$RESULT_DIR/"
+scp -r gateway-host:"~/model-velo/$RESULT_DIR/gateway-stats-status.json" \
+  "$RESULT_DIR/"
 scp -r gateway-host:"~/model-velo/$RESULT_DIR/prometheus" \
   "$RESULT_DIR/"
 scp -r gateway-host:"~/model-velo/$RESULT_DIR/gateway-evidence" \
@@ -285,16 +347,19 @@ scp -r upstream-host:"~/model-velo/$RESULT_DIR/upstream-stats.jsonl" \
   "$RESULT_DIR/"
 scp -r upstream-host:"~/model-velo/$RESULT_DIR/upstream-stats-metadata.txt" \
   "$RESULT_DIR/"
+scp -r upstream-host:"~/model-velo/$RESULT_DIR/upstream-stats-status.json" \
+  "$RESULT_DIR/"
 
 python3 test/threehost/summarize.py "$RESULT_DIR"
 tar -czf "$RUN_ID.tar.gz" -C test-results/threehost "$RUN_ID"
 ```
 
-把最后的 `<RUN_ID>.tar.gz` 给分析者即可。`summary.md` 是人读摘要，`summary.json` 保留
-全部机器可读 case、分位数、状态计数、直连差值、逐 Chunk SSE、资源、Prometheus 和
-Usage 证据。原始 `*.log`、`*-summary.json`、`*-stream.json`、`*-upstream.json` 和
-带时间戳采样也都保留；下一轮可以据此定位是客户端 VU、网关 CPU/Queue/Redis、Usage
-Worker、上游放大还是长尾问题，再改对应代码。
+把最后的 `<RUN_ID>.tar.gz` 给分析者即可。`summary.html` 是不依赖 CDN、可直接在浏览器
+打开的交互报告，`summary.md` 是终端友好的摘要，`summary.json` 保留全部机器可读 case、
+分位数、状态计数、直连差值、逐 Chunk SSE、资源、Prometheus 和 Usage 证据。原始
+`*.log`、`*-summary.json`、`*-stream.json`、`*-upstream.json` 和带时间戳采样也都保留；
+下一轮可以据此定位是客户端 VU、网关 CPU/Queue/Redis、Usage Worker、上游放大还是长尾
+问题，再改对应代码。
 汇总还会把正常网关 case 的实际 HTTP 请求数和落库 Usage Event 数对账；smoke、
 reliability 和独立限流用例因包含非 Chat 请求或前置拒绝，不纳入该等式。
 
@@ -350,6 +415,7 @@ reliability 和独立限流用例因包含非 Chat 请求或前置拒绝，不�
 | `prepare-gateway-env.sh` | 生成不入库的三机网关 `.env` |
 | `run-client.sh` | 固定顺序运行并保存 k6 结果 |
 | `run-complete-client.sh` | 执行完整矩阵、保存 case 时间与上游计数 |
+| `run-diagnostic-client.sh` | 执行约 19 分钟的第一轮热路径诊断 |
 | `collect-host-stats.sh` | 自动采集客户端 CPU、内存、Load 和负载进程 RSS |
 | `collect-compose-stats.sh` | 在被测主机本地采集容器资源 |
 | `collect-prometheus.sh` | 连续采集网关和 Worker 的低基数指标 |

@@ -19,7 +19,7 @@ type modelHandler struct {
 }
 
 type authorizedModelLister interface {
-	AuthorizedModels(context.Context, string) ([]string, error)
+	AuthorizedModels(context.Context, apikey.Identity) ([]string, error)
 }
 
 func (handler modelHandler) list(c *gin.Context) {
@@ -37,7 +37,7 @@ func (handler modelHandler) list(c *gin.Context) {
 		writeIdentityUnavailable(c)
 		return
 	}
-	allowed, err := handler.allowedModels(c.Request.Context(), identity.TenantID, models)
+	allowed, err := handler.allowedModels(c.Request.Context(), identity, models)
 	if err != nil {
 		writeAPIError(
 			c, http.StatusServiceUnavailable, "model catalog authorization is unavailable",
@@ -61,7 +61,7 @@ func (handler modelHandler) get(c *gin.Context) {
 		return
 	}
 	if err := handler.access.AuthorizeModel(
-		c.Request.Context(), identity.TenantID, model,
+		c.Request.Context(), identity, model,
 	); err != nil {
 		if errors.Is(err, apikey.ErrModelNotAllowed) {
 			writeAPIError(
@@ -104,11 +104,11 @@ func (handler modelHandler) get(c *gin.Context) {
 
 func (handler modelHandler) allowedModels(
 	ctx context.Context,
-	tenantID string,
+	identity apikey.Identity,
 	configured []string,
 ) ([]string, error) {
 	if lister, ok := handler.access.(authorizedModelLister); ok {
-		granted, err := lister.AuthorizedModels(ctx, tenantID)
+		granted, err := lister.AuthorizedModels(ctx, identity)
 		if err != nil {
 			return nil, err
 		}
@@ -129,7 +129,7 @@ func (handler modelHandler) allowedModels(
 	}
 	result := make([]string, 0, len(configured))
 	for _, model := range configured {
-		if err := handler.access.AuthorizeModel(ctx, tenantID, model); err == nil {
+		if err := handler.access.AuthorizeModel(ctx, identity, model); err == nil {
 			result = append(result, model)
 		} else if !errors.Is(err, apikey.ErrModelNotAllowed) {
 			return nil, err

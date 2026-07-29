@@ -260,49 +260,65 @@ func (worker *Worker) processBatch(ctx context.Context, messages []goredis.XMess
 	)
 	defer cancel()
 
+	entries := make([]storeEntry, 0, len(messages))
+	entryIDs := make([]string, 0, len(messages))
 	for _, message := range messages {
-		if err := worker.processMessage(batchContext, message); err != nil {
-			worker.stats.failed.Add(1)
-			slog.Error(
-				"usage worker entry failed",
-				"entry_id", message.ID,
-				"error", err,
+		payload, ok := streamString(message.Values["payload"])
+		if !ok {
+			worker.recordEntryError(
+				message.ID,
+				worker.handlePoison(batchContext, message, "missing_payload"),
 			)
+			continue
 		}
+		event, err := Decode([]byte(payload))
+		if err != nil {
+			worker.recordEntryError(
+				message.ID,
+				worker.handlePoison(batchContext, message, "invalid_event"),
+			)
+			continue
+		}
+		entries = append(entries, storeEntry{entryID: message.ID, event: event})
+		entryIDs = append(entryIDs, message.ID)
 		if batchContext.Err() != nil {
 			return
 		}
 	}
+	if len(entries) == 0 {
+		return
+	}
+
+	stored, duplicates, err := worker.store.putBatch(batchContext, entries)
+	if err != nil {
+		worker.stats.failed.Add(1)
+		slog.Error("usage worker batch failed", "entries", len(entries), "error", err)
+		return
+	}
+	worker.stats.stored.Add(stored)
+	worker.stats.duplicates.Add(duplicates)
+
+	if err := worker.acknowledge(batchContext, entryIDs); err != nil {
+		worker.stats.failed.Add(1)
+		slog.Error("usage worker acknowledgement failed", "entries", len(entryIDs), "error", err)
+	}
 }
 
-func (worker *Worker) processMessage(ctx context.Context, message goredis.XMessage) error {
-	payload, ok := streamString(message.Values["payload"])
-	if !ok {
-		return worker.handlePoison(ctx, message, "missing_payload")
+func (worker *Worker) recordEntryError(entryID string, err error) {
+	if err == nil {
+		return
 	}
-	event, err := Decode([]byte(payload))
-	if err != nil {
-		return worker.handlePoison(ctx, message, "invalid_event")
-	}
+	worker.stats.failed.Add(1)
+	slog.Error("usage worker entry failed", "entry_id", entryID, "error", err)
+}
 
-	duplicate, err := worker.store.Put(ctx, message.ID, event)
-	if err != nil {
-		return err
-	}
-	if duplicate {
-		worker.stats.duplicates.Add(1)
-	} else {
-		worker.stats.stored.Add(1)
-	}
-	_, err = worker.client.TxPipelined(ctx, func(pipe goredis.Pipeliner) error {
-		pipe.XAck(ctx, worker.config.StreamKey, worker.config.Group, message.ID)
-		pipe.XDel(ctx, worker.config.StreamKey, message.ID)
+func (worker *Worker) acknowledge(ctx context.Context, entryIDs []string) error {
+	_, err := worker.client.TxPipelined(ctx, func(pipe goredis.Pipeliner) error {
+		pipe.XAck(ctx, worker.config.StreamKey, worker.config.Group, entryIDs...)
+		pipe.XDel(ctx, worker.config.StreamKey, entryIDs...)
 		return nil
 	})
-	if err != nil {
-		return err
-	}
-	return nil
+	return err
 }
 
 func (worker *Worker) handlePoison(

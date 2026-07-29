@@ -100,6 +100,7 @@ type Manager struct {
 	pricing  Quoter
 	settings config.Quota
 	now      func() time.Time
+	policies *policyIndex
 }
 
 func NewManager(
@@ -115,7 +116,8 @@ func NewManager(
 		return nil, errors.New("quota manager settings are invalid")
 	}
 	return &Manager{
-		database: database, pricing: pricing, settings: settings, now: time.Now,
+		database: database, pricing: pricing, settings: settings,
+		now: time.Now, policies: newPolicyIndex(),
 	}, nil
 }
 
@@ -181,6 +183,7 @@ func (manager *Manager) createPolicy(
 	if err != nil {
 		return PolicyView{}, err
 	}
+	manager.policies.Put(policy)
 	return view, nil
 }
 
@@ -252,7 +255,11 @@ func (manager *Manager) updatePolicy(
 		}
 		return nil
 	})
-	return policyView(updated), err
+	if err != nil {
+		return PolicyView{}, err
+	}
+	manager.policies.Put(updated)
+	return policyView(updated), nil
 }
 
 func ensureTenant(transaction *gorm.DB, tenantID string) error {
@@ -363,6 +370,9 @@ func (manager *Manager) Reserve(
 	if input.GroupID == "" || input.TenantID == "" || input.GatewayModel == "" ||
 		input.EstimatedInputTokens < 0 || input.EstimatedOutputTokens < 0 {
 		return Decision{}, errors.New("quota reservation input is invalid")
+	}
+	if !manager.HasPolicy(input.TenantID, input.GatewayModel) {
+		return Decision{}, nil
 	}
 	totalTokens, ok := add(input.EstimatedInputTokens, input.EstimatedOutputTokens)
 	if !ok {

@@ -76,6 +76,12 @@ umask 077
   printf 'MODEL_VELO_POSTGRES_USER=model_velo\n'
   printf 'MODEL_VELO_POSTGRES_PASSWORD=%s\n' "$postgres_password"
   printf 'MODEL_VELO_POSTGRES_MAX_OPEN_CONNS=50\n'
+  printf 'MODEL_VELO_AUTH_CACHE_ENABLED=true\n'
+  printf 'MODEL_VELO_AUTH_CACHE_L1_MAX_ENTRIES=10000\n'
+  printf 'MODEL_VELO_AUTH_CACHE_L1_TTL=15s\n'
+  printf 'MODEL_VELO_AUTH_CACHE_L2_TTL=30s\n'
+  printf 'MODEL_VELO_AUTH_CACHE_KEY_PREFIX=model-velo:threehost:auth:v1\n'
+  printf 'MODEL_VELO_AUTH_CACHE_INVALIDATION_CHANNEL=model-velo:threehost:auth:v1:invalidate\n'
   printf 'MODEL_VELO_POSTGRES_MAX_IDLE_CONNS=10\n'
   printf 'MODEL_VELO_API_KEY_PEPPER=%s\n' "$api_key_pepper"
   printf 'MODEL_VELO_ADMIN_KEY_PEPPER=%s\n' "$admin_key_pepper"

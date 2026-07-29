@@ -36,6 +36,14 @@ func newUsageSession(
 	stream bool,
 	metrics *observability.Metrics,
 ) (*usageSession, error) {
+	startedAt := time.Now()
+	stageResult := "error"
+	defer func() {
+		metrics.RequestStage(
+			"usage_begin", stageResult, "", time.Since(startedAt),
+		)
+	}()
+
 	collector, err := usage.NewCollector(usage.NewEventInput{
 		RequestID:      requestIDFromContext(ctx),
 		TenantID:       tenantID,
@@ -57,6 +65,7 @@ func newUsageSession(
 		}
 		metrics.UsageDelivery("lifecycle_begin", "success")
 	}
+	stageResult = "success"
 	return &usageSession{
 		collector: collector, emitter: emitter, eventID: pending.EventID,
 		metrics: metrics,
@@ -94,9 +103,13 @@ func (session *usageSession) finish(c *gin.Context) {
 		settleContext, cancel := context.WithTimeout(
 			context.WithoutCancel(c.Request.Context()), 2*time.Second,
 		)
-		if err := session.quota.Settle(
+		startedAt := time.Now()
+		err := session.quota.Settle(
 			settleContext, session.reservationID, session.event,
-		); err != nil {
+		)
+		result := "success"
+		if err != nil {
+			result = "error"
 			slog.Error(
 				"quota settlement failed",
 				"request_id", session.event.RequestID,
@@ -104,19 +117,34 @@ func (session *usageSession) finish(c *gin.Context) {
 				"error", err,
 			)
 		}
+		session.metrics.RequestStage(
+			"quota_settle", result, "", time.Since(startedAt),
+		)
 		cancel()
 	}
-	if _, err := session.emitter.Emit(c.Request.Context(), session.event); err != nil {
+	startedAt := time.Now()
+	entryID, err := session.emitter.Emit(c.Request.Context(), session.event)
+	result := "queued"
+	if entryID != "" {
+		result = "published"
+	}
+	if err != nil {
+		result = "deferred"
+	}
+	session.metrics.RequestStage(
+		"usage_finalize", result, "", time.Since(startedAt),
+	)
+	if err != nil {
 		session.metrics.UsageDelivery("finalize", "deferred")
 		slog.Warn(
-			"usage immediate publish deferred",
+			"usage finalization deferred",
 			"request_id", session.event.RequestID,
 			"event_id", session.event.EventID,
 			"error", err,
 		)
 		return
 	}
-	session.metrics.UsageDelivery("finalize", "published")
+	session.metrics.UsageDelivery("finalize", result)
 }
 
 func (session *usageSession) attachQuota(

@@ -5,6 +5,7 @@ import (
 	"errors"   // 判断具体认证错误类型。
 	"net/http" // 读取请求头并使用 HTTP 状态码。
 	"strings"  // 解析 Authorization 请求头。
+	"time"
 
 	"github.com/gin-gonic/gin" // Gin 中间件与请求上下文。
 
@@ -17,8 +18,8 @@ const identityGinKey = "model-velo.identity" // 身份在 Gin Context 中的存�
 type identityContextKey struct{} // 身份在标准 context.Context 中使用的专用键类型。
 
 type AccessController interface { // 认证与模型授权服务接口。
-	Authenticate(ctx context.Context, plaintext string) (apikey.Identity, error) // 验证网关 API Key 并返回租户身份。
-	AuthorizeModel(ctx context.Context, tenantID, model string) error            // 检查租户是否允许使用指定模型。
+	Authenticate(ctx context.Context, plaintext string) (apikey.Identity, error)      // 验证网关 API Key 并返回租户身份。
+	AuthorizeModel(ctx context.Context, identity apikey.Identity, model string) error // 使用认证快照检查模型权限。
 }
 
 type RateLimiter interface { // 租户限流服务接口。
@@ -44,8 +45,25 @@ func authenticationMiddleware(access AccessController) gin.HandlerFunc { // 创�
 			return // 不再进入后续路由。
 		}
 
+		startedAt := time.Now()
 		identity, authenticateErr := access.Authenticate(c.Request.Context(), plaintext) // 验证 API Key 并取得租户身份。
-		if authenticateErr != nil {                                                      // API Key 验证失败。
+		result := "accepted"
+		switch {
+		case c.Request.Context().Err() != nil:
+			result = "canceled"
+		case errors.Is(authenticateErr, apikey.ErrInvalidCredential),
+			errors.Is(authenticateErr, apikey.ErrKeyInactive),
+			errors.Is(authenticateErr, apikey.ErrKeyRevoked),
+			errors.Is(authenticateErr, apikey.ErrKeyExpired),
+			errors.Is(authenticateErr, apikey.ErrTenantInactive):
+			result = "rejected"
+		case authenticateErr != nil:
+			result = "error"
+		}
+		routerMetrics(c).RequestStage(
+			"authentication", result, "", time.Since(startedAt),
+		)
+		if authenticateErr != nil { // API Key 验证失败。
 			if c.Request.Context().Err() != nil { // 请求已经取消时不再写响应。
 				return
 			}

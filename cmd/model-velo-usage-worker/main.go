@@ -96,7 +96,12 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("configure usage outbox emitter: %w", err)
 	}
-	relay, err := usage.NewOutboxRelay(database.ORM(), redisEmitter, usageConfig.WorkerTimeout)
+	relay, err := usage.NewOutboxRelay(
+		database.ORM(),
+		redisEmitter,
+		usageConfig.Group,
+		usageConfig.BatchSize,
+	)
 	if err != nil {
 		return fmt.Errorf("configure usage outbox relay: %w", err)
 	}

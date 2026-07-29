@@ -1,0 +1,1185 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Model‑Velo 三机性能实验报告</title>
+  <style>
+    :root {
+      --ink: #111a24;
+      --muted: #5a6874;
+      --paper: #f4f7f8;
+      --surface: #ffffff;
+      --line: #cfd9dd;
+      --line-dark: #81929b;
+      --cyan: #1e7898;
+      --cyan-soft: #d9edf3;
+      --orange: #d5683d;
+      --orange-soft: #fae3d9;
+      --green: #34836c;
+      --green-soft: #dceee8;
+      --amber: #b7892e;
+      --amber-soft: #f4ead0;
+      --red: #a9473e;
+      --red-soft: #f5ddda;
+      --mono: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+      --body: "Segoe UI", "Microsoft YaHei UI", sans-serif;
+      --display: Cambria, Georgia, "Songti SC", serif;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        linear-gradient(rgba(17,26,36,.035) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(17,26,36,.025) 1px, transparent 1px),
+        var(--paper);
+      background-size: 32px 32px;
+      font-family: var(--body);
+      line-height: 1.55;
+    }
+    a { color: var(--cyan); text-underline-offset: 3px; }
+    button, input, select { font: inherit; }
+    :focus-visible { outline: 3px solid var(--orange); outline-offset: 3px; }
+
+    .shell {
+      display: grid;
+      grid-template-columns: 240px minmax(0, 1fr);
+      min-height: 100vh;
+    }
+    .rail {
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      padding: 28px 24px;
+      color: #edf4f5;
+      background: var(--ink);
+      border-right: 5px solid var(--cyan);
+      overflow-y: auto;
+    }
+    .rail-brand {
+      font: 700 22px/1 var(--display);
+      letter-spacing: .02em;
+    }
+    .rail-code {
+      margin-top: 8px;
+      color: #9ec7d4;
+      font: 12px/1.4 var(--mono);
+    }
+    .rail nav { margin-top: 34px; }
+    .rail nav a {
+      display: block;
+      padding: 8px 0;
+      color: #b8c7cd;
+      text-decoration: none;
+      border-bottom: 1px solid rgba(255,255,255,.08);
+      font-size: 14px;
+    }
+    .rail nav a:hover { color: #fff; }
+    .rail-note {
+      margin-top: 30px;
+      padding-top: 18px;
+      border-top: 1px solid rgba(255,255,255,.16);
+      color: #9fb0b7;
+      font-size: 12px;
+    }
+    main { min-width: 0; padding: 38px clamp(22px, 5vw, 74px) 90px; }
+    .page { max-width: 1460px; margin: 0 auto; }
+
+    .eyebrow {
+      color: var(--cyan);
+      font: 700 12px/1.2 var(--mono);
+      letter-spacing: .13em;
+      text-transform: uppercase;
+    }
+    h1, h2, h3 { margin-top: 0; }
+    h1 {
+      max-width: 940px;
+      margin-bottom: 18px;
+      font: 700 clamp(42px, 6vw, 82px)/.98 var(--display);
+      letter-spacing: -.045em;
+    }
+    h2 {
+      margin-bottom: 20px;
+      font: 700 clamp(27px, 3vw, 42px)/1.08 var(--display);
+      letter-spacing: -.025em;
+    }
+    h3 { font-size: 17px; line-height: 1.25; }
+    .lead {
+      max-width: 880px;
+      margin: 0;
+      color: #33434d;
+      font-size: clamp(17px, 2vw, 22px);
+    }
+    .hero {
+      padding: 32px 0 42px;
+      border-bottom: 2px solid var(--ink);
+    }
+    .hero-meta {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 1px;
+      margin-top: 34px;
+      background: var(--line-dark);
+      border: 1px solid var(--line-dark);
+    }
+    .hero-meta > div { padding: 16px; background: var(--surface); }
+    .hero-meta dt {
+      margin-bottom: 7px;
+      color: var(--muted);
+      font: 11px/1.2 var(--mono);
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+    .hero-meta dd { margin: 0; font-weight: 700; overflow-wrap: anywhere; }
+
+    section {
+      padding: 64px 0;
+      border-bottom: 1px solid var(--line-dark);
+      scroll-margin-top: 18px;
+    }
+    .section-head {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(260px, 480px);
+      gap: 40px;
+      align-items: end;
+      margin-bottom: 28px;
+    }
+    .section-head p { margin: 0; color: var(--muted); }
+    .kicker {
+      display: block;
+      margin-bottom: 9px;
+      color: var(--orange);
+      font: 700 11px/1.2 var(--mono);
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+
+    .verdict {
+      display: grid;
+      grid-template-columns: 1.3fr .7fr;
+      gap: 1px;
+      background: var(--ink);
+      border: 1px solid var(--ink);
+    }
+    .verdict-main, .verdict-side { background: var(--surface); padding: clamp(24px, 4vw, 48px); }
+    .verdict-main strong {
+      display: block;
+      max-width: 760px;
+      font: 700 clamp(30px, 4vw, 56px)/1.05 var(--display);
+      letter-spacing: -.025em;
+    }
+    .verdict-main p { max-width: 760px; color: var(--muted); }
+    .verdict-side { background: var(--ink); color: #fff; }
+    .big-number { font: 700 clamp(54px, 7vw, 94px)/.9 var(--display); }
+    .unit { color: #99c5d3; font: 13px/1.4 var(--mono); }
+
+    .envelope { margin-top: 32px; padding: 24px; background: #e8eef0; border: 1px solid var(--line); }
+    .envelope-labels {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 10px;
+      color: var(--muted);
+      font: 11px/1.2 var(--mono);
+    }
+    .band {
+      position: relative;
+      display: grid;
+      grid-template-columns: 25fr 12.5fr 12.5fr 25fr 25fr;
+      height: 42px;
+      overflow: visible;
+      border: 1px solid var(--ink);
+    }
+    .band span:nth-child(1) { background: var(--green); }
+    .band span:nth-child(2) { background: #76a676; }
+    .band span:nth-child(3) { background: var(--amber); }
+    .band span:nth-child(4) { background: var(--orange); }
+    .band span:nth-child(5) { background: var(--red); }
+    .needle {
+      position: absolute;
+      top: -8px;
+      width: 2px;
+      height: 58px;
+      background: var(--ink);
+    }
+    .needle::before {
+      content: attr(data-label);
+      position: absolute;
+      left: 50%;
+      bottom: 100%;
+      padding: 3px 6px;
+      color: #fff;
+      background: var(--ink);
+      font: 10px/1.2 var(--mono);
+      transform: translateX(-50%);
+      white-space: nowrap;
+    }
+    .envelope-legend {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 12px;
+      margin-top: 18px;
+      color: #40515b;
+      font-size: 12px;
+    }
+    .envelope-legend b { display: block; color: var(--ink); font-family: var(--mono); }
+
+    .ledger {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      border-top: 1px solid var(--line-dark);
+      border-left: 1px solid var(--line-dark);
+    }
+    .ledger-item {
+      min-height: 122px;
+      padding: 19px;
+      background: rgba(255,255,255,.74);
+      border-right: 1px solid var(--line-dark);
+      border-bottom: 1px solid var(--line-dark);
+    }
+    .ledger-item .value {
+      display: block;
+      margin: 7px 0 6px;
+      font: 700 29px/1 var(--display);
+    }
+    .ledger-item .label { color: var(--muted); font-size: 12px; }
+    .status {
+      display: inline-block;
+      padding: 4px 8px;
+      border: 1px solid currentColor;
+      border-radius: 999px;
+      font: 700 10px/1 var(--mono);
+      text-transform: uppercase;
+    }
+    .ok { color: var(--green); }
+    .warn { color: var(--amber); }
+    .bad { color: var(--red); }
+    .info { color: var(--cyan); }
+
+    .grid-2, .grid-3 {
+      display: grid;
+      gap: 18px;
+      margin-top: 22px;
+    }
+    .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .panel {
+      min-width: 0;
+      padding: 22px;
+      background: var(--surface);
+      border: 1px solid var(--line-dark);
+      box-shadow: 5px 5px 0 rgba(17,26,36,.06);
+    }
+    .panel > p, .panel .note { color: var(--muted); font-size: 13px; }
+    .panel-accent { border-top: 5px solid var(--cyan); }
+    .panel-warn { border-top: 5px solid var(--orange); }
+    .panel-good { border-top: 5px solid var(--green); }
+    .panel-dark { color: #edf4f5; background: var(--ink); }
+    .panel-dark p, .panel-dark .note { color: #aebfc6; }
+
+    .chart { min-height: 280px; margin-top: 12px; }
+    .chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+    .axis { stroke: #9aa9b0; stroke-width: 1; }
+    .gridline { stroke: #d9e1e4; stroke-width: 1; stroke-dasharray: 3 5; }
+    .chart-label { fill: #667680; font: 10px var(--mono); }
+    .chart-value { fill: var(--ink); font: 10px var(--mono); }
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 16px;
+      margin-top: 12px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .legend i { display: inline-block; width: 18px; height: 3px; margin-right: 6px; vertical-align: middle; }
+
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      padding: 10px 8px;
+      color: #eaf1f3;
+      background: var(--ink);
+      text-align: left;
+      font: 700 10px/1.2 var(--mono);
+      letter-spacing: .04em;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+    td { padding: 9px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+    tbody tr:nth-child(even) { background: rgba(30,120,152,.04); }
+    tbody tr:hover { background: var(--cyan-soft); }
+    .table-wrap {
+      max-height: 610px;
+      overflow: auto;
+      background: var(--surface);
+      border: 1px solid var(--line-dark);
+    }
+    .mono { font-family: var(--mono); }
+    .num { text-align: right; font-variant-numeric: tabular-nums; }
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin: 16px 0;
+    }
+    .toolbar input, .toolbar select {
+      min-height: 42px;
+      padding: 8px 12px;
+      color: var(--ink);
+      background: #fff;
+      border: 1px solid var(--line-dark);
+    }
+    .toolbar input { flex: 1; min-width: 220px; }
+
+    .timeline { border-left: 2px solid var(--line-dark); margin-left: 8px; }
+    .timeline-item { position: relative; padding: 0 0 28px 28px; }
+    .timeline-item::before {
+      content: "";
+      position: absolute;
+      top: 4px;
+      left: -7px;
+      width: 12px;
+      height: 12px;
+      background: var(--surface);
+      border: 2px solid var(--cyan);
+      border-radius: 50%;
+    }
+    .timeline-item h3 { margin-bottom: 5px; font-family: var(--mono); }
+    .timeline-item p { margin: 4px 0; color: var(--muted); font-size: 13px; }
+
+    .evidence-list { display: grid; gap: 1px; background: var(--line-dark); border: 1px solid var(--line-dark); }
+    .evidence-row {
+      display: grid;
+      grid-template-columns: 210px 120px minmax(0, 1fr);
+      gap: 18px;
+      padding: 15px 17px;
+      background: var(--surface);
+      align-items: start;
+    }
+    .evidence-row b { font-family: var(--mono); font-size: 12px; }
+    .callout {
+      margin: 22px 0;
+      padding: 18px 20px;
+      background: var(--amber-soft);
+      border-left: 5px solid var(--amber);
+    }
+    .callout.bad-callout { background: var(--red-soft); border-color: var(--red); }
+    .callout strong { display: block; margin-bottom: 5px; }
+
+    .compare-row {
+      display: grid;
+      grid-template-columns: 150px minmax(0, 1fr) 110px;
+      gap: 12px;
+      align-items: center;
+      margin: 13px 0;
+    }
+    .compare-row .bar-track { height: 18px; background: #e1e8eb; border: 1px solid #bac7cc; }
+    .compare-row .bar-fill { height: 100%; background: var(--cyan); }
+    .compare-row.model .bar-fill {
+      background: repeating-linear-gradient(135deg, var(--orange), var(--orange) 7px, #e79470 7px, #e79470 14px);
+    }
+    .compare-row output { font: 700 12px var(--mono); text-align: right; }
+    .source-list { padding-left: 20px; }
+    .source-list li { margin: 9px 0; color: var(--muted); }
+
+    details {
+      margin-top: 16px;
+      background: rgba(255,255,255,.7);
+      border: 1px solid var(--line);
+    }
+    summary { cursor: pointer; padding: 12px 15px; font-weight: 700; }
+    details pre {
+      max-height: 430px;
+      margin: 0;
+      padding: 16px;
+      overflow: auto;
+      color: #dce8eb;
+      background: var(--ink);
+      font: 11px/1.55 var(--mono);
+      white-space: pre-wrap;
+    }
+    .footer {
+      padding-top: 38px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .print-only { display: none; }
+
+    @media (max-width: 1040px) {
+      .shell { display: block; }
+      .rail {
+        position: relative;
+        width: 100%;
+        height: auto;
+        padding: 18px 22px;
+        border-right: 0;
+        border-bottom: 5px solid var(--cyan);
+      }
+      .rail nav { display: none; }
+      .rail-note { display: none; }
+      main { padding-top: 18px; }
+      .hero-meta, .ledger { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 760px) {
+      .section-head, .verdict, .grid-2, .grid-3 { grid-template-columns: 1fr; }
+      .hero-meta, .ledger { grid-template-columns: 1fr; }
+      .envelope-legend { grid-template-columns: repeat(2, 1fr); }
+      .evidence-row { grid-template-columns: 1fr; gap: 6px; }
+      .compare-row { grid-template-columns: 105px minmax(0, 1fr) 70px; }
+      section { padding: 48px 0; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+      *, *::before, *::after { animation: none !important; transition: none !important; }
+    }
+    @media print {
+      .shell { display: block; }
+      .rail, .toolbar { display: none; }
+      main { padding: 0; }
+      section { break-inside: avoid; }
+      .table-wrap { max-height: none; overflow: visible; }
+      .print-only { display: block; }
+      body { background: #fff; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside class="rail" aria-label="报告导航">
+      <div class="rail-brand">Model‑Velo</div>
+      <div class="rail-code">PERF LAB / THREE‑HOST<br><span id="rail-run">loading…</span></div>
+      <nav>
+        <a href="#verdict">01 / 总结</a>
+        <a href="#capacity">02 / 容量与延迟</a>
+        <a href="#stream">03 / SSE 流式</a>
+        <a href="#reliability">04 / 可靠性与耐久</a>
+        <a href="#hotpath">05 / 热路径诊断</a>
+        <a href="#resources">06 / 资源与镜像</a>
+        <a href="#evidence">07 / 证据完整性</a>
+        <a href="#method">08 / 环境与口径</a>
+        <a href="#cases">09 / 全部 Case</a>
+        <a href="#artifacts">10 / 原始产物</a>
+      </nav>
+      <div class="rail-note">本文件自包含，可离线打开。报告含私网地址与运行元数据，不建议直接公开部署。</div>
+    </aside>
+
+    <main>
+      <div class="page">
+        <header class="hero">
+          <div class="eyebrow">Three‑host benchmark dossier · 2026‑07</div>
+          <h1 id="report-title">三机性能实验与热路径证据。</h1>
+          <p class="lead" id="report-lead">客户端 → Model‑Velo → Go 假上游；容量、延迟、依赖池和错误码使用同一 UTC 时间窗。</p>
+          <dl class="hero-meta" id="hero-meta"></dl>
+        </header>
+
+        <section id="verdict">
+          <span class="kicker">01 / decision line</span>
+          <h2>当前最可辩护的结论</h2>
+          <div class="verdict">
+            <div class="verdict-main">
+              <strong id="verdict-title"><span id="strict-rps">0</span> RPS 严格运行线。</strong>
+              <p id="verdict-detail">严格口径为成功率 ≥ 99.9%、k6 丢弃迭代为 0，并同时观察 P99。</p>
+            </div>
+            <div class="verdict-side">
+              <div class="big-number" id="strict-p99">357.56</div>
+              <div class="unit">ms · strict point P99</div>
+              <p id="verdict-side-detail">低负载 P50 增量 <b id="low-overhead">未运行</b>；流式首内容 P50 增量 <b id="ttft-overhead">未运行</b>。</p>
+            </div>
+          </div>
+          <div class="envelope" aria-label="当前运行包络">
+            <div class="envelope-labels"><span>0 RPS</span><span>500</span><span>750</span><span>1,000</span><span>1,500</span><span>2,000</span></div>
+            <div class="band">
+              <span></span><span></span><span></span><span></span><span></span>
+              <i class="needle" id="strict-needle" style="left:0" data-label="严格线"></i>
+              <i class="needle" id="edge-needle" style="left:0" data-label="下一档"></i>
+            </div>
+            <div class="envelope-legend">
+              <div><b>0–500</b>稳定区</div>
+              <div><b>500–750</b>严格 SLO 区</div>
+              <div><b>750–1,000</b>边缘区</div>
+              <div><b>1,500+</b>过载塌陷区</div>
+            </div>
+          </div>
+          <div class="ledger" id="top-ledger"></div>
+        </section>
+
+        <section id="capacity">
+          <div class="section-head">
+            <div><span class="kicker">02 / load envelope</span><h2>容量、吞吐与尾延迟</h2></div>
+            <p>闭环并发回答“固定并发下能跑多快”，开环到达率回答“给定业务流量能不能准时接住”。生产容量线应以后者为主，前者用于观察调度和平台形状。</p>
+          </div>
+          <div class="grid-2" id="closed-loop-panels">
+            <article class="panel panel-accent">
+              <h3>闭环网关吞吐</h3>
+              <p>每档并发按重复运行取中位数；闭环峰值用于定位吞吐拐点，不等同于生产 SLO。</p>
+              <div class="chart" id="capacity-chart"></div>
+            </article>
+            <article class="panel panel-warn">
+              <h3>闭环 P99</h3>
+              <p>同时展示 P50 与 P99，便于识别并发上升后是否出现排队和尾延迟放大。</p>
+              <div class="chart" id="capacity-latency-chart"></div>
+            </article>
+          </div>
+          <div class="grid-2">
+            <article class="panel">
+              <h3>开环：目标、实际与丢弃</h3>
+              <div class="chart" id="rate-chart"></div>
+            </article>
+            <article class="panel">
+              <h3>开环：成功率与 P99</h3>
+              <div class="chart" id="rate-quality-chart"></div>
+            </article>
+          </div>
+          <div class="callout bad-callout" id="capacity-callout">
+            <strong>1,500 RPS 的问题发生在上游之前，但本轮证据还不足以定位代码。</strong>
+            一个代表性 case 中，42,938 个 HTTP 请求只有 24,462 个到达假上游并成功，另有 18,476 个 5xx，P99 约 3.0 秒。假上游最大 active 只有个位数；这排除了“假 LLM 被打满”，却不能在缺少与主运行重叠的网关日志、容器资源和 Prometheus 时序时继续下结论。
+          </div>
+          <div class="panel" id="overhead-panel">
+            <h3>直连基线 vs 网关增量</h3>
+            <p>直连假上游在高并发时把客户端 CPU 打到 99% 以上；网关 case 的客户端 CPU 峰值仅约 10–12%。因此，摘要里的“客户端可能限制容量”只适用于直连高吞吐基线，不足以解释网关约 1.25k RPS 的平台。</p>
+            <div class="table-wrap" style="max-height:420px"><table><thead><tr><th>并发</th><th class="num">直连 RPS</th><th class="num">网关 RPS</th><th class="num">网关/直连</th><th class="num">P50 增量</th><th class="num">P99 增量</th></tr></thead><tbody id="overhead-table"></tbody></table></div>
+          </div>
+        </section>
+
+        <section id="stream">
+          <div class="section-head">
+            <div><span class="kicker">03 / server-sent events</span><h2>SSE 回放与逐 Chunk 观测</h2></div>
+            <p>独立 stream loader 记录 headers、首事件、首内容、总耗时和 chunk 间隔；请求数、并发和重复次数均取自本次运行元数据。</p>
+          </div>
+          <div class="ledger" id="stream-ledger"></div>
+          <div class="grid-2">
+            <article class="panel panel-good">
+              <h3>首内容与总完成时间</h3>
+              <div class="chart" id="stream-chart"></div>
+            </article>
+            <article class="panel">
+              <h3>怎么解读</h3>
+              <div id="stream-interpretation"></div>
+            </article>
+          </div>
+        </section>
+
+        <section id="reliability">
+          <div class="section-head">
+            <div><span class="kicker">04 / failure semantics</span><h2>缓存、故障恢复、队列与耐久</h2></div>
+            <p>这一组不是单纯追求成功率：error10 和 queue overload 会有意制造可接受错误。报告将“测试断言成功”和“业务 HTTP 2xx”分开。</p>
+          </div>
+          <div class="grid-3" id="diagnostic-cards"></div>
+          <div class="grid-2">
+            <article class="panel panel-accent">
+              <h3>17 项可靠性断言</h3>
+              <ol id="reliability-checks"></ol>
+            </article>
+            <article class="panel panel-warn">
+              <h3>本次可靠性诊断</h3>
+              <div id="reliability-findings"></div>
+            </article>
+          </div>
+        </section>
+
+        <section id="hotpath">
+          <div class="section-head">
+            <div><span class="kicker">05 / hot path</span><h2>请求阶段、依赖池与错误码</h2></div>
+            <p>每个 case 使用开始前和结束后的 Prometheus 累计值做差。阶段分位数来自 Histogram；<span class="mono">reliability</span> 包含 Queue、Provider、Retry 和 Fallback，因此不能与其子阶段相加。</p>
+          </div>
+          <div class="toolbar">
+            <select id="hotpath-case" aria-label="选择热路径 case"></select>
+          </div>
+          <div class="ledger" id="hotpath-ledger"></div>
+          <div class="grid-2">
+            <article class="panel panel-accent">
+              <h3>阶段 P99</h3>
+              <div id="hotpath-bars"></div>
+            </article>
+            <article class="panel">
+              <h3>阶段分位数</h3>
+              <div class="table-wrap" style="max-height:520px">
+                <table><thead><tr><th>阶段</th><th class="num">样本</th><th class="num">avg ms</th><th class="num">P50 ms</th><th class="num">P95 ms</th><th class="num">P99 ms</th></tr></thead><tbody id="hotpath-table"></tbody></table>
+              </div>
+            </article>
+          </div>
+          <article class="panel" style="margin-top:22px">
+            <h3>该 case 的网关错误码</h3>
+            <div class="table-wrap" style="max-height:320px">
+              <table><thead><tr><th>HTTP</th><th>内部错误码</th><th class="num">次数</th></tr></thead><tbody id="hotpath-errors"></tbody></table>
+            </div>
+          </article>
+          <div class="callout" id="hotpath-note"></div>
+        </section>
+
+        <section id="resources">
+          <div class="section-head">
+            <div><span class="kicker">06 / runtime envelope</span><h2>客户端、网关容器与镜像</h2></div>
+            <p>资源数据只使用与 case 时间窗重叠的采样；同时展示客户端负载生成器、网关容器内存和最终镜像体积。</p>
+          </div>
+          <div class="ledger" id="resource-ledger"></div>
+          <div class="grid-2">
+            <article class="panel">
+              <h3>按阶段 CPU 峰值</h3>
+              <div class="chart" id="resource-chart"></div>
+            </article>
+            <article class="panel">
+              <h3>按阶段资源明细</h3>
+              <div class="table-wrap" style="max-height:420px"><table><thead><tr><th>阶段</th><th class="num">样本</th><th class="num">CPU avg</th><th class="num">CPU max</th><th class="num">内存 max</th><th class="num">k6 RSS max</th></tr></thead><tbody id="resource-table"></tbody></table></div>
+            </article>
+          </div>
+          <article class="panel" style="margin-top:22px">
+            <h3>服务器采集窗口对齐</h3>
+            <div class="table-wrap" style="max-height:420px"><table><thead><tr><th>文件</th><th>类型</th><th>与主运行关系</th><th class="num">采样</th><th>开始 UTC</th><th>结束 UTC</th><th>资源峰值</th></tr></thead><tbody id="server-capture-table"></tbody></table></div>
+          </article>
+          <div class="callout" id="server-capture-note"><strong>服务器侧文件存在，但没有覆盖主运行。</strong></div>
+        </section>
+
+        <section id="evidence">
+          <div class="section-head">
+            <div><span class="kicker">07 / evidence audit</span><h2>哪些结论能说，哪些还不能</h2></div>
+            <p>“文件不存在”不是“指标为零”。尤其是 Usage：自动摘要把缺失证据显示成 observed=0，但这不能解释为 243 万事件全部丢失。</p>
+          </div>
+          <div class="evidence-list" id="evidence-list"></div>
+          <div class="grid-2">
+            <article class="panel">
+              <h3>四次运行痕迹</h3>
+              <div class="timeline" id="attempt-timeline"></div>
+            </article>
+            <article class="panel panel-dark" id="evidence-audit">
+              <h3>证据审计结论</h3>
+              <p>本轮是一次完整、可用于建立容量包络的客户端侧实验，但还不是一次可直接驱动代码改动的服务器侧性能剖析。</p>
+              <p>下一轮必须让网关/上游容器 stats、Prometheus、gateway evidence、错误响应分类和网关日志真正覆盖客户端主运行窗口。做到后，1,500 RPS 的 5xx 才能直接映射到 Queue wait timeout、Breaker、Redis、DB pool 或 Usage 链路。</p>
+              <p>主运行使用提交 <span class="mono" id="commit-full"></span>，且客户端 worktree=dirty。当前工作区之后的参数改动不属于这次实测。</p>
+            </article>
+          </div>
+        </section>
+
+        <section id="comparison" hidden>
+          <div class="section-head">
+            <div><span class="kicker">08 / external reference</span><h2>和其他网关怎么比</h2></div>
+            <p>唯一公平的排名来自同一硬件、同一客户端、同一假上游、同一功能开关。本节只提供公开结果的方向性坐标，不宣布跨环境“胜负”。</p>
+          </div>
+          <div class="grid-2">
+            <article class="panel panel-accent">
+              <h3>独立 CI 的低负载开销参考</h3>
+              <p>外部项目在同一 neutral CI runner + mock upstream 上测得 Bifrost、Portkey OSS 和 LiteLLM；Model‑Velo 条目来自本次三机 c=1 P50 直连差值，拓扑不同，用斜纹标记。</p>
+              <div id="external-bars"></div>
+              <p class="note">方向上，Model‑Velo 3.12 ms 位于该外部 Portkey 2.69 ms 与 LiteLLM 5.41 ms 之间，明显高于 Bifrost 0.56 ms；这只是“值得继续优化”的信号，不是同场排名。</p>
+            </article>
+            <article class="panel panel-warn">
+              <h3>厂商自报与项目公开状态</h3>
+              <table>
+                <thead><tr><th>网关</th><th>公开数字</th><th>能否直接比</th></tr></thead>
+                <tbody>
+                  <tr><td>Bifrost</td><td>t3.medium 2 vCPU / 4GB，5k RPS、100% 成功；自报内部 overhead 59µs</td><td><span class="status bad">不能</span> 排除项和 2.12s 上游不同</td></tr>
+                  <tr><td>Portkey OSS</td><td>项目 README 声称 &lt;1ms；独立 CI 复现为 2.69ms</td><td><span class="status warn">方向参考</span></td></tr>
+                  <tr><td>LiteLLM</td><td>本次检索未找到官方、可复现、同类自托管 RPS 基线；独立 CI 为 5.41ms</td><td><span class="status warn">方向参考</span></td></tr>
+                  <tr><td>GoModel</td><td>官方仓库未发布可复现 benchmark 数字</td><td><span class="status info">暂无数据</span></td></tr>
+                  <tr><td>Model‑Velo</td><td>本次：严格 750 RPS；低负载 P50 +3.12ms；SSE TTFT P50 +5.37ms</td><td><span class="status ok">本轮实测</span></td></tr>
+                </tbody>
+              </table>
+            </article>
+          </div>
+          <div class="callout"><strong>为什么不把 Bifrost 的 5,000 RPS 画进同一吞吐柱图？</strong>Bifrost 页面使用 0.13KB 请求、1.37KB 响应、平均端到端 2.12s，并将 JSON marshalling 和 HTTP 调用排除在“59µs overhead”之外；本次 Model‑Velo 是跨三台私网服务器、完整鉴权/限流/缓存/可靠性/Usage 路径。放在一根柱图里会制造虚假的精确性。</div>
+          <h3>来源与核对日期（2026‑07‑27）</h3>
+          <ul class="source-list">
+            <li><a href="https://github.com/cuihuan/awesome-ai-gateway" rel="noreferrer">Independent gateway overhead comparison</a>：同一 neutral CI runner、mock upstream；Bifrost 0.56ms、Portkey OSS 2.69ms、LiteLLM 5.41ms，并提供 <span class="mono">probe/overhead.mjs</span>。</li>
+            <li><a href="https://docs.getbifrost.ai/benchmarking/t3.medium" rel="noreferrer">Bifrost t3.medium benchmark</a>：实例、请求/响应大小、5k RPS、内存和内部阶段计时。</li>
+            <li><a href="https://docs.getbifrost.ai/benchmarking/run-your-own-benchmarks" rel="noreferrer">Bifrost run-your-own guide</a>：强调用自有工作负载运行，并在同机时采集进程内存。</li>
+            <li><a href="https://github.com/Portkey-AI/gateway" rel="noreferrer">Portkey OSS repository</a>：项目自己的 &lt;1ms 声明与功能说明。</li>
+            <li><a href="https://github.com/ENTERPILOT/GOModel" rel="noreferrer">GoModel repository</a>：截至核对日期未找到官方 benchmark 条目。</li>
+          </ul>
+        </section>
+
+        <section id="method">
+          <div class="section-head">
+            <div><span class="kicker">09 / reproducibility</span><h2>环境、配置与测量口径</h2></div>
+            <p>本报告对应测试提交，不对应当前未提交工作区。所有时间为 UTC；私网地址仅用于复盘三机拓扑。</p>
+          </div>
+          <div class="grid-2">
+            <article class="panel">
+              <h3>测试矩阵</h3>
+              <div id="matrix-table"></div>
+            </article>
+            <article class="panel">
+              <h3>客户端环境</h3>
+              <div id="environment-table"></div>
+            </article>
+          </div>
+          <details><summary>查看完整 client-metadata.txt</summary><pre id="metadata-raw"></pre></details>
+        </section>
+
+        <section id="cases">
+          <div class="section-head">
+            <div><span class="kicker">10 / complete case ledger</span><h2>全部测试 Case</h2></div>
+            <p>这里列出本次实际生成的全部 case；数值保留到足以回查同目录原始 JSON 和日志。</p>
+          </div>
+          <div class="toolbar">
+            <input id="case-search" type="search" placeholder="搜索 case / phase / target / model…" aria-label="搜索 case">
+            <select id="phase-filter" aria-label="按阶段筛选"><option value="">全部阶段</option></select>
+            <select id="target-filter" aria-label="按目标筛选"><option value="">全部目标</option><option value="gateway">gateway</option><option value="direct">direct</option></select>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Case</th><th>阶段</th><th>目标</th><th>负载</th><th>重复</th><th class="num">请求</th><th class="num">RPS</th><th class="num">成功</th><th class="num">P50</th><th class="num">P95</th><th class="num">P99</th><th class="num">Dropped</th><th class="num">上游 calls</th><th>原始文件</th></tr></thead>
+              <tbody id="case-table"></tbody>
+            </table>
+          </div>
+          <p class="note" id="case-count"></p>
+        </section>
+
+        <section id="artifacts">
+          <div class="section-head">
+            <div><span class="kicker">11 / raw evidence</span><h2>原始产物索引</h2></div>
+            <p>主运行目录内的每个文件都列在这里。日志和 JSON 链接使用相对路径，保持本 HTML 与结果目录一起移动即可打开。</p>
+          </div>
+          <div class="toolbar"><input id="artifact-search" type="search" placeholder="搜索文件名…" aria-label="搜索原始产物"></div>
+          <div class="table-wrap" style="max-height:520px">
+            <table><thead><tr><th>路径</th><th class="num">大小</th><th>UTC 修改时间</th></tr></thead><tbody id="artifact-table"></tbody></table>
+          </div>
+          <p class="note" id="artifact-count"></p>
+          <details><summary>查看本报告内嵌数据说明</summary><pre>summary.html 内嵌 summary.json、client-metadata.txt、client-stats.jsonl 的解析结果、运行尝试目录摘要、可靠性断言名称和产物索引。原始 k6 日志与每个 case 的 JSON 不重复嵌入，使用同目录相对链接访问。</pre></details>
+        </section>
+
+        <footer class="footer">
+          <p>Generated <span id="generated-at" class="mono"></span> · Model‑Velo Performance Lab · 本报告不构成生产 SLA。</p>
+        </footer>
+      </div>
+    </main>
+  </div>
+
+  <script id="report-data" type="application/json">__MODEL_VELO_REPORT_DATA__</script>
+  <script>
+  (() => {
+    "use strict";
+    const data = JSON.parse(document.getElementById("report-data").textContent);
+    const S = data.summary || {};
+    const k6Rows = S.cases || [];
+    const streamRows = S.stream || [];
+    const rows = [...k6Rows, ...streamRows];
+    const meta = data.metadata || {};
+
+    const $ = (id) => document.getElementById(id);
+    const esc = (value) => String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+    const n = (value) => Number(value || 0);
+    const fmt = (value, digits=1) => Number(value || 0).toLocaleString("zh-CN", {maximumFractionDigits: digits, minimumFractionDigits: digits});
+    const int = (value) => Math.round(n(value)).toLocaleString("zh-CN");
+    const pct = (value, digits=3) => `${fmt(n(value) * 100, digits)}%`;
+    const bytes = (value) => {
+      let x = n(value);
+      for (const unit of ["B","KB","MB","GB"]) {
+        if (x < 1024 || unit === "GB") return `${fmt(x, unit === "B" ? 0 : 1)} ${unit}`;
+        x /= 1024;
+      }
+    };
+    const median = (values) => {
+      const a = values.map(n).sort((x,y) => x-y);
+      if (!a.length) return 0;
+      const m = Math.floor(a.length / 2);
+      return a.length % 2 ? a[m] : (a[m-1] + a[m]) / 2;
+    };
+    const statusCount = (row, family) => {
+      const counts = row.status_counts || {};
+      if (family in counts) return n(counts[family]);
+      return Object.entries(counts).reduce((sum, [key,value]) => {
+        const code = Number(key);
+        if (family === "2xx" && code >= 200 && code < 300) return sum + n(value);
+        if (family === "4xx" && code >= 400 && code < 500) return sum + n(value);
+        if (family === "5xx" && code >= 500) return sum + n(value);
+        return sum;
+      }, 0);
+    };
+    const rowLatency = row => row.latency || row.total || {};
+    const aggregate = (items, key, value) => items.filter(x => String(x[key]) === String(value));
+
+    $("rail-run").textContent = meta.run_id || "unknown run";
+    $("commit-full").textContent = meta.commit || "unknown";
+    $("generated-at").textContent = data.generated_at || "";
+    $("metadata-raw").textContent = data.metadata_text || "metadata missing";
+
+    const start = Date.parse(meta.started_at || "");
+    const end = Date.parse(meta.ended_at || "");
+    const durationSeconds = Number.isFinite(start) && Number.isFinite(end) ? (end-start)/1000 : 0;
+    const durationText = durationSeconds ? `${Math.floor(durationSeconds/3600)}h ${Math.floor((durationSeconds%3600)/60)}m ${Math.round(durationSeconds%60)}s` : "unknown";
+    const totalRequests = rows.reduce((sum,row) => sum + n(row.requests), 0);
+    const ratePoints = (S.rate_sweep || []).sort((a,b) => n(a.load)-n(b.load));
+    const strict = ratePoints.filter(x => n(x.success_rate) >= .999 && n(x.dropped_iterations) === 0 && n(x.throughput_rps) >= n(x.load)*.99).at(-1) || {};
+    const nextRate = ratePoints.find(x=>n(x.load)>n(strict.load)) || {};
+    const lowOverhead = (S.comparisons || []).find(x => x.phase === "capacity" && String(x.load) === "1") || {};
+    const streamPair = (S.stream_comparisons || [])[0] || {};
+    const performanceDiagnostics = S.performance_diagnostics || [];
+    const usageReconciliation = S.usage_reconciliation || {};
+    const gatewayResource = (S.resources || []).find(x => String(x.container || "").toLowerCase().includes("gateway")) || {};
+    const gatewayImage = (S.images || []).find(x => x.repository === "model-velo") || {};
+
+    $("strict-rps").textContent = int(strict.load);
+    $("strict-p99").textContent = fmt(strict.p99_ms, 2);
+    $("low-overhead").textContent = Object.keys(lowOverhead).length ? `${fmt(lowOverhead.p50_delta_ms, 2)} ms` : "未运行";
+    $("ttft-overhead").textContent = Object.keys(streamPair).length ? `${fmt(streamPair.first_content_p50_delta_ms, 2)} ms` : "未运行";
+    $("report-title").innerHTML = meta.test_profile === "diagnostic"
+      ? "第一轮热路径诊断。<br>先找对瓶颈，再动参数。"
+      : "三机性能实验：<br>容量、长尾与可靠性。";
+    $("verdict-title").textContent = Object.keys(strict).length
+      ? `${int(strict.load)} RPS 是本轮严格运行线。`
+      : "本轮没有负载点满足严格运行线。";
+    $("verdict-detail").textContent = Object.keys(nextRate).length
+      ? `严格口径为成功率 ≥ 99.9%、零 dropped iterations、实际吞吐达到目标 99%。下一档 ${int(nextRate.load)} RPS：成功率 ${pct(nextRate.success_rate)}，P99 ${fmt(nextRate.p99_ms,2)} ms，dropped ${int(nextRate.dropped_iterations)}。`
+      : "严格口径为成功率 ≥ 99.9%、零 dropped iterations、实际吞吐达到目标 99%；请结合热路径阶段和依赖池证据判断余量。";
+    const maxRate = Math.max(1,...ratePoints.map(x=>n(x.load)));
+    $("strict-needle").style.left = `${Math.min(100,n(strict.load)/maxRate*100)}%`;
+    $("strict-needle").dataset.label = `严格线 ${int(strict.load)}`;
+    $("edge-needle").style.left = `${Math.min(100,n(nextRate.load)/maxRate*100)}%`;
+    $("edge-needle").dataset.label = Object.keys(nextRate).length ? `下一档 ${int(nextRate.load)}` : "无下一档";
+    $("hero-meta").innerHTML = [
+      ["Run ID", meta.run_id],
+      ["测试提交", (meta.commit || "").slice(0,12)],
+      ["持续时间", durationText],
+      ["测试档案", meta.test_profile || "complete"]
+    ].map(([k,v]) => `<div><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>`).join("");
+
+    const cacheShared = k6Rows.find(x => x.phase === "cache" && x.cache_mode === "shared") || {};
+    const gatewayCapacityValues = (S.capacity || []).filter(x=>x.target==="gateway");
+    const endurance = k6Rows.find(x=>x.phase==="endurance") || {};
+    const ledger = [
+      ["HTTP 交互", `${fmt(totalRequests/1e6,2)}M`, `${rows.length} cases`, "info"],
+      Object.keys(strict).length ? ["严格开环", `${int(strict.load)} RPS`, `P99 ${fmt(strict.p99_ms,2)} ms`, "ok"] : null,
+      gatewayCapacityValues.length ? ["闭环峰值", `${fmt(Math.max(...gatewayCapacityValues.map(x=>n(x.throughput_rps))),1)} RPS`, `${gatewayCapacityValues.length} 个并发点`, "warn"] : null,
+      Object.keys(cacheShared).length ? ["共享缓存卸载", `${fmt((1-n(cacheShared.upstream?.requests)/Math.max(1,n(cacheShared.requests)))*100,2)}%`, `${int(cacheShared.requests)} gateway → ${int(cacheShared.upstream?.requests)} upstream`, "ok"] : null,
+      Object.keys(endurance).length ? ["耐久", pct(endurance.success_rate), `${int(endurance.load)} RPS · ${int(statusCount(endurance,"5xx"))} × 5xx`, n(statusCount(endurance,"5xx"))?"warn":"ok"] : null,
+      n(usageReconciliation.expected_gateway_requests) ? ["Usage 对账", pct(usageReconciliation.observed_ratio), `${int(usageReconciliation.observed_usage_events)} / ${int(usageReconciliation.expected_gateway_requests)}`, n(usageReconciliation.difference)===0?"ok":"bad"] : null,
+      Object.keys(gatewayResource).length ? ["网关内存峰值", `${fmt(gatewayResource.memory_max_mb,1)} MB`, `${int(gatewayResource.samples)} 个重叠采样`, "info"] : null,
+      Object.keys(gatewayImage).length ? ["网关镜像", `${fmt(n(gatewayImage.size_bytes)/1e6,2)} MB`, `${gatewayImage.repository}:${gatewayImage.tag}`, "info"] : null,
+      performanceDiagnostics.some(item=>item.stages?.length) ? ["阶段证据", `${performanceDiagnostics.filter(item=>item.stages?.length).length} cases`, "Histogram + pool + runtime", "ok"] : ["阶段证据", "缺失", "检查镜像与监控窗口", "bad"]
+    ].filter(Boolean);
+    $("top-ledger").innerHTML = ledger.map(([label,value,note,kind]) => `<div class="ledger-item"><span class="status ${kind}">${esc(label)}</span><span class="value">${esc(value)}</span><span class="label">${esc(note)}</span></div>`).join("");
+    if (!gatewayCapacityValues.length) {
+      $("closed-loop-panels").hidden = true;
+      $("overhead-panel").hidden = true;
+    }
+    if (!streamRows.length) $("stream").hidden = true;
+    if (meta.test_profile === "diagnostic") {
+      $("reliability").hidden = true;
+      $("comparison").hidden = true;
+      document.querySelector(".envelope").hidden = true;
+    }
+    const firstUnstable = ratePoints.find(x=>n(x.success_rate)<.999 || n(x.dropped_iterations)>0 || n(x.throughput_rps)<n(x.load)*.99);
+    $("capacity-callout").innerHTML = firstUnstable
+      ? `<strong>首个未满足严格口径的点是 ${int(firstUnstable.load)} RPS。</strong>实际 ${fmt(firstUnstable.throughput_rps,1)} RPS，成功率 ${pct(firstUnstable.success_rate)}，P99 ${fmt(firstUnstable.p99_ms,2)} ms，dropped ${int(firstUnstable.dropped_iterations)}；请在“热路径诊断”切到同名 case 查看阶段、池等待和错误码。`
+      : `<strong>本轮所有开环点都满足严格口径。</strong>这只说明已测范围内稳定，不能外推到更高流量。`;
+
+    function lineChart(target, series, labels, options={}) {
+      const el = $(target);
+      const width = 680, height = 290, left = 54, right = 18, top = 20, bottom = 48;
+      const points = series.flatMap(s => s.values.map(v => n(v)));
+      let min = options.min ?? 0;
+      let max = options.max ?? Math.max(1, ...points) * 1.08;
+      if (max === min) max = min + 1;
+      const x = i => left + i * ((width-left-right)/Math.max(1, labels.length-1));
+      const y = v => top + (max-n(v)) * ((height-top-bottom)/(max-min));
+      let svg = `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${esc(options.label || "折线图")}">`;
+      for (let i=0;i<=4;i++) {
+        const value = max - (max-min)*i/4;
+        const yy = y(value);
+        svg += `<line class="gridline" x1="${left}" y1="${yy}" x2="${width-right}" y2="${yy}"/><text class="chart-label" x="${left-8}" y="${yy+3}" text-anchor="end">${esc(options.formatY ? options.formatY(value) : fmt(value,0))}</text>`;
+      }
+      labels.forEach((label,i) => svg += `<text class="chart-label" x="${x(i)}" y="${height-18}" text-anchor="middle">${esc(label)}</text>`);
+      series.forEach((s,si) => {
+        const path = s.values.map((v,i) => `${i?"L":"M"}${x(i)},${y(v)}`).join(" ");
+        svg += `<path d="${path}" fill="none" stroke="${s.color}" stroke-width="${s.width||3}" stroke-linejoin="round" stroke-linecap="round"/>`;
+        s.values.forEach((v,i) => svg += `<circle cx="${x(i)}" cy="${y(v)}" r="4" fill="${s.color}"><title>${esc(labels[i])}: ${esc(options.tooltip ? options.tooltip(v) : fmt(v,2))}</title></circle>`);
+      });
+      svg += `<line class="axis" x1="${left}" y1="${height-bottom}" x2="${width-right}" y2="${height-bottom}"/></svg>`;
+      svg += `<div class="legend">${series.map(s => `<span><i style="background:${s.color}"></i>${esc(s.name)}</span>`).join("")}</div>`;
+      el.innerHTML = svg;
+    }
+
+    const gatewayCapacity = (S.capacity || []).filter(x => x.target === "gateway").sort((a,b)=>n(a.load)-n(b.load));
+    lineChart("capacity-chart", [{name:"网关 RPS",color:"#1e7898",values:gatewayCapacity.map(x=>x.throughput_rps)}], gatewayCapacity.map(x=>`c${x.load}`), {label:"闭环网关吞吐",tooltip:v=>`${fmt(v,1)} RPS`});
+    lineChart("capacity-latency-chart", [
+      {name:"P99",color:"#d5683d",values:gatewayCapacity.map(x=>x.p99_ms)},
+      {name:"P50",color:"#34836c",values:gatewayCapacity.map(x=>x.p50_ms)}
+    ], gatewayCapacity.map(x=>`c${x.load}`), {label:"闭环网关延迟",tooltip:v=>`${fmt(v,2)} ms`});
+
+    const rate = (S.rate_sweep || []).sort((a,b)=>n(a.load)-n(b.load));
+    lineChart("rate-chart", [
+      {name:"目标 RPS",color:"#81929b",width:2,values:rate.map(x=>x.load)},
+      {name:"实际 RPS",color:"#1e7898",values:rate.map(x=>x.throughput_rps)}
+    ], rate.map(x=>int(x.load)), {label:"开环目标与实际吞吐",max:2100,tooltip:v=>`${fmt(v,1)} RPS`});
+    lineChart("rate-quality-chart", [
+      {name:"成功率 %",color:"#34836c",values:rate.map(x=>n(x.success_rate)*100)},
+      {name:"P99 / 40ms",color:"#d5683d",values:rate.map(x=>n(x.p99_ms)/40)}
+    ], rate.map(x=>int(x.load)), {label:"开环成功率与归一化尾延迟",max:105,formatY:v=>`${fmt(v,0)}`,tooltip:v=>fmt(v,2)});
+
+    const directByLoad = new Map((S.capacity || []).filter(x=>x.target==="direct").map(x=>[String(x.load),x]));
+    $("overhead-table").innerHTML = gatewayCapacity.map(g => {
+      const d = directByLoad.get(String(g.load)) || {};
+      const c = (S.comparisons || []).find(x=>x.phase==="capacity"&&String(x.load)===String(g.load)) || {};
+      return `<tr><td class="mono">c=${int(g.load)}</td><td class="num">${fmt(d.throughput_rps,1)}</td><td class="num">${fmt(g.throughput_rps,1)}</td><td class="num">${fmt(n(g.throughput_rps)/Math.max(1,n(d.throughput_rps))*100,2)}%</td><td class="num">${fmt(c.p50_delta_ms,2)} ms</td><td class="num">${fmt(c.p99_delta_ms,2)} ms</td></tr>`;
+    }).join("");
+
+    const directStream = streamRows.filter(x=>x.target==="direct");
+    const gatewayStream = streamRows.filter(x=>x.target==="gateway");
+    const streamMedian = (items,key,field) => median(items.map(x=>n((x[key]||{})[field])));
+    const gatewayStreamRequests = gatewayStream.reduce((a,x)=>a+n(x.requests),0);
+    const gatewayStreamSuccesses = gatewayStream.reduce((a,x)=>a+n(x.successes),0);
+    const gatewayStreamSuccessRate = gatewayStreamSuccesses / Math.max(1,gatewayStreamRequests);
+    const gatewayTTFTP99 = streamMedian(gatewayStream,"first_content","p99_ms");
+    $("stream-ledger").innerHTML = [
+      ["网关流请求", `${int(gatewayStreamRequests)}`, `${pct(gatewayStreamSuccessRate)} 正常结束`, gatewayStreamSuccessRate>=.999?"ok":"bad"],
+      ["网关 TTFT P99", `${fmt(gatewayTTFTP99,2)} ms`, `c=${esc(meta.stream_concurrency || "unknown")}`, "info"],
+      ["TTFT P50 增量", `${fmt(streamPair.first_content_p50_delta_ms,2)} ms`, "gateway − direct", "info"],
+      ["TTFT P99 增量", `${fmt(streamPair.first_content_p99_delta_ms,2)} ms`, "尾部抖动", "warn"],
+      ["Chunk gap P99", `+${fmt(streamPair.gap_p99_delta_ms,2)} ms`, "持续转发稳定", "ok"]
+    ].map(([label,value,note,kind]) => `<div class="ledger-item"><span class="status ${kind}">${esc(label)}</span><span class="value">${esc(value)}</span><span class="label">${esc(note)}</span></div>`).join("");
+    lineChart("stream-chart", [
+      {name:"直连",color:"#81929b",values:[
+        streamMedian(directStream,"first_content","p50_ms"),
+        streamMedian(directStream,"first_content","p99_ms"),
+        streamMedian(directStream,"total","p99_ms"),
+        streamMedian(directStream,"inter_chunk","p99_ms")
+      ]},
+      {name:"网关",color:"#1e7898",values:[
+        streamMedian(gatewayStream,"first_content","p50_ms"),
+        streamMedian(gatewayStream,"first_content","p99_ms"),
+        streamMedian(gatewayStream,"total","p99_ms"),
+        streamMedian(gatewayStream,"inter_chunk","p99_ms")
+      ]}
+    ], ["TTFT P50","TTFT P99","Total P99","Gap P99"], {label:"SSE直连与网关延迟",tooltip:v=>`${fmt(v,2)} ms`});
+    $("stream-interpretation").innerHTML = `<p><b>网关 TTFT P99：</b>${fmt(gatewayTTFTP99,2)} ms；正常结束 ${pct(gatewayStreamSuccessRate)}，共 ${int(gatewayStreamRequests)} 个网关 SSE 请求。</p>
+      <p><b>相对直连：</b>TTFT P50 增量 ${fmt(streamPair.first_content_p50_delta_ms,2)} ms，TTFT P99 增量 ${fmt(streamPair.first_content_p99_delta_ms,2)} ms，总耗时 P99 增量 ${fmt(streamPair.total_p99_delta_ms,2)} ms，inter-chunk P99 增量 ${fmt(streamPair.gap_p99_delta_ms,2)} ms。</p>
+      <div class="callout"><strong>提交边界也在可靠性用例中验证：</strong>首 chunk 前非法事件保持 HTTP 错误；首 chunk 已提交后断流不再切换 Provider。</div>`;
+
+    const diagNames = [
+      ["cache-shared-gateway-r1","共享缓存", row => `${int(row.requests)} → ${int(row.upstream?.requests)} upstream`, "ok"],
+      ["ramp-gateway","阶梯负载", row => `${pct(row.success_rate)} · P99 ${fmt(row.latency?.p99_ms,1)}ms`, "warn"],
+      ["burst-gateway","突发负载", row => `${pct(row.success_rate)} · ${int(statusCount(row,"5xx"))} 5xx`, "warn"],
+      ["fault-error10-gateway","10% 确定性错误", row => `${fmt(n(row.upstream?.requests)/Math.max(1,n(row.requests)),2)}× upstream`, "warn"],
+      ["fault-fallback-5xx-gateway","全量 5xx Fallback", row => `${pct(row.success_rate)} · ${int(row.upstreams?.fail?.requests)} failed calls`, "ok"],
+      ["fault-provider-recovery-gateway","Provider 恢复", row => `${pct(row.success_rate)} · ${int(row.upstreams?.fail?.requests)} primary calls`, "ok"],
+      ["queue-overload-r01000-gateway-r1","Queue 过载", row => `${pct(n(statusCount(row,"2xx"))/Math.max(1,n(row.requests)))} HTTP 2xx`, "bad"],
+      ["endurance-r00500-gateway-r1","30 分钟耐久", row => `${pct(row.success_rate)} · ${int(statusCount(row,"5xx"))} 5xx`, "warn"]
+    ].filter(([name]) => k6Rows.some(x=>x.case===name));
+    $("diagnostic-cards").innerHTML = diagNames.map(([name,label,render,kind]) => {
+      const row = k6Rows.find(x=>x.case===name) || {};
+      return `<article class="panel"><span class="status ${kind}">${esc(label)}</span><h3 style="margin-top:14px">${esc(render(row))}</h3><p>${esc(name)}</p></article>`;
+    }).join("");
+    $("reliability-checks").innerHTML = (data.reliability_checks || []).map(x=>`<li>${esc(x)}</li>`).join("");
+    const fallbackFailure = k6Rows.find(x=>x.case==="fault-fallback-5xx-gateway") || {};
+    const providerRecovery = k6Rows.find(x=>x.case==="fault-provider-recovery-gateway") || {};
+    const failScenario = providerRecovery.upstreams?.fail?.scenarios?.[0] || {};
+    const recoveryInjectedAt = Date.parse(providerRecovery.started_at || "");
+    const recoveryFirstAt = Date.parse(failScenario.first_request_at || "");
+    const recoverySeconds = Number.isFinite(recoveryInjectedAt) && Number.isFinite(recoveryFirstAt)
+      ? Math.max(0,(recoveryFirstAt-recoveryInjectedAt)/1000)
+      : null;
+    const usageChaos = S.usage_chaos || [];
+    $("reliability-findings").innerHTML = [
+      Object.keys(fallbackFailure).length
+        ? `<p><b>全量 5xx：</b>${int(fallbackFailure.requests)} 个请求成功率 ${pct(fallbackFailure.success_rate)}；故障 Provider ${int(fallbackFailure.upstreams?.fail?.requests)} 次调用，备用 Provider ${int(fallbackFailure.upstreams?.fallback?.requests)} 次调用。</p>`
+        : `<p><b>全量 5xx：</b>本次未运行可量化 Fallback case。</p>`,
+      Object.keys(providerRecovery).length
+        ? `<p><b>恢复放量：</b>${recoverySeconds===null?"恢复时间不可用":`${fmt(recoverySeconds,2)} 秒后首次重新打到主 Provider`}；主 Provider ${int(providerRecovery.upstreams?.fail?.requests)} 次，备用 ${int(providerRecovery.upstreams?.fallback?.requests)} 次，客户端成功率 ${pct(providerRecovery.success_rate)}。</p>`
+        : `<p><b>恢复放量：</b>本次未运行 Provider recovery case。</p>`,
+      usageChaos.length
+        ? `<p><b>Usage chaos：</b>${usageChaos.map(x=>`${esc(x.phase)} ${esc(x.stored_after_recovery)}`).join("；")}；完整 CSV 已随报告归档。</p>`
+        : `<p><b>Usage chaos：</b>未收到 Worker/Redis 中断、重复投递和毒消息证据。</p>`
+    ].join("");
+
+    const hotpath = S.performance_diagnostics || [];
+    const hotpathCase = $("hotpath-case");
+    hotpathCase.innerHTML = hotpath.length
+      ? hotpath.map((item,index)=>`<option value="${index}">${esc(item.case)} · ${esc(item.phase)} · load ${esc(item.load)}</option>`).join("")
+      : `<option value="">没有阶段指标</option>`;
+    function renderHotpath() {
+      const item = hotpath[n(hotpathCase.value)] || {};
+      const postgres = item.postgres || {};
+      const redis = item.redis || {};
+      const runtime = item.runtime || {};
+      const stages = item.stages || [];
+      $("hotpath-ledger").innerHTML = [
+        ["PostgreSQL wait", `${int(postgres.waits)} / ${fmt(postgres.wait_ms,1)} ms`, `in-use max ${int(postgres.in_use_max)} · open max ${int(postgres.open_max)}`, n(postgres.waits)?"warn":"ok"],
+        ["Redis wait", `${int(redis.waits)} / ${fmt(redis.wait_ms,1)} ms`, `timeouts ${int(redis.timeouts)} · pending max ${int(redis.pending_max)}`, n(redis.timeouts)?"bad":n(redis.waits)?"warn":"ok"],
+        ["Gateway process", `${fmt(runtime.process_cpu_avg_pct,1)}% CPU`, `RSS ${fmt(runtime.rss_max_mb,1)} MB · heap ${fmt(runtime.heap_max_mb,1)} MB`, "info"],
+        ["Go runtime", `${int(runtime.goroutines_max)} goroutines`, `${int(runtime.gc_cycles)} GC cycles`, "info"]
+      ].map(([label,value,note,kind]) => `<div class="ledger-item"><span class="status ${kind}">${esc(label)}</span><span class="value">${esc(value)}</span><span class="label">${esc(note)}</span></div>`).join("");
+      const maximum = Math.max(1,...stages.map(stage=>n(stage.p99_ms)));
+      $("hotpath-bars").innerHTML = stages.length
+        ? stages.map(stage=>`<div class="compare-row"><b>${esc(stage.stage)}</b><div class="bar-track"><div class="bar-fill" style="width:${n(stage.p99_ms)/maximum*100}%"></div></div><output>${fmt(stage.p99_ms,3)} ms</output></div>`).join("")
+        : `<p class="note">没有收到 <span class="mono">model_velo_request_stage_duration_seconds</span>；请确认网关镜像和 Prometheus 采集窗口。</p>`;
+      $("hotpath-table").innerHTML = stages.map(stage=>`<tr><td class="mono">${esc(stage.stage)}</td><td class="num">${int(stage.count)}</td><td class="num">${fmt(stage.avg_ms,3)}</td><td class="num">${fmt(stage.p50_ms,3)}</td><td class="num">${fmt(stage.p95_ms,3)}</td><td class="num">${fmt(stage.p99_ms,3)}</td></tr>`).join("");
+      const errors = item.errors || [];
+      $("hotpath-errors").innerHTML = errors.length
+        ? errors.map(error=>`<tr><td>${esc(error.status)}</td><td class="mono">${esc(error.code)}</td><td class="num">${int(error.count)}</td></tr>`).join("")
+        : `<tr><td colspan="3">该窗口没有分类 HTTP 错误。</td></tr>`;
+      const preProvider = stages.filter(stage=>["authentication","usage_begin","authorization","rate_limit","route_plan","quota_reserve"].includes(stage.stage));
+      const slowest = preProvider.sort((a,b)=>n(b.p99_ms)-n(a.p99_ms))[0];
+      $("hotpath-note").innerHTML = stages.length
+        ? `<strong>这个窗口最慢的前置阶段：${esc(slowest?.stage || "无")}，P99 ${fmt(slowest?.p99_ms,3)} ms。</strong>阶段 Histogram、池等待和错误码都按同一 case 时间窗求差，可直接决定下一步先优化认证、Usage、Quota、Redis 还是过载控制。`
+        : `<strong>当前结果不能定位热路径。</strong>采集窗口存在，但镜像没有输出阶段指标，或采集器没有覆盖这个 case。`;
+    }
+    hotpathCase.addEventListener("change",renderHotpath);
+    renderHotpath();
+
+    function phaseResources() {
+      const samples = data.client_stats || [];
+      const phases = [...new Set(rows.map(x=>x.phase))];
+      return phases.map(phase => {
+        const phaseRows = rows.filter(x=>x.phase===phase);
+        const from = Math.min(...phaseRows.map(x=>Date.parse(x.started_at)));
+        const to = Math.max(...phaseRows.map(x=>Date.parse(x.ended_at)));
+        const window = samples.filter(x => {
+          const t = Date.parse(x.timestamp);
+          return t >= from && t <= to;
+        });
+        const cpu = window.map(x=>n(x.cpu_pct));
+        const used = window.map(x=>(n(x.memory_total_bytes)-n(x.memory_available_bytes))/1048576);
+        const rss = window.map(x=>n(x.loadgen_rss_bytes)/1048576);
+        return {
+          phase, samples:window.length,
+          cpu_avg: cpu.reduce((a,x)=>a+x,0)/Math.max(1,cpu.length),
+          cpu_max: Math.max(0,...cpu),
+          memory_max: Math.max(0,...used),
+          rss_max: Math.max(0,...rss)
+        };
+      });
+    }
+    const phaseResource = phaseResources();
+    const cr = S.client_resource || {};
+    $("resource-ledger").innerHTML = [
+      ["采样点", int(cr.samples), "≈ 1 秒间隔", "info"],
+      ["客户端 CPU 峰值", `${fmt(cr.cpu_max_pct,1)}%`, "按 case 时间窗归属", n(cr.cpu_max_pct)>=90?"warn":"info"],
+      ["k6 RSS 峰值", `${fmt(cr.loadgen_rss_max_mb,0)} MB`, "负载生成器", "info"],
+      Object.keys(gatewayResource).length ? ["网关容器内存峰值", `${fmt(gatewayResource.memory_max_mb,1)} MB`, `${int(gatewayResource.samples)} samples`, "ok"] : ["网关容器内存峰值", "证据缺失", "需要重叠 Docker stats", "bad"],
+      Object.keys(gatewayImage).length ? ["Model‑Velo 镜像", `${fmt(n(gatewayImage.size_bytes)/1e6,2)} MB`, `${gatewayImage.repository}:${gatewayImage.tag}`, "ok"] : ["Model‑Velo 镜像", "证据缺失", "需要 compose-images.json", "bad"]
+    ].map(([label,value,note,kind]) => `<div class="ledger-item"><span class="status ${kind}">${esc(label)}</span><span class="value">${esc(value)}</span><span class="label">${esc(note)}</span></div>`).join("");
+    lineChart("resource-chart", [{name:"CPU max %",color:"#d5683d",values:phaseResource.map(x=>x.cpu_max)}], phaseResource.map(x=>x.phase), {label:"各阶段客户端CPU峰值",max:105,tooltip:v=>`${fmt(v,1)}%`});
+    $("resource-table").innerHTML = phaseResource.map(x=>`<tr><td>${esc(x.phase)}</td><td class="num">${int(x.samples)}</td><td class="num">${fmt(x.cpu_avg,1)}%</td><td class="num">${fmt(x.cpu_max,1)}%</td><td class="num">${fmt(x.memory_max,0)} MB</td><td class="num">${fmt(x.rss_max,0)} MB</td></tr>`).join("");
+
+    const captures = data.server_captures || [];
+    const relationLabels = {before:"主运行前结束",after:"主运行后开始",overlap:"覆盖主运行",unknown:"时间未知"};
+    const capturePeak = capture => {
+      const entries = Object.entries(capture.containers || {});
+      if (!entries.length) return "—";
+      const [name, value] = entries.sort((a,b)=>n(b[1].cpu_max_pct)-n(a[1].cpu_max_pct))[0];
+      return `${name.replace("model-velo-","").replace("-1","")}: ${fmt(value.cpu_max_pct,1)}% CPU / ${fmt(value.memory_max_mb,0)} MB`;
+    };
+    $("server-capture-table").innerHTML = captures.map(capture => `<tr><td class="mono"><a href="${encodeURI(capture.path)}">${esc(capture.path)}</a></td><td>${esc(capture.kind)}</td><td><span class="status ${capture.relation==="overlap"?"ok":capture.relation==="unknown"?"warn":"bad"}">${esc(relationLabels[capture.relation]||capture.relation)}</span></td><td class="num">${int(capture.samples)}</td><td class="mono">${esc(capture.first||"—")}</td><td class="mono">${esc(capture.last||"—")}</td><td>${esc(capturePeak(capture))}</td></tr>`).join("");
+    const alignedCapture = captures.find(x=>x.kind==="docker-stats"&&x.relation==="overlap");
+    const postCapture = captures.find(x=>x.kind==="docker-stats"&&x.relation==="after");
+    const postPeak = postCapture ? capturePeak(postCapture) : "";
+    $("server-capture-note").innerHTML = alignedCapture
+      ? `<strong>服务器采集与客户端主运行有时间重叠。</strong>容器 CPU、内存和 Prometheus 阶段数据可以按 case 窗口用于解释容量曲线。`
+      : postCapture
+        ? `<strong>服务器文件与主运行零重叠，不能用于解释容量曲线。</strong>后置窗口观测到 ${esc(postPeak)}，只能作为测试后状态线索。`
+        : `<strong>服务器采集没有覆盖主运行。</strong>容器资源与阶段数据不能用于解释容量曲线。`;
+
+    const gatewayCaptures = captures.filter(x=>x.kind==="docker-stats"&&x.path.includes("gateway-stats"));
+    const upstreamCaptures = captures.filter(x=>x.kind==="docker-stats"&&x.path.includes("upstream-stats"));
+    const prometheusCaptures = captures.filter(x=>x.kind==="prometheus");
+    const captureEvidence = list => {
+      if (list.some(x=>x.relation==="overlap")) return ["覆盖","采样窗口与主运行有交集","ok"];
+      if (list.length) return ["时间错位",`${list.length} 个文件存在，但与主运行零重叠`,"bad"];
+      return ["缺失","没有收到采集文件","bad"];
+    };
+    const gatewayEvidence = captureEvidence(gatewayCaptures);
+    const upstreamEvidence = captureEvidence(upstreamCaptures);
+    const prometheusEvidence = captureEvidence(prometheusCaptures);
+    const hasUsage = data.artifacts.some(x=>x.path.startsWith("gateway-evidence/") || /usage-(overview|status|diagnostics)/.test(x.path));
+    const usageExact = n(usageReconciliation.expected_gateway_requests)>0 && n(usageReconciliation.difference)===0;
+    const hasUsageChaos = (S.usage_chaos || []).length >= 4;
+    const evidence = [
+      ["k6 case summaries","完整",`${rows.length} cases；HTTP 分位数、成功率、状态族和 dropped iterations`,"ok"],
+      ["SSE chunk timing","完整",`${streamRows.length} cases；headers / first event / first content / total / inter-chunk`,"ok"],
+      ["假上游计数","完整","每个 case 有 requests / errors / max_active / scenario 计数","ok"],
+      ["客户端资源","完整",`${int(cr.samples)} samples；CPU / memory / load / k6 RSS`,"ok"],
+      ["网关容器资源",...gatewayEvidence],
+      ["上游容器资源",...upstreamEvidence],
+      ["Prometheus",...prometheusEvidence],
+      ["Usage 请求对账",hasUsage?(usageExact?"一致":"不一致"):"缺失",hasUsage?`${int(usageReconciliation.observed_usage_events)} stored / ${int(usageReconciliation.expected_gateway_requests)} expected`:"没有收到 PostgreSQL/Redis 证据",usageExact?"ok":"bad"],
+      ["Usage 故障恢复",hasUsageChaos?"完整":"缺失",hasUsageChaos?"Worker/Redis outage、重复投递、毒消息":"需要 usage-chaos/summary.csv",hasUsageChaos?"ok":"bad"]
+    ];
+    $("evidence-list").innerHTML = evidence.map(([name,state,note,kind])=>`<div class="evidence-row"><b>${esc(name)}</b><span class="status ${kind}">${esc(state)}</span><span>${esc(note)}</span></div>`).join("");
+    const serverAligned = gatewayEvidence[0] === "覆盖" && upstreamEvidence[0] === "覆盖" && prometheusEvidence[0] === "覆盖";
+    const stagesAvailable = performanceDiagnostics.some(item=>item.stages?.length);
+    $("evidence-audit").innerHTML = `<h3>证据审计结论</h3>
+      <p>${serverAligned ? "网关、上游容器和 Prometheus 采集与客户端主运行有时间交集。" : "至少一类服务器采集没有覆盖客户端主运行；相关资源结论无效。"}</p>
+      <p>${stagesAvailable ? "阶段 Histogram、依赖池、Go runtime 和内部错误码已经能够按 case 对齐，可用于选择下一项代码优化。" : "没有可用的逐阶段 Histogram；本轮不能把长尾归因到认证、Usage、Quota、Redis、Queue 或 Provider。"}</p>
+      <p>测试提交 <span class="mono">${esc(meta.commit || "unknown")}</span> · worktree ${esc(meta.worktree || "unknown")} · profile ${esc(meta.test_profile || "complete")}。</p>`;
+
+    const attemptText = {
+      "complete":"完整主运行",
+      "smoke failed":"Smoke 失败后停止",
+      "interrupted":"Smoke/预热通过，容量阶段早停",
+      "earlier failed run":"不同提交的早期失败运行",
+      "other":"其他运行"
+    };
+    $("attempt-timeline").innerHTML = (data.attempts || []).map(x=>`<div class="timeline-item"><h3>${esc(x.name)}</h3><span class="status ${x.status==="complete"?"ok":x.status==="interrupted"?"warn":"bad"}">${esc(attemptText[x.status]||x.status)}</span><p>${int(x.case_count)} cases · ${int(x.file_count)} files · ${bytes(x.bytes)}</p><p>${esc((x.commit||"unknown").slice(0,12))} · ${esc(x.started_at||"time missing")}</p></div>`).join("");
+
+    const external = [
+      {name:"Bifrost",value:.56},
+      {name:"Portkey OSS",value:2.69},
+      {name:"Model‑Velo*",value:n(lowOverhead.p50_delta_ms),model:true},
+      {name:"LiteLLM",value:5.41}
+    ];
+    const extMax = Math.max(...external.map(x=>x.value));
+    $("external-bars").innerHTML = external.map(x=>`<div class="compare-row ${x.model?"model":""}"><b>${esc(x.name)}</b><div class="bar-track"><div class="bar-fill" style="width:${n(x.value)/extMax*100}%"></div></div><output>${fmt(x.value,2)} ms</output></div>`).join("");
+
+    function keyValueTable(items) {
+      return `<table><tbody>${items.map(([k,v])=>`<tr><td>${esc(k)}</td><td class="mono">${esc(v)}</td></tr>`).join("")}</tbody></table>`;
+    }
+    $("matrix-table").innerHTML = keyValueTable([
+      ["容量并发",meta.capacity_vus],
+      ["开环 RPS",meta.rate_sweep],
+      ["重复次数",meta.repetitions],
+      ["SSE",`${meta.stream_requests} requests @ c=${meta.stream_concurrency}`],
+      ["Ramp",meta.ramp_stages],
+      ["Burst",meta.burst_stages],
+      ["Fault recovery",`${meta.fault_recovery_rate || "—"} RPS · ${meta.fault_recovery_failure_duration || "—"} failure + ${meta.fault_recovery_healthy_duration || "—"} recovery`],
+      ["Queue",`${meta.queue_rate} RPS · VUs ${meta.queue_pre_allocated_vus}/${meta.queue_max_vus}`],
+      ["Endurance",`${meta.endurance_rate} RPS · ${meta.endurance_duration}`]
+    ]);
+    $("environment-table").innerHTML = keyValueTable([
+      ["客户端",meta.host || "详见 client-metadata.txt"],
+      ["k6",meta.k6_version],
+      ["Python",meta.python_version],
+      ["Gateway",meta.gateway_url],
+      ["Upstream",meta.upstream_url],
+      ["Worktree",meta.worktree]
+    ]);
+
+    const phases = [...new Set(rows.map(x=>x.phase))].sort();
+    $("phase-filter").innerHTML += phases.map(x=>`<option value="${esc(x)}">${esc(x)}</option>`).join("");
+    const caseSearch = $("case-search"), phaseFilter = $("phase-filter"), targetFilter = $("target-filter");
+    function rawLink(row) {
+      const suffix = row.mode === "streamload" ? "-stream.json" : "-summary.json";
+      return `<a href="${encodeURI(row.case+suffix)}">JSON</a>${row.mode==="streamload"?"":` · <a href="${encodeURI(row.case+".log")}">log</a>`}`;
+    }
+    function renderCases() {
+      const query = caseSearch.value.trim().toLowerCase();
+      const filtered = rows.filter(row => {
+        const haystack = [row.case,row.phase,row.target,row.model,row.cache_mode].join(" ").toLowerCase();
+        return (!query || haystack.includes(query)) && (!phaseFilter.value || row.phase===phaseFilter.value) && (!targetFilter.value || row.target===targetFilter.value);
+      });
+      $("case-table").innerHTML = filtered.map(row => {
+        const latency = rowLatency(row);
+        return `<tr><td class="mono">${esc(row.case)}</td><td>${esc(row.phase)}</td><td>${esc(row.target)}</td><td class="mono">${esc(row.load)}</td><td class="num">${esc(row.repetition)}</td><td class="num">${int(row.requests)}</td><td class="num">${fmt(row.throughput_rps,1)}</td><td class="num">${pct(row.success_rate)}</td><td class="num">${fmt(latency.p50_ms,2)}</td><td class="num">${fmt(latency.p95_ms,2)}</td><td class="num">${fmt(latency.p99_ms,2)}</td><td class="num">${int(row.dropped_iterations)}</td><td class="num">${int(row.upstream?.requests)}</td><td>${rawLink(row)}</td></tr>`;
+      }).join("");
+      $("case-count").textContent = `显示 ${filtered.length} / ${rows.length} cases`;
+    }
+    [caseSearch,phaseFilter,targetFilter].forEach(el=>el.addEventListener("input",renderCases));
+    renderCases();
+
+    const artifactSearch = $("artifact-search");
+    function renderArtifacts() {
+      const query = artifactSearch.value.trim().toLowerCase();
+      const artifacts = (data.artifacts || []).filter(x=>x.path.toLowerCase().includes(query));
+      $("artifact-table").innerHTML = artifacts.map(x=>`<tr><td class="mono"><a href="${encodeURI(x.path)}">${esc(x.path)}</a></td><td class="num">${bytes(x.bytes)}</td><td>${esc(x.modified_at)}</td></tr>`).join("");
+      $("artifact-count").textContent = `显示 ${artifacts.length} / ${(data.artifacts||[]).length} files`;
+    }
+    artifactSearch.addEventListener("input",renderArtifacts);
+    renderArtifacts();
+  })();
+  </script>
+</body>
+</html>

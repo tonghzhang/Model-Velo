@@ -95,7 +95,7 @@ func (h embeddingHandler) create(c *gin.Context) {
 	}
 	defer session.finish(c)
 
-	if err := h.access.AuthorizeModel(c.Request.Context(), identity.TenantID, model); err != nil {
+	if err := h.access.AuthorizeModel(c.Request.Context(), identity, model); err != nil {
 		if errors.Is(err, apikey.ErrModelNotAllowed) {
 			writeAPIError(
 				c, http.StatusForbidden,
@@ -244,6 +244,11 @@ func (h embeddingHandler) reserveQuota(
 	plan routing.Plan,
 ) bool {
 	if h.quota == nil {
+		return true
+	}
+	if !h.quota.HasPolicy(tenantID, model) {
+		h.metrics.RequestStage("quota_reserve", "no_policy", "", 0)
+		h.metrics.Quota("no_policy")
 		return true
 	}
 	decision, err := h.quota.Reserve(c.Request.Context(), quota.ReserveInput{

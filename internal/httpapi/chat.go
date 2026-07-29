@@ -163,15 +163,29 @@ func (h chatHandler) complete(c *gin.Context) {
 		return
 	}
 
-	if err := h.access.AuthorizeModel( // 检查该租户是否允许使用当前模型。
+	startedAt := time.Now()
+	authorizationErr := h.access.AuthorizeModel( // 检查该租户是否允许使用当前模型。
 		c.Request.Context(),
-		identity.TenantID,
+		identity,
 		model,
-	); err != nil {
+	)
+	authorizationResult := "allowed"
+	switch {
+	case c.Request.Context().Err() != nil:
+		authorizationResult = "canceled"
+	case errors.Is(authorizationErr, apikey.ErrModelNotAllowed):
+		authorizationResult = "denied"
+	case authorizationErr != nil:
+		authorizationResult = "error"
+	}
+	h.metrics.RequestStage(
+		"authorization", authorizationResult, "", time.Since(startedAt),
+	)
+	if authorizationErr != nil {
 		if c.Request.Context().Err() != nil { // 请求已经取消时不再写响应。
 			return
 		}
-		if errors.Is(err, apikey.ErrModelNotAllowed) { // API Key 没有模型权限。
+		if errors.Is(authorizationErr, apikey.ErrModelNotAllowed) { // API Key 没有模型权限。
 			writeAPIError(
 				c,
 				http.StatusForbidden, // 返回 403。
@@ -194,7 +208,22 @@ func (h chatHandler) complete(c *gin.Context) {
 		return
 	}
 
+	startedAt = time.Now()
 	limitDecision, err := h.limiter.Allow(c.Request.Context(), identity.TenantID, model) // 查询租户和模型的限流额度。
+	limitResult := "allowed"
+	switch {
+	case c.Request.Context().Err() != nil:
+		limitResult = "canceled"
+	case err != nil:
+		limitResult = "error"
+	case !limitDecision.Allowed:
+		limitResult = "rejected"
+	case limitDecision.Bypassed:
+		limitResult = "bypassed"
+	}
+	h.metrics.RequestStage(
+		"rate_limit", limitResult, "", time.Since(startedAt),
+	)
 	if err != nil {
 		if c.Request.Context().Err() != nil { // 请求已经取消。
 			return
@@ -257,7 +286,15 @@ func (h chatHandler) complete(c *gin.Context) {
 		c.Request.Context(),
 		active.CacheNamespace,
 	))
+	startedAt = time.Now()
 	routePlan, err := active.Routes.Plan(model, requiredCapabilities) // 生成符合模型和能力要求的候选 Provider。
+	routeResult := "planned"
+	if err != nil {
+		routeResult = "error"
+	}
+	h.metrics.RequestStage(
+		"route_plan", routeResult, "", time.Since(startedAt),
+	)
 	if err != nil {
 		if errors.Is(err, routing.ErrCapabilityUnavailable) { // 没有 Provider 支持请求能力。
 			writeAPIError(
@@ -306,7 +343,15 @@ func (h chatHandler) complete(c *gin.Context) {
 
 	cacheResult := responsecache.Result{Status: responsecache.StatusBypass} // 默认标记为绕过缓存。
 	if !requestBypassesResponseCache(c.Request) {                           // 请求头没有 no-store 时才查询缓存。
+		startedAt = time.Now()
 		cacheResult, err = h.cache.Lookup(c.Request.Context(), identity.TenantID, model, requestBody) // 用租户、模型和请求体查缓存。
+		cacheLookupResult := string(cacheResult.Status)
+		if err != nil {
+			cacheLookupResult = "error"
+		}
+		h.metrics.RequestStage(
+			"cache_lookup", cacheLookupResult, "", time.Since(startedAt),
+		)
 		if err != nil {
 			if c.Request.Context().Err() != nil { // 请求取消时停止处理。
 				return
@@ -349,11 +394,19 @@ func (h chatHandler) complete(c *gin.Context) {
 	h.metrics.Cache("lookup", string(cacheResult.Status))
 	usageSession.setCacheStatus(string(cacheResult.Status))
 
+	startedAt = time.Now()
 	execution, failure := active.Chat.Execute(c.Request.Context(), reliability.ExecutionInput{ // 执行 Provider 调用和回退。
 		RequestID: requestIDFromContext(c.Request.Context()), // 当前网关请求 ID。
 		Request:   request,                                   // 解析后的聊天请求。
 		Plan:      routePlan,                                 // 路由候选计划。
 	})
+	executionResult := "success"
+	if failure != nil {
+		executionResult = string(failure.Category)
+	}
+	h.metrics.RequestStage(
+		"reliability", executionResult, "", time.Since(startedAt),
+	)
 	if failure != nil {
 		h.observeFailure(requestIDFromContext(c.Request.Context()), failure)
 		usageSession.recordFailure(failure)
@@ -379,13 +432,22 @@ func (h chatHandler) complete(c *gin.Context) {
 	usageSession.recordExecution(execution)
 	usageSession.observe(responseBody)
 	if cacheResult.Status == responsecache.StatusMiss && execution.Fallbacks == 0 { // 只有缓存未命中且未切换 Provider 时才缓存。
-		if err := h.cache.Store(
+		startedAt = time.Now()
+		err := h.cache.Store(
 			c.Request.Context(),
 			identity.TenantID,
 			model,
 			requestBody,
 			responseBody,
-		); err != nil {
+		)
+		cacheStoreResult := "stored"
+		if err != nil {
+			cacheStoreResult = "error"
+		}
+		h.metrics.RequestStage(
+			"cache_store", cacheStoreResult, "", time.Since(startedAt),
+		)
+		if err != nil {
 			if c.Request.Context().Err() != nil { // 请求取消时停止。
 				return
 			}
@@ -433,6 +495,11 @@ func (h chatHandler) reserveQuota(
 	if h.quota == nil {
 		return true
 	}
+	if !h.quota.HasPolicy(tenantID, model) {
+		h.metrics.RequestStage("quota_reserve", "no_policy", "", 0)
+		h.metrics.Quota("no_policy")
+		return true
+	}
 	output := h.quota.DefaultMaxOutputTokens()
 	if request.MaxCompletionTokens != nil {
 		output = int64(*request.MaxCompletionTokens)
@@ -442,6 +509,7 @@ func (h chatHandler) reserveQuota(
 	if request.N != nil && *request.N > 1 {
 		output *= int64(*request.N)
 	}
+	startedAt := time.Now()
 	decision, err := h.quota.Reserve(c.Request.Context(), quota.ReserveInput{
 		GroupID:               session.eventID,
 		TenantID:              tenantID,
@@ -450,6 +518,24 @@ func (h chatHandler) reserveQuota(
 		EstimatedOutputTokens: output,
 		Plan:                  plan,
 	})
+	result := "allowed"
+	switch {
+	case c.Request.Context().Err() != nil:
+		result = "canceled"
+	case errors.Is(err, quota.ErrExceeded):
+		result = "denied"
+	case err != nil:
+		result = "error"
+	case decision.Exceeded:
+		result = "allowed_overage"
+	case len(decision.Alerts) > 0:
+		result = "allowed_alert"
+	case decision.AppliedPolicies == 0:
+		result = "no_policy"
+	}
+	h.metrics.RequestStage(
+		"quota_reserve", result, "", time.Since(startedAt),
+	)
 	if err != nil {
 		if errors.Is(err, quota.ErrExceeded) {
 			h.metrics.Quota("denied")
@@ -598,11 +684,19 @@ func (h chatHandler) stream(
 		return
 	}
 
+	startedAt := time.Now()
 	prepared, failure := orchestrator.OpenStream(c.Request.Context(), reliability.ExecutionInput{ // 打开上游流并取得首个事件。
 		RequestID: requestIDFromContext(c.Request.Context()),
 		Request:   request,
 		Plan:      plan,
 	})
+	result := "success"
+	if failure != nil {
+		result = string(failure.Category)
+	}
+	h.metrics.RequestStage(
+		"reliability", result, "", time.Since(startedAt),
+	)
 	if failure != nil {
 		h.observeFailure(requestIDFromContext(c.Request.Context()), failure)
 		usageSession.recordFailure(failure)

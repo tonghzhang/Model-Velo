@@ -14,6 +14,7 @@ import (
 	"model-velo/internal/apikey"
 	"model-velo/internal/config"
 	"model-velo/internal/postgres"
+	redisstore "model-velo/internal/redis"
 	"model-velo/internal/usage"
 )
 
@@ -53,10 +54,25 @@ func run(ctx context.Context, arguments []string) error {
 	if err != nil {
 		return fmt.Errorf("configure API key security: %w", err)
 	}
-	manager, err := apikey.NewManager(database.ORM(), security.Pepper)
+	var manager *apikey.Manager
+	closeCache := func() {}
+	if arguments[0] == "revoke-key" ||
+		arguments[0] == "disable-key" {
+		manager, closeCache, err = newInvalidatingKeyManager(
+			ctx,
+			database,
+			security.Pepper,
+		)
+	} else {
+		manager, err = apikey.NewManager(
+			database.ORM(),
+			security.Pepper,
+		)
+	}
 	if err != nil {
 		return err
 	}
+	defer closeCache()
 
 	switch arguments[0] {
 	case "bootstrap-tenant":
@@ -70,6 +86,43 @@ func run(ctx context.Context, arguments []string) error {
 	default:
 		return usageError()
 	}
+}
+
+func newInvalidatingKeyManager(
+	ctx context.Context,
+	database *postgres.Database,
+	pepper []byte,
+) (*apikey.Manager, func(), error) {
+	settings, err := config.LoadAuthCache()
+	if err != nil {
+		return nil, nil, err
+	}
+	if !settings.Enabled {
+		manager, managerErr := apikey.NewManager(database.ORM(), pepper)
+		return manager, func() {}, managerErr
+	}
+	redisSettings, err := config.LoadRedis()
+	if err != nil {
+		return nil, nil, err
+	}
+	client, err := redisstore.Open(ctx, redisSettings)
+	if err != nil {
+		return nil, nil, err
+	}
+	manager, err := apikey.NewCachedManager(
+		database.ORM(),
+		pepper,
+		client.Native(),
+		settings,
+		nil,
+	)
+	if err != nil {
+		_ = client.Close()
+		return nil, nil, err
+	}
+	return manager, func() {
+		_ = client.Close()
+	}, nil
 }
 
 func bootstrapAdmin(

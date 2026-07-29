@@ -5,7 +5,7 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH= cd -- "$script_dir/../.." && pwd)
 env_file=${1:-"$script_dir/benchmark.env"}
 
-if [[ ! -f "$env_file" ]]; then
+if [[ "$env_file" != "-" && ! -f "$env_file" ]]; then
   printf 'missing benchmark environment file: %s\n' "$env_file" >&2
   exit 1
 fi
@@ -17,13 +17,22 @@ for command_name in curl git k6 python3; do
 done
 
 set -a
-# shellcheck disable=SC1090
-. "$env_file"
+if [[ "$env_file" != "-" ]]; then
+  # shellcheck disable=SC1090
+  . "$env_file"
+fi
 set +a
 
 : "${GATEWAY_URL:?GATEWAY_URL is required}"
 : "${UPSTREAM_URL:?UPSTREAM_URL is required}"
 : "${MODEL_VELO_API_KEY:?MODEL_VELO_API_KEY is required}"
+UPSTREAM_FAIL_URL=${UPSTREAM_FAIL_URL:-}
+UPSTREAM_FALLBACK_URL=${UPSTREAM_FALLBACK_URL:-}
+upstream_origin=${UPSTREAM_URL%/}
+if [[ "$upstream_origin" =~ ^(https?://.+):9000$ ]]; then
+  UPSTREAM_FAIL_URL=${UPSTREAM_FAIL_URL:-"${BASH_REMATCH[1]}:9001"}
+  UPSTREAM_FALLBACK_URL=${UPSTREAM_FALLBACK_URL:-"${BASH_REMATCH[1]}:9002"}
+fi
 
 REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-30s}
 COOLDOWN_SECONDS=${COOLDOWN_SECONDS:-3}
@@ -50,6 +59,9 @@ PROFILE_PRE_ALLOCATED_VUS=${PROFILE_PRE_ALLOCATED_VUS:-512}
 PROFILE_MAX_VUS=${PROFILE_MAX_VUS:-2048}
 FAULT_RATE=${FAULT_RATE:-100}
 FAULT_DURATION=${FAULT_DURATION:-2m}
+FAULT_RECOVERY_RATE=${FAULT_RECOVERY_RATE:-100}
+FAULT_RECOVERY_FAILURE_DURATION=${FAULT_RECOVERY_FAILURE_DURATION:-45s}
+FAULT_RECOVERY_HEALTHY_DURATION=${FAULT_RECOVERY_HEALTHY_DURATION:-45s}
 QUEUE_RATE=${QUEUE_RATE:-1000}
 QUEUE_DURATION=${QUEUE_DURATION:-2m}
 QUEUE_PRE_ALLOCATED_VUS=${QUEUE_PRE_ALLOCATED_VUS:-2048}
@@ -62,6 +74,7 @@ RATE_LIMIT_TEST_RATE=${RATE_LIMIT_TEST_RATE:-100}
 RATE_LIMIT_TEST_DURATION=${RATE_LIMIT_TEST_DURATION:-2m}
 RESULTS_ROOT=${RESULTS_ROOT:-"$repo_root/test-results/threehost"}
 SAVE_RAW_METRICS=${SAVE_RAW_METRICS:-false}
+TEST_PROFILE=${TEST_PROFILE:-complete}
 
 RUN_CAPACITY=${RUN_CAPACITY:-true}
 RUN_WARMUP=${RUN_WARMUP:-true}
@@ -72,6 +85,7 @@ RUN_CACHE=${RUN_CACHE:-true}
 RUN_RAMP=${RUN_RAMP:-true}
 RUN_BURST=${RUN_BURST:-true}
 RUN_FAULT=${RUN_FAULT:-true}
+RUN_FAULT_RECOVERY=${RUN_FAULT_RECOVERY:-true}
 RUN_QUEUE_OVERLOAD=${RUN_QUEUE_OVERLOAD:-true}
 RUN_ENDURANCE=${RUN_ENDURANCE:-true}
 RUN_RELIABILITY=${RUN_RELIABILITY:-true}
@@ -87,6 +101,7 @@ for boolean_name in \
   RUN_RAMP \
   RUN_BURST \
   RUN_FAULT \
+  RUN_FAULT_RECOVERY \
   RUN_QUEUE_OVERLOAD \
   RUN_ENDURANCE \
   RUN_RELIABILITY \
@@ -117,6 +132,7 @@ for integer_name in \
   PROFILE_PRE_ALLOCATED_VUS \
   PROFILE_MAX_VUS \
   FAULT_RATE \
+  FAULT_RECOVERY_RATE \
   QUEUE_RATE \
   QUEUE_PRE_ALLOCATED_VUS \
   QUEUE_MAX_VUS \
@@ -145,6 +161,11 @@ if [[ "$ENDURANCE_MAX_VUS" -lt "$ENDURANCE_PRE_ALLOCATED_VUS" ]]; then
 fi
 if [[ "$QUEUE_MAX_VUS" -lt "$QUEUE_PRE_ALLOCATED_VUS" ]]; then
   printf 'QUEUE_MAX_VUS must be greater than or equal to QUEUE_PRE_ALLOCATED_VUS\n' >&2
+  exit 1
+fi
+if [[ "$RUN_FAULT_RECOVERY" == "true" ]] &&
+  { [[ -z "$UPSTREAM_FAIL_URL" ]] || [[ -z "$UPSTREAM_FALLBACK_URL" ]]; }; then
+  printf 'UPSTREAM_FAIL_URL and UPSTREAM_FALLBACK_URL are required when RUN_FAULT_RECOVERY=true\n' >&2
   exit 1
 fi
 for value in $CAPACITY_VUS $RATE_SWEEP; do
@@ -192,11 +213,14 @@ trap 'cleanup; summarize' EXIT
 
 {
   printf 'run_id=%s\n' "$run_id"
+  printf 'test_profile=%s\n' "$TEST_PROFILE"
   printf 'request_prefix=%s\n' "$request_prefix"
   printf 'commit=%s\n' "$(git -C "$repo_root" rev-parse HEAD)"
   printf 'started_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   printf 'gateway_url=%s\n' "$GATEWAY_URL"
   printf 'upstream_url=%s\n' "$UPSTREAM_URL"
+  printf 'upstream_fail_url=%s\n' "$UPSTREAM_FAIL_URL"
+  printf 'upstream_fallback_url=%s\n' "$UPSTREAM_FALLBACK_URL"
   printf 'repetitions=%s\n' "$REPETITIONS"
   printf 'capacity_vus=%s\n' "$CAPACITY_VUS"
   printf 'rate_sweep=%s\n' "$RATE_SWEEP"
@@ -205,6 +229,9 @@ trap 'cleanup; summarize' EXIT
   printf 'ramp_stages=%s\n' "$RAMP_STAGES"
   printf 'burst_stages=%s\n' "$BURST_STAGES"
   printf 'queue_rate=%s\n' "$QUEUE_RATE"
+  printf 'fault_recovery_rate=%s\n' "$FAULT_RECOVERY_RATE"
+  printf 'fault_recovery_failure_duration=%s\n' "$FAULT_RECOVERY_FAILURE_DURATION"
+  printf 'fault_recovery_healthy_duration=%s\n' "$FAULT_RECOVERY_HEALTHY_DURATION"
   printf 'queue_pre_allocated_vus=%s\n' "$QUEUE_PRE_ALLOCATED_VUS"
   printf 'queue_max_vus=%s\n' "$QUEUE_MAX_VUS"
   printf 'endurance_rate=%s\n' "$ENDURANCE_RATE"
@@ -245,26 +272,60 @@ case_prefix() {
 }
 
 reset_upstream() {
+  local upstream_url
+  for upstream_url in "$UPSTREAM_URL" "$UPSTREAM_FAIL_URL" "$UPSTREAM_FALLBACK_URL"; do
+    if [[ -z "$upstream_url" ]]; then
+      continue
+    fi
+    curl \
+      --fail \
+      --silent \
+      --show-error \
+      --max-time 10 \
+      -X POST \
+      "$(base_url "$upstream_url")/__admin/reset" \
+      >/dev/null
+  done
+}
+
+capture_upstream_url() {
+  local case_name=$1
+  local label=$2
+  local upstream_url=$3
+  if [[ -z "$upstream_url" ]]; then
+    return
+  fi
   curl \
     --fail \
     --silent \
     --show-error \
     --max-time 10 \
-    -X POST \
-    "$(base_url "$UPSTREAM_URL")/__admin/reset" \
-    >/dev/null
+    "$(base_url "$upstream_url")/__admin/stats" \
+    >"$results_dir/$case_name-$label-upstream.json" ||
+    printf '{"capture_error":true}\n' >"$results_dir/$case_name-$label-upstream.json"
 }
 
 capture_upstream() {
   local case_name=$1
+  capture_upstream_url "$case_name" main "$UPSTREAM_URL"
+  cp "$results_dir/$case_name-main-upstream.json" \
+    "$results_dir/$case_name-upstream.json"
+  capture_upstream_url "$case_name" fail "$UPSTREAM_FAIL_URL"
+  capture_upstream_url "$case_name" fallback "$UPSTREAM_FALLBACK_URL"
+}
+
+set_upstream_scenario() {
+  local upstream_url=$1
+  local scenario=$2
   curl \
     --fail \
     --silent \
     --show-error \
     --max-time 10 \
-    "$(base_url "$UPSTREAM_URL")/__admin/stats" \
-    >"$results_dir/$case_name-upstream.json" ||
-    printf '{"capture_error":true}\n' >"$results_dir/$case_name-upstream.json"
+    -H 'Content-Type: application/json' \
+    -d "{\"scenario\":\"$scenario\"}" \
+    "$(base_url "$upstream_url")/__admin/scenario" \
+    >/dev/null
 }
 
 record_case() {
@@ -671,6 +732,21 @@ if [[ "$RUN_FAULT" == "true" ]]; then
   run_fault_case fault-error10-gateway mock/error-rate-10 "200,502,503"
   run_fault_case fault-jitter-gateway mock/jitter "200"
   run_fault_case fault-spike5-gateway mock/spike-5 "200"
+fi
+
+if [[ "$RUN_FAULT_RECOVERY" == "true" ]]; then
+  original_fault_rate=$FAULT_RATE
+  original_fault_duration=$FAULT_DURATION
+  FAULT_RATE=$FAULT_RECOVERY_RATE
+  set_upstream_scenario "$UPSTREAM_FAIL_URL" mock/error-503
+  FAULT_DURATION=$FAULT_RECOVERY_FAILURE_DURATION
+  run_fault_case fault-fallback-5xx-gateway mock/fallback "200"
+  set_upstream_scenario "$UPSTREAM_FAIL_URL" mock/instant
+  FAULT_DURATION=$FAULT_RECOVERY_HEALTHY_DURATION
+  run_fault_case fault-provider-recovery-gateway mock/fallback "200"
+  set_upstream_scenario "$UPSTREAM_FAIL_URL" mock/error-503
+  FAULT_RATE=$original_fault_rate
+  FAULT_DURATION=$original_fault_duration
 fi
 
 if [[ "$RUN_QUEUE_OVERLOAD" == "true" ]]; then

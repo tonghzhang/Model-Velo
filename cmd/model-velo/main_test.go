@@ -235,6 +235,12 @@ func setValidInfrastructureEnv(t *testing.T) {
 	t.Setenv("MODEL_VELO_REDIS_POOL_TIMEOUT", "")
 	t.Setenv("MODEL_VELO_REDIS_STARTUP_POLICY", "")
 	t.Setenv("MODEL_VELO_ENVIRONMENT", "test")
+	t.Setenv("MODEL_VELO_AUTH_CACHE_ENABLED", "")
+	t.Setenv("MODEL_VELO_AUTH_CACHE_L1_MAX_ENTRIES", "")
+	t.Setenv("MODEL_VELO_AUTH_CACHE_L1_TTL", "")
+	t.Setenv("MODEL_VELO_AUTH_CACHE_L2_TTL", "")
+	t.Setenv("MODEL_VELO_AUTH_CACHE_KEY_PREFIX", "")
+	t.Setenv("MODEL_VELO_AUTH_CACHE_INVALIDATION_CHANNEL", "")
 	t.Setenv("MODEL_VELO_RATE_LIMIT_REQUESTS", "")
 	t.Setenv("MODEL_VELO_RATE_LIMIT_WINDOW", "")
 	t.Setenv("MODEL_VELO_RATE_LIMIT_FAILURE_POLICY", "")
@@ -266,7 +272,11 @@ func (mainTestAccessController) Authenticate(context.Context, string) (apikey.Id
 	return apikey.Identity{TenantID: "tenant-test-id"}, nil
 }
 
-func (mainTestAccessController) AuthorizeModel(context.Context, string, string) error {
+func (mainTestAccessController) AuthorizeModel(
+	context.Context,
+	apikey.Identity,
+	string,
+) error {
 	return nil
 }
 

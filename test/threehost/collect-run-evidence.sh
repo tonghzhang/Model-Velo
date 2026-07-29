@@ -69,6 +69,12 @@ safe_setting_names=(
   MODEL_VELO_POSTGRES_MAX_IDLE_CONNS
   MODEL_VELO_POSTGRES_MAX_CONN_IDLE_TIME
   MODEL_VELO_POSTGRES_MAX_CONN_LIFETIME
+  MODEL_VELO_AUTH_CACHE_ENABLED
+  MODEL_VELO_AUTH_CACHE_L1_MAX_ENTRIES
+  MODEL_VELO_AUTH_CACHE_L1_TTL
+  MODEL_VELO_AUTH_CACHE_L2_TTL
+  MODEL_VELO_AUTH_CACHE_KEY_PREFIX
+  MODEL_VELO_AUTH_CACHE_INVALIDATION_CHANNEL
   MODEL_VELO_REDIS_DB
   MODEL_VELO_REDIS_POOL_SIZE
   MODEL_VELO_REDIS_MIN_IDLE_CONNS
@@ -140,17 +146,17 @@ redis_command() {
 
 drain_deadline=$((SECONDS + drain_timeout_seconds))
 drain_state=timeout
-unfinished_outbox=-1
+remaining_outbox=-1
 stream_length=-1
 while ((SECONDS < drain_deadline)); do
-  unfinished_outbox=$(docker compose -f "$compose_file" exec -T postgres \
+  remaining_outbox=$(docker compose -f "$compose_file" exec -T postgres \
     psql \
     -U "$postgres_user" \
     -d "$postgres_database" \
     -At \
-    -c "SELECT count(*) FROM usage_outbox WHERE left(request_id, $prefix_length) = '$request_prefix' AND state <> 'published';")
+    -c "SELECT count(*) FROM usage_outbox WHERE left(request_id, $prefix_length) = '$request_prefix';")
   stream_length=$(redis_command --raw XLEN "$usage_stream")
-  if [[ "$unfinished_outbox" == "0" && "$stream_length" == "0" ]]; then
+  if [[ "$remaining_outbox" == "0" ]]; then
     drain_state=complete
     break
   fi
@@ -159,7 +165,7 @@ done
 {
   printf 'state=%s\n' "$drain_state"
   printf 'timeout_seconds=%s\n' "$drain_timeout_seconds"
-  printf 'unfinished_outbox=%s\n' "$unfinished_outbox"
+  printf 'remaining_outbox=%s\n' "$remaining_outbox"
   printf 'stream_length=%s\n' "$stream_length"
 } >"$output_dir/usage-drain.txt"
 
@@ -189,7 +195,7 @@ docker compose -f "$compose_file" exec -T postgres \
   -U "$postgres_user" \
   -d "$postgres_database" \
   --csv \
-  -c "SELECT requested_model, status, stream, cache_status, error_category, error_code, count(*) AS events, sum(attempts) AS attempts, sum(retries) AS retries, sum(fallbacks) AS fallbacks, round(avg(latency_ms)::numeric, 2) AS latency_avg_ms, percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms) AS latency_p95_ms, round(avg(first_token_ms)::numeric, 2) AS first_token_avg_ms FROM usage_events WHERE left(request_id, $prefix_length) = '$request_prefix' GROUP BY requested_model, status, stream, cache_status, error_category, error_code ORDER BY requested_model, status, stream, cache_status, error_category, error_code;" \
+  -c "SELECT requested_model, status, stream, cache_status, error_category, error_code, count(*) AS events, sum(attempts) AS attempts, sum(retries) AS retries, sum(fallbacks) AS fallbacks, round(avg(latency_ms)::numeric, 2) AS latency_avg_ms, percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms) AS latency_p95_ms, percentile_cont(0.99) WITHIN GROUP (ORDER BY latency_ms) AS latency_p99_ms, round(avg(first_token_ms)::numeric, 2) AS first_token_avg_ms, percentile_cont(0.95) WITHIN GROUP (ORDER BY first_token_ms) AS first_token_p95_ms, percentile_cont(0.99) WITHIN GROUP (ORDER BY first_token_ms) AS first_token_p99_ms FROM usage_events WHERE left(request_id, $prefix_length) = '$request_prefix' GROUP BY requested_model, status, stream, cache_status, error_category, error_code ORDER BY requested_model, status, stream, cache_status, error_category, error_code;" \
   >"$output_dir/usage-diagnostics.csv"
 
 {

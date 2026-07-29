@@ -190,6 +190,7 @@ func (manager *Manager) UpdateTenantAudited(
 	if err != nil {
 		return TenantView{}, err
 	}
+	manager.invalidateTenant(ctx, tenantID)
 	return tenantView(updated, models), nil
 }
 
@@ -305,7 +306,11 @@ func (manager *Manager) UpdateKeyStatusAudited(
 			keyView(current), keyView(updated),
 		)
 	})
-	return keyView(updated), err
+	if err != nil {
+		return KeyView{}, err
+	}
+	manager.invalidateKey(ctx, keyID)
+	return keyView(updated), nil
 }
 
 func replaceModelGrants(

@@ -2,11 +2,14 @@ package observability
 
 import (
 	"context"
+	"database/sql"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	goredis "github.com/redis/go-redis/v9"
 
 	"model-velo/internal/usage"
 )
@@ -16,9 +19,24 @@ func TestMetricsAreBoundedAndProtected(t *testing.T) {
 	if err := metrics.RegisterUsageWorker(fakeUsageWorker{}); err != nil {
 		t.Fatal(err)
 	}
+	redisClient := goredis.NewClient(&goredis.Options{Addr: "127.0.0.1:1"})
+	t.Cleanup(func() {
+		_ = redisClient.Close()
+	})
+	if err := metrics.RegisterDependencies(&sql.DB{}, redisClient); err != nil {
+		t.Fatal(err)
+	}
 	finish := metrics.BeginRequest()
 	finish("/v1/test", http.MethodPost, http.StatusOK, false, 20*time.Millisecond)
+	metrics.HTTPError("/v1/test", http.StatusServiceUnavailable, "gateway_overloaded")
+	metrics.RequestStage("authentication", "accepted", "", time.Millisecond)
 	metrics.Authentication("accepted")
+	metrics.AuthCacheLookup("l1", "hit", time.Microsecond)
+	metrics.AuthCacheLookup("l2", "miss", time.Millisecond)
+	metrics.AuthCacheEvent("write", "success")
+	metrics.AuthPostgresFallback("success")
+	metrics.AuthDatabaseQueries(2)
+	metrics.ModelAuthorization("allowed")
 	metrics.RateLimit("allowed")
 	metrics.Cache("lookup", "hit")
 	metrics.ProviderAttempt("provider-a", "success", "", time.Millisecond, false)
@@ -53,11 +71,22 @@ func TestMetricsAreBoundedAndProtected(t *testing.T) {
 			payload := response.Body.String()
 			for _, metricName := range []string{
 				"model_velo_http_requests_total",
+				"model_velo_http_errors_total",
+				"model_velo_request_stage_duration_seconds",
 				"model_velo_provider_attempts_total",
 				"model_velo_authentication_total",
+				"model_velo_auth_cache_lookups_total",
+				"model_velo_auth_cache_lookup_duration_seconds",
+				"model_velo_auth_cache_events_total",
+				"model_velo_auth_postgres_fallback_total",
+				"model_velo_auth_postgres_queries",
+				"model_velo_model_authorization_total",
 				"model_velo_usage_delivery_total",
 				"model_velo_usage_worker_pending",
 				"model_velo_quota_decisions_total",
+				"model_velo_postgres_connections",
+				"model_velo_redis_pool_connections",
+				"go_goroutines",
 			} {
 				if !strings.Contains(payload, metricName) {
 					t.Errorf("scrape does not contain %s", metricName)

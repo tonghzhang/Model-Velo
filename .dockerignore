@@ -4,3 +4,12 @@
 .env
 *.log
 reports
+test-results
+threehost
+threehost.tar.gz
+Best_README_template-master
+Best_README_template-master.zip
+*.pyc
+__pycache__
+frontend/node_modules
+frontend/dist

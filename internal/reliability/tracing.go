@@ -87,17 +87,25 @@ func traceQueueAcquire(
 			attribute.String("gateway.provider.id", providerID),
 		),
 	)
+	startedAt := time.Now()
 	lease, failure := queues.Acquire(ctx, providerID)
+	duration := time.Since(startedAt)
+	result := "acquired"
 	if failure == nil {
 		span.SetAttributes(attribute.String("gateway.queue.result", "acquired"))
 		span.SetStatus(codes.Ok, "")
 	} else {
+		result = string(failure.Queue)
+		if result == "" {
+			result = string(failure.Category)
+		}
 		span.SetAttributes(
 			attribute.String("gateway.queue.result", string(failure.Queue)),
 			attribute.String("gateway.failure.category", string(failure.Category)),
 		)
 		span.SetStatus(codes.Error, string(failure.Category))
 	}
+	observeQueueWait(ctx, providerID, result, duration)
 	span.End()
 	return lease, failure
 }
